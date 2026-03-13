@@ -400,6 +400,11 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'scan_helpers',
+      description: 'Zobrazí všechny existující helpery v HA (input_boolean, input_number, input_select, input_datetime, counter, timer). Použij před tvorbou testovacího dashboardu.',
+      input_schema: { type: 'object', properties: {}, required: [] },
+    },
+    {
       name: 'generate_report',
       description: 'Vygeneruje report o stavu domu — teploty, pohyb, počasí, energie, co se dělo.',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -870,6 +875,28 @@ async function executeTool(name, input, chatId) {
         }
       }
 
+      case 'scan_helpers': {
+        const states = await haGet('states');
+        const helperDomains = ['input_boolean', 'input_number', 'input_select', 'input_datetime', 'input_text', 'counter', 'timer'];
+        const helpers = {};
+        for (const domain of helperDomains) {
+          const found = states
+            .filter(s => s.entity_id.startsWith(domain + '.'))
+            .map(s => ({
+              entity_id: s.entity_id,
+              name: s.attributes.friendly_name || s.entity_id,
+              state: s.state,
+              unit: s.attributes.unit_of_measurement || '',
+              options: s.attributes.options || null,
+              min: s.attributes.min !== undefined ? s.attributes.min : null,
+              max: s.attributes.max !== undefined ? s.attributes.max : null,
+            }));
+          if (found.length > 0) helpers[domain] = found;
+        }
+        const total = Object.values(helpers).reduce((s, arr) => s + arr.length, 0);
+        return { helpers, total, note: total === 0 ? 'Žádné helpery nenalezeny — můžu je vytvořit přes write_package' : `${total} helperů nalezeno` };
+      }
+
       case 'generate_report': {
         const states = await haGet('states');
 
@@ -1287,11 +1314,126 @@ Příklady doplnění:
 - Chybí měření spotřeby → Shelly EM (~1200 Kč) nebo Sonoff POW Elite (~600 Kč)
 - Chybí dveřní senzor → Aqara Door/Window (~400 Kč) nebo Sonoff SNZB-04 (~250 Kč)
 
-TESTOVACÍ PLÁNOVÁNÍ:
-- Dashboardy: název-test.yaml
-- Balíčky: název-test.yaml  
-- Jasně označ že jde o testovací/plánovací verzi bez reálného HW
-- Navrhni senzory které by logiku vylepšily
+TESTOVACÍ DASHBOARDY — kompletní workflow:
+Kdykoli uživatel chce "zkusit", "otestovat", "naplánovat" nebo "vyzkoušet" dashboard:
+
+1. scan_all_devices — načti skutečná dostupná zařízení
+2. get_states — načti aktuální entity (světla, senzory, zásuvky atd.)
+3. Vymysli moderní dashboard pro danou místnost/téma
+4. Pokud chybí reálná zařízení → navrhni pomocné entity (helpers):
+   - input_boolean → virtuální přepínač (simuluje světlo, zásuvku)
+   - input_number → virtuální stmívač/teplota/CO2 hodnota
+   - input_select → virtuální výběr režimu (Den/Noc/Pryč)
+   - input_datetime → virtuální čas/datum
+   - counter → virtuální čítač (návštěvy, otevření dveří)
+   - timer → virtuální časovač
+5. write_package (kategorie: system, název: helpers-[tema]-test.yaml) — zapiš helpers
+6. write_dashboard (název: [Tema]-test.yaml) — zapiš dashboard
+7. reload_ha (what: helpers) — aktivuj helpery
+
+PRAVIDLA PRO TESTOVACÍ DASHBOARDY:
+- Název souboru VŽDY končí -test (např. Svetla-test.yaml, Obyvak-test.yaml)
+- Nadpis dashboardu obsahuje "🧪 TEST:" (např. "🧪 TEST: Obývák")
+- Každá karta s helperem má v title nebo label text "(simulace)"
+- Na začátek dashboardu přidej info kartu s vysvětlením co je real a co sim:
+  type: markdown
+  content: "🧪 **Testovací dashboard** — ovládání označená _(sim)_ jsou simulovaná pomocí helperů HA. Skutečná zařízení jsou označena normálně."
+
+MODERNÍ DASHBOARD YAML — preferované karty (vestavěné v HA, vždy fungují):
+\`\`\`yaml
+# Přepínač světla
+- type: tile
+  entity: light.svetlo_obyvak
+  name: "Světlo obývák"
+
+# Senzor s historií
+- type: sensor
+  entity: sensor.co2_obyvak
+  graph: line
+
+# Skupina karet vedle sebe
+- type: horizontal-stack
+  cards:
+    - type: tile
+      entity: light.xxx
+    - type: tile
+      entity: switch.xxx
+
+# Stmívač
+- type: light
+  entity: light.xxx
+
+# Rychlé tlačítko
+- type: button
+  entity: light.xxx
+  tap_action:
+    action: toggle
+
+# Gauge (teploměr/CO2)
+- type: gauge
+  entity: sensor.teplota
+  min: 0
+  max: 40
+  severity:
+    green: 18
+    yellow: 25
+    red: 30
+\`\`\`
+
+MUSHROOM CARDS (pokud uživatel má HACS + mushroom nainstalováno — zeptej se):
+\`\`\`yaml
+- type: custom:mushroom-light-card
+  entity: light.xxx
+  show_brightness_control: true
+  show_color_control: true
+  collapsible_controls: true
+
+- type: custom:mushroom-climate-card
+  entity: climate.xxx
+  show_temperature_control: true
+
+- type: custom:mushroom-chips-card
+  chips:
+    - type: entity
+      entity: sensor.teplota
+    - type: entity
+      entity: sensor.co2
+\`\`\`
+
+HELPERS YAML PŘÍKLAD (packages/system/helpers-obyvak-test.yaml):
+\`\`\`yaml
+input_boolean:
+  sim_svetlo_obyvak:
+    name: "💡 Světlo obývák (sim)"
+    icon: mdi:ceiling-light
+
+input_number:
+  sim_jas_obyvak:
+    name: "🔆 Jas obývák (sim)"
+    min: 0
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:brightness-6
+  sim_co2_obyvak:
+    name: "💨 CO2 obývák (sim)"
+    min: 400
+    max: 2000
+    step: 10
+    unit_of_measurement: "ppm"
+    icon: mdi:molecule-co2
+
+input_select:
+  sim_rezim_obyvak:
+    name: "🏠 Režim obývák (sim)"
+    options: [Den, Večer, Noc, Pryč]
+    icon: mdi:home-clock
+\`\`\`
+
+Po vytvoření vždy:
+- Vysvětli co je reálné a co je simulované
+- Napiš kde v HA dashboard najít (Settings → Dashboards)
+- Navrhni co by šlo přikoupit aby se simulace stala realitou (s cenami)
 
 Čas: ${new Date().toLocaleString('cs-CZ')}`;
 
