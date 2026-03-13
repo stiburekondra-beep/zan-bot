@@ -1238,7 +1238,21 @@ function loadGarden() {
   return {
     // Mapa zahrady — pojmenované zóny s popisem
     map: {
-      // např. "zahon_u_plotu": { name: "Záhon u plotu", description: "...", plants: ["rajčata", "bazalka"] }
+      // Sekce 1 - Předzahrádka
+      predzahradka: { name: 'Předzahrádka', section: '1', description: 'předzahrádka před domem', plants: [] },
+      // Sekce 2 - Přední dvůr
+      od_uhlehu: { name: '2.1 Od Úlehlů', section: '2', description: 'záhon u sousedů Úlehlů', plants: [] },
+      nad_sklepem: { name: '2.2 Nad sklepem', section: '2', description: 'záhon nad sklepem', plants: [] },
+      // Sekce 3 - Zahrada
+      k_uhlehlom: { name: '3.1 K Úlehlom', section: '3', description: 'hlavní záhony zeleniny', plants: [] },
+      k_tureckOM: { name: '3.2 K Turečkom', section: '3', description: 'spodní záhon u Turečků', plants: [] },
+      travnik: { name: '3.3 Trávník', section: '3', description: 'volná travnatá plocha', plants: [] },
+      vyvyseny_zahon_1: { name: '3.4 Vyvýšený záhon 1', section: '3', description: 'vyvýšený záhon č.1', plants: [] },
+      vyvyseny_zahon_2: { name: '3.5 Vyvýšený záhon 2', section: '3', description: 'vyvýšený záhon č.2', plants: [] },
+      u_studny: { name: '3.6 U studny', section: '3', description: 'okrasná zóna u studny', plants: [] },
+      // Sekce 4 - Sad
+      sad_stromy: { name: '4.1 Stromy', section: '4', description: 'ovocný sad', plants: [] },
+      policko: { name: '4.2 Políčko', section: '4', description: 'zelenina na políčku', plants: [] },
     },
     // Profily rostlin — každá rostlina má svůj záznam
     plant_profiles: {
