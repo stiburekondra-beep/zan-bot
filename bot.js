@@ -1460,21 +1460,18 @@ Zařízení: ${JSON.stringify(memory.devices)}
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ')}
 
-${isJana ? `🌱 ZAHRADNÍ KONTEXT (Jana je zahradnice):
-Mapa zón: ${Object.entries(garden.map || {}).map(([k,v]) => `${v.name}: ${(v.plants||[]).join(', ')}`).join(' | ') || 'zatím nenastavena — zeptej se Jany'}
-Rostliny: zelenina (${garden.plants.zelenina.join(', ')}), stromy (${garden.plants.ovocne_stromy.join(', ')}), keře (${garden.plants.kere.join(', ')})
-Profily rostlin: ${Object.keys(garden.plant_profiles || {}).length} profilů
-Měsíc: ${seasonal.season} | Sezónní úkoly: ${seasonal.tasks.slice(0,3).join(', ')}
+🌱 ZAHRADA:
+Mapa zón: ${Object.entries(garden.map || {}).map(([k,v]) => `${v.name}${(v.plants||[]).length ? ': ' + v.plants.join(', ') : ''}`).join(' | ') || 'zatím nenastavena'}
+Rostliny: zelenina (${(garden.plants||{}).zelenina?.join(', ')||'?'}), stromy (${(garden.plants||{}).ovocne_stromy?.join(', ')||'?'}), keře (${(garden.plants||{}).kere?.join(', ')||'?'})
+Profily rostlin: ${Object.keys(garden.plant_profiles || {}).length} profilů | Měsíc: ${seasonal.season} | Sez. úkoly: ${seasonal.tasks.slice(0,3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
 
 ZAHRADNÍ NÁSTROJE (používej aktivně):
 - garden_map: správa mapy zahrady a zón
-- garden_plant_profile: profil každé rostliny (výsadba, foto, poznámky)  
+- garden_plant_profile: profil každé rostliny (výsadba, foto, poznámky)
 - garden_planting_plan: výsadbová historie a střídání plodin
 - garden_note: zahradní deník
-Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje.
-Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.
-` : ''}
+${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje.\nKdyž pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.' : 'Ondra je admin — na dotazy o zahradě odpovídej na základě výše uvedených dat.'}
 
 TVOJE CHOVÁNÍ:
 - Vždy potvrď SKUTEČNOU akci — nikdy netvrď že jsi něco provedl pokud jsi nezavolal nástroj
@@ -1511,13 +1508,23 @@ REPORT (když uživatel napíše "report"):
 NOVÉ ZAŘÍZENÍ — kompletní workflow (spusť automaticky kdykoli uživatel zmíní nové/přidané zařízení):
 1. scan_all_devices — získej přehled VŠECH zařízení, místností a integrací
 2. Identifikuj nové/nezařazené zařízení podle kontextu (co uživatel popsal, jaká místnost)
-3. Navrhni logický český název (např. "Světlo obývák strop", "Senzor CO2 obývák")
-4. rename_entity — přejmenuj každou entitu zařízení
+3. Navrhni logický český název (např. "Světlo obývák strop", "Senzor CO2 obývák") — ZEPTEJ SE uživatele jestli souhlasí s názvy a místností, ČEKEJ na potvrzení
+4. Po potvrzení: rename_entity — přejmenuj každou entitu zařízení
 5. Pokud místnost neexistuje → create_area ji vytvoř
 6. assign_device_to_area — přiřaď celé zařízení do místnosti (preferuj přes device_id)
-7. Navrhni automatizace odpovídající typu zařízení (světlo→stmívání/rozsvícení při pohybu, senzor CO2→upozornění nad 1000ppm, teploměr→topení)
-8. write_package — po potvrzení zapiš automatizace jako YAML balíček
-9. Navrhni doplňující HW nákupy (konkrétní model, značka, orientační cena v Kč)
+7. remember — ulož zařízení a místnost do paměti (category: devices / rooms)
+8. Navrhni 2-3 konkrétní automatizace s YAML ukázkou — ZOBRAZ uživateli, ČEKEJ na výběr nebo úpravu. NEZAPISUJ dokud uživatel nepotvrdí!
+9. Po potvrzení automatizací: write_package — zapiš jako YAML balíček (packages/[nazev]-auto.yaml)
+10. Navrhni doplňující HW nákupy (konkrétní model, značka, orientační cena v Kč)
+
+POTVRZENÍ před zápisem — vždy zobraz uživateli:
+"📋 Navrhuju tato nastavení:
+  Název: [nový název entity]
+  Místnost: [místnost]
+  Automatizace:
+  1. [popis] — [YAML]
+  2. [popis] — [YAML]
+Potvrzuješ? (nebo uprav co chceš změnit)"
 
 IDENTIFIKACE INTEGRACE ZE scan_all_devices:
 - integration obsahuje "tuya" → Tuya zařízení (žárovky, zásuvky, čidla přes Tuya app nebo cloud)
@@ -2234,16 +2241,72 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Startup — načti aktuální stavy jako baseline + vytvoř rodinný dashboard
+// Startup — načti aktuální stavy jako baseline + vytvoř rodinný dashboard + sync kontextu
 setTimeout(async () => {
+  // 1. Načti HA stavy jako baseline pro sledování návyků
+  let states = [];
   try {
-    const states = await haGet('states');
+    states = await haGet('states');
     for (const s of states) {
       const domain = s.entity_id.split('.')[0];
       if (HABIT_DOMAINS.includes(domain)) lastStates[s.entity_id] = s.state;
     }
     console.log(`📊 Baseline načten: ${Object.keys(lastStates).length} sledovaných entit`);
-  } catch {}
+  } catch (e) { console.warn('⚠️ Baseline load selhal:', e.message); }
+
+  // 2. Sync místností z HA area registry → memory.rooms
+  try {
+    const areas = await haGet('config/area_registry/list');
+    if (Array.isArray(areas) && areas.length > 0) {
+      const memory = loadMemory();
+      let changed = false;
+      for (const area of areas) {
+        const key = area.area_id;
+        if (!memory.rooms[key]) {
+          memory.rooms[key] = { name: area.name, area_id: area.area_id };
+          changed = true;
+        } else if (memory.rooms[key].name !== area.name) {
+          memory.rooms[key].name = area.name;
+          changed = true;
+        }
+      }
+      if (changed) {
+        saveMemory(memory);
+        console.log(`🏠 Místnosti sync: ${areas.map(a => a.name).join(', ')}`);
+      }
+    }
+  } catch (e) { console.warn('⚠️ Area sync selhal:', e.message); }
+
+  // 3. Sync zařízení ze stavů → memory.devices (jen pokud je devices prázdné)
+  try {
+    const memory = loadMemory();
+    if (states.length > 0 && Object.keys(memory.devices || {}).length === 0) {
+      const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather', 'automation', 'script', 'scene', 'timer', 'counter'];
+      const interestingDomains = ['light', 'switch', 'sensor', 'binary_sensor', 'climate', 'cover', 'media_player', 'fan', 'input_boolean', 'input_number'];
+      const interesting = states.filter(s => interestingDomains.some(d => s.entity_id.startsWith(d + '.')));
+      for (const s of interesting.slice(0, 100)) {
+        const name = s.attributes.friendly_name || s.entity_id;
+        memory.devices[s.entity_id] = { name, entity_id: s.entity_id, domain: s.entity_id.split('.')[0], state: s.state };
+      }
+      saveMemory(memory);
+      console.log(`🔌 Zařízení sync: ${interesting.length} entit načteno do paměti`);
+    }
+  } catch (e) { console.warn('⚠️ Devices sync selhal:', e.message); }
+
+  // 4. Aktualizuj known_entities
+  try {
+    const memory = loadMemory();
+    const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification'];
+    const all = states.filter(s => !skipDomains.some(d => s.entity_id.startsWith(d + '.'))).map(s => s.entity_id);
+    if (all.length > 0) {
+      const prev = memory.known_entities || [];
+      const newOnes = all.filter(e => !prev.includes(e));
+      memory.known_entities = all;
+      saveMemory(memory);
+      if (newOnes.length > 0) console.log(`🔍 ${newOnes.length} nových entit od posledního startu`);
+    }
+  } catch (e) { console.warn('⚠️ Known entities sync selhal:', e.message); }
+
   await createFamilyDashboard();
 }, 5000);
 
