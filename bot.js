@@ -152,12 +152,15 @@ function connectSamba() {
 // ═══════════════════════════════════════════════
 // HA API s timeoutem a retry
 // ═══════════════════════════════════════════════
-const haHeaders = { Authorization: `Bearer ${HA_TOKEN}`, 'Content-Type': 'application/json' };
+// haHeaders jako funkce — vždy čte aktuální HA_TOKEN (token může přijít až po startu)
+function haHeaders() {
+  return { Authorization: `Bearer ${process.env.HA_TOKEN || HA_TOKEN}`, 'Content-Type': 'application/json' };
+}
 
 async function haGet(p, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     try {
-      const r = await axios.get(`${HA_URL}/api/${p}`, { headers: haHeaders, timeout: 8000 });
+      const r = await axios.get(`${HA_URL}/api/${p}`, { headers: haHeaders(), timeout: 8000 });
       return r.data;
     } catch (e) {
       if (i === retries) throw e;
@@ -169,7 +172,7 @@ async function haGet(p, retries = 2) {
 async function haPost(p, data = {}, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     try {
-      const r = await axios.post(`${HA_URL}/api/${p}`, data, { headers: haHeaders, timeout: 8000 });
+      const r = await axios.post(`${HA_URL}/api/${p}`, data, { headers: haHeaders(), timeout: 8000 });
       return r.data;
     } catch (e) {
       if (i === retries) throw e;
@@ -860,11 +863,38 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'scan_all_devices': {
+        const errors = {};
         const [deviceReg, entityReg, areaReg] = await Promise.all([
-          haGet('config/device_registry/list').catch(() => []),
-          haGet('config/entity_registry/list').catch(() => []),
-          haGet('config/area_registry/list').catch(() => []),
+          haGet('config/device_registry/list').catch(e => { errors.device_registry = e.message; return null; }),
+          haGet('config/entity_registry/list').catch(e => { errors.entity_registry = e.message; return null; }),
+          haGet('config/area_registry/list').catch(e => { errors.area_registry = e.message; return null; }),
         ]);
+
+        if (Object.keys(errors).length) console.warn('scan_all_devices errors:', errors);
+
+        // Fallback — pokud registry selžou, použij /api/states
+        const useStateFallback = !Array.isArray(deviceReg) || deviceReg.length === 0;
+        if (useStateFallback) {
+          const states = await haGet('states');
+          const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather'];
+          const filtered = states.filter(s => !skipDomains.some(d => s.entity_id.startsWith(d + '.')));
+          const byDomain = {};
+          for (const s of filtered) {
+            const domain = s.entity_id.split('.')[0];
+            if (!byDomain[domain]) byDomain[domain] = [];
+            byDomain[domain].push({ entity_id: s.entity_id, name: s.attributes.friendly_name || s.entity_id, state: s.state });
+          }
+          const areas = Array.isArray(areaReg) ? areaReg.map(a => ({ area_id: a.area_id, name: a.name })) : [];
+          return {
+            total_entities: filtered.length,
+            total_areas: areas.length,
+            areas,
+            by_domain: byDomain,
+            registry_errors: errors,
+            note: 'Registry API nedostupné — zobrazuji entity ze stavů. Oblasti jsou ' + (areas.length ? areas.map(a => a.name).join(', ') : 'prázdné, vytvoř je v HA: Nastavení → Oblasti'),
+          };
+        }
+
         const entityByDevice = {};
         for (const e of (Array.isArray(entityReg) ? entityReg : [])) {
           if (e.device_id) {
@@ -879,7 +909,7 @@ async function executeTool(name, input, chatId) {
         }
         const areas = Array.isArray(areaReg) ? areaReg : [];
         const areaMap = Object.fromEntries(areas.map(a => [a.area_id, a.name]));
-        const devices = (Array.isArray(deviceReg) ? deviceReg : []).map(d => ({
+        const devices = deviceReg.map(d => ({
           device_id: d.id,
           name: d.name_by_user || d.name || 'Neznámé',
           manufacturer: d.manufacturer || '',
