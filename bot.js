@@ -348,8 +348,13 @@ function buildTools(chatId) {
       input_schema: { type: 'object', properties: {}, required: [] },
     },
     {
+      name: 'scan_all_devices',
+      description: 'Kompletní sken všech zařízení v HA — device registry, entity registry, oblasti. Vrátí zařízení podle místností, nezařazená zařízení, výrobce (Tuya, Sonoff, eWeLink, Zigbee apod.).',
+      input_schema: { type: 'object', properties: {}, required: [] },
+    },
+    {
       name: 'rename_entity',
-      description: 'Přejmenuje entitu v HA registru.',
+      description: 'Přejmenuje entitu v HA registru (friendly_name).',
       input_schema: {
         type: 'object',
         properties: {
@@ -360,8 +365,19 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'create_area',
+      description: 'Vytvoří novou místnost (oblast) v HA.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Název místnosti, např. Obývák' },
+        },
+        required: ['name'],
+      },
+    },
+    {
       name: 'assign_area',
-      description: 'Zařadí zařízení do oblasti (místnosti) v HA.',
+      description: 'Přiřadí entitu do místnosti v HA entity registry.',
       input_schema: {
         type: 'object',
         properties: {
@@ -369,6 +385,18 @@ function buildTools(chatId) {
           area_name: { type: 'string', description: 'Název oblasti, např. Obývák' },
         },
         required: ['entity_id', 'area_name'],
+      },
+    },
+    {
+      name: 'assign_device_to_area',
+      description: 'Přiřadí celé zařízení (device_id) do místnosti. Použij po scan_all_devices když znáš device_id.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          device_id: { type: 'string', description: 'ID zařízení z device registry' },
+          area_id: { type: 'string', description: 'area_id z area registry' },
+        },
+        required: ['device_id', 'area_id'],
       },
     },
     {
@@ -759,16 +787,84 @@ async function executeTool(name, input, chatId) {
         }
       }
 
+      case 'scan_all_devices': {
+        const [deviceReg, entityReg, areaReg] = await Promise.all([
+          haGet('config/device_registry/list').catch(() => []),
+          haGet('config/entity_registry/list').catch(() => []),
+          haGet('config/area_registry/list').catch(() => []),
+        ]);
+        const entityByDevice = {};
+        for (const e of (Array.isArray(entityReg) ? entityReg : [])) {
+          if (e.device_id) {
+            if (!entityByDevice[e.device_id]) entityByDevice[e.device_id] = [];
+            entityByDevice[e.device_id].push({
+              entity_id: e.entity_id,
+              name: e.name || e.original_name || e.entity_id,
+              area_id: e.area_id,
+              disabled: !!e.disabled_by,
+            });
+          }
+        }
+        const areas = Array.isArray(areaReg) ? areaReg : [];
+        const areaMap = Object.fromEntries(areas.map(a => [a.area_id, a.name]));
+        const devices = (Array.isArray(deviceReg) ? deviceReg : []).map(d => ({
+          device_id: d.id,
+          name: d.name_by_user || d.name || 'Neznámé',
+          manufacturer: d.manufacturer || '',
+          model: d.model || '',
+          area_id: d.area_id || null,
+          area_name: d.area_id ? (areaMap[d.area_id] || d.area_id) : null,
+          integration: (d.identifiers || []).map(i => i[0]).filter(Boolean).join(', '),
+          entities: entityByDevice[d.id] || [],
+        }));
+        const byArea = {};
+        for (const d of devices) {
+          const key = d.area_name || 'Bez místnosti';
+          if (!byArea[key]) byArea[key] = [];
+          byArea[key].push(d);
+        }
+        return {
+          total_devices: devices.length,
+          total_areas: areas.length,
+          areas: areas.map(a => ({ area_id: a.area_id, name: a.name })),
+          by_area: byArea,
+          unassigned: devices.filter(d => !d.area_id),
+        };
+      }
+
+      case 'create_area': {
+        if (!isAdmin(chatId)) return { error: 'Vytvoření místnosti vyžaduje admin přístup.' };
+        try {
+          const result = await haPost('config/area_registry/create', { name: input.name });
+          logAction(chatId, user.name, 'create_area', input.name, 'ok');
+          return { success: true, area_id: result.area_id, name: result.name };
+        } catch (e) {
+          return { error: `Vytvoření oblasti selhalo: ${e.message}` };
+        }
+      }
+
       case 'assign_area': {
         if (!isAdmin(chatId)) return { error: 'Přiřazení oblasti vyžaduje admin přístup.' };
         try {
-          // Nejdřív najdi area_id podle názvu
           const areas = await haGet('config/area_registry/list').catch(() => []);
-          let area = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === input.area_name.toLowerCase()) : null;
+          const area = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === input.area_name.toLowerCase()) : null;
           if (!area) {
-            return { error: `Oblast "${input.area_name}" nenalezena. Vytvoř ji nejdřív v HA Settings → Areas.`, suggestion: `Dostupné oblasti: ${Array.isArray(areas) ? areas.map(a => a.name).join(', ') : 'neznámo'}` };
+            return { error: `Oblast "${input.area_name}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
           }
-          return { success: true, message: `Entita zařazena do oblasti ${input.area_name}. Potvrď ručně v HA Settings → Devices.`, area_id: area.area_id };
+          await haPost('config/entity_registry/update', { entity_id: input.entity_id, area_id: area.area_id });
+          logAction(chatId, user.name, 'assign_area', input.entity_id, area.area_id);
+          return { success: true, message: `${input.entity_id} přiřazena do oblasti ${area.name}` };
+        } catch (e) {
+          return { error: e.message };
+        }
+      }
+
+      case 'assign_device_to_area': {
+        if (!isAdmin(chatId)) return { error: 'Přiřazení vyžaduje admin přístup.' };
+        try {
+          await haPost('config/device_registry/update', { device_id: input.device_id, area_id: input.area_id });
+          logAction(chatId, user.name, 'assign_device_area', input.device_id, input.area_id);
+          return { success: true, message: `Zařízení ${input.device_id} přiřazeno do oblasti ${input.area_id}` };
         } catch (e) {
           return { error: e.message };
         }
@@ -1155,12 +1251,41 @@ REPORT (když uživatel napíše "report"):
 - Použij generate_report pro data
 - Napiš přehledný lidský report: teploty, co běží, počasí, energie, zajímavosti
 
-NOVÉ ZAŘÍZENÍ (když uživatel napíše že připojil něco nového):
-1. get_new_entities — najdi co je nové
-2. Navrhni přejmenování a oblast
-3. Vytvoř balíček (po potvrzení)
-4. Navrhni automatizace a dashboard
-5. Navrhni HW který by to doplnil
+NOVÉ ZAŘÍZENÍ — kompletní workflow (spusť automaticky kdykoli uživatel zmíní nové/přidané zařízení):
+1. scan_all_devices — získej přehled VŠECH zařízení, místností a integrací
+2. Identifikuj nové/nezařazené zařízení podle kontextu (co uživatel popsal, jaká místnost)
+3. Navrhni logický český název (např. "Světlo obývák strop", "Senzor CO2 obývák")
+4. rename_entity — přejmenuj každou entitu zařízení
+5. Pokud místnost neexistuje → create_area ji vytvoř
+6. assign_device_to_area — přiřaď celé zařízení do místnosti (preferuj přes device_id)
+7. Navrhni automatizace odpovídající typu zařízení (světlo→stmívání/rozsvícení při pohybu, senzor CO2→upozornění nad 1000ppm, teploměr→topení)
+8. write_package — po potvrzení zapiš automatizace jako YAML balíček
+9. Navrhni doplňující HW nákupy (konkrétní model, značka, orientační cena v Kč)
+
+IDENTIFIKACE INTEGRACE ZE scan_all_devices:
+- integration obsahuje "tuya" → Tuya zařízení (žárovky, zásuvky, čidla přes Tuya app nebo cloud)
+- integration obsahuje "ewelink" → Sonoff přes eWeLink (spínače, zásuvky, sonoff série)
+- integration obsahuje "zha" nebo "zigbee" → Zigbee zařízení (Aqara, IKEA, Philips Hue atd.)
+- integration obsahuje "mqtt" → MQTT zařízení (Tasmota, ESPHome atd.)
+- manufacturer obsahuje "Xiaomi"/"Aqara" → Zigbee nebo Mi Home
+
+SENZORY — co dělat s různými typy:
+- temperature + humidity → navrhni automatizaci topení, upozornění na extrémní hodnoty
+- CO2 (unit ppm) → upozornění Telegram při >1000ppm, při >1500ppm varování, navrhni větrání
+- motion → automatizace světel, bezpečnostní upozornění
+- door/window sensor → upozornění při otevření v noci, při dešti
+- power/energy sensor → monitoring spotřeby, upozornění při anomálii
+- smoke/gas → okamžité Telegram upozornění
+
+NÁKUPNÍ DOPORUČENÍ — navrhni vždy konkrétně:
+Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [co to přidá]"
+Příklady doplnění:
+- Ke světlu bez stmívání → Shelly Dimmer 2 (~800 Kč) nebo Philips Hue (~600-1200 Kč/ks)
+- K teploměru bez topení → termostatická hlavice Aqara SRTS-A01 (~800 Kč) nebo Danfoss Ally (~1500 Kč)
+- K pohybovému senzoru → Aqara FP2 (mmWave přítomnost, ~1500 Kč) — přesnější než PIR
+- Chybí CO2 → SenseAir S8 DIY nebo Aranet4 (~2500 Kč) nebo Aqara TVOC Air Quality Monitor (~900 Kč)
+- Chybí měření spotřeby → Shelly EM (~1200 Kč) nebo Sonoff POW Elite (~600 Kč)
+- Chybí dveřní senzor → Aqara Door/Window (~400 Kč) nebo Sonoff SNZB-04 (~250 Kč)
 
 TESTOVACÍ PLÁNOVÁNÍ:
 - Dashboardy: název-test.yaml
