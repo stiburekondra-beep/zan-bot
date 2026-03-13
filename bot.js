@@ -542,6 +542,11 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'list_www_images',
+        description: 'Zobrazí obrázky uložené v /config/www/zan/ které lze použít v dashboardech.',
+        input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
         name: 'reload_ha',
         description: 'Reloadne část HA po změně YAML.',
         input_schema: {
@@ -1154,6 +1159,18 @@ async function executeTool(name, input, chatId) {
         return { content };
       }
 
+      case 'list_www_images': {
+        const wwwDir = path.join(HA_CONFIG_PATH, 'www', 'zan');
+        try {
+          if (!fs.existsSync(wwwDir)) return { images: [], note: 'Složka /config/www/zan/ zatím neexistuje — pošli fotku s textem "dashboard" nebo "domeček"' };
+          const files = fs.readdirSync(wwwDir).filter(f => /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(f));
+          return {
+            images: files.map(f => ({ filename: f, url: `/local/zan/${f}`, yaml: `image: "/local/zan/${f}"` })),
+            count: files.length,
+          };
+        } catch (e) { return { error: e.message }; }
+      }
+
       case 'reload_ha': {
         const map = {
           automations: 'config/automation/reload',
@@ -1746,7 +1763,26 @@ bot.on('message', async (msg) => {
 
       logAction(chatId, user.name, 'photo_received', isGardenPhoto ? 'garden' : 'general', caption.substring(0, 50));
 
-      if (isGardenPhoto) {
+      // Detekce: chce uložit fotku do dashboardu?
+      const dashboardImageKeywords = ['dashboard', 'domeček', 'domecek', 'pozadí', 'pozadi', 'logo', 'ikona', 'obrázek', 'obrazek', 'fotka do', 'ulož', 'uloz'];
+      const isDashboardImage = dashboardImageKeywords.some(k => caption.toLowerCase().includes(k));
+
+      if (isDashboardImage) {
+        // Ulož do /config/www/zan/
+        const wwwDir = path.join(HA_CONFIG_PATH, 'www', 'zan');
+        if (!fs.existsSync(wwwDir)) fs.mkdirSync(wwwDir, { recursive: true });
+        const timestamp = Date.now();
+        const filename = `foto_${timestamp}.jpg`;
+        const filepath = path.join(wwwDir, filename);
+        fs.writeFileSync(filepath, Buffer.from(imgResp.data));
+        const localUrl = `/local/zan/${filename}`;
+        logAction(chatId, user.name, 'image_saved', filename, 'ok');
+        const saveMsg = `📸 Fotka uložena! Můžu ji použít v dashboardu jako:\n\`\`\`yaml\n- type: picture\n  image: "${localUrl}"\n\`\`\`\nURL: \`${localUrl}\``;
+        bot.sendMessage(chatId, saveMsg, { parse_mode: 'Markdown' });
+        const userCaption = caption || 'Fotka uložena pro dashboard.';
+        const response = await processMessage(chatId, `${userCaption} (fotka uložena jako ${localUrl})`, base64);
+        bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+      } else if (isGardenPhoto) {
         bot.sendMessage(chatId, '🌱 Koukám na fotku...');
         const garden = loadGarden();
         const memory = loadMemory();
