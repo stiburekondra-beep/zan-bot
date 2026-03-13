@@ -524,6 +524,24 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'validate_dashboard',
+        description: 'Přečte dashboard, najde všechny entity v něm a zkontroluje které existují v HA a které ne. Základ pro úklid dashboardu.',
+        input_schema: {
+          type: 'object',
+          properties: { filename: { type: 'string', description: 'Název souboru dashboardu' } },
+          required: ['filename'],
+        },
+      },
+      {
+        name: 'delete_dashboard',
+        description: 'Smaže soubor dashboardu.',
+        input_schema: {
+          type: 'object',
+          properties: { filename: { type: 'string' } },
+          required: ['filename'],
+        },
+      },
+      {
         name: 'reload_ha',
         description: 'Reloadne část HA po změně YAML.',
         input_schema: {
@@ -1073,6 +1091,62 @@ async function executeTool(name, input, chatId) {
         } catch (e) { return { error: e.message }; }
       }
 
+      case 'validate_dashboard': {
+        const fp = getDashboardPath(input.filename);
+        const content = readYamlFile(fp);
+        if (!content) return { error: `Dashboard ${input.filename} neexistuje` };
+
+        // Vytáhni všechny entity_id z YAML textu
+        const entityMatches = content.match(/entity:\s*([^\s\n#]+)/g) || [];
+        const entitiesMatches = content.match(/entities:\s*\n([\s\S]*?)(?=\n\s*\w+:|$)/g) || [];
+        const foundEntities = new Set();
+
+        for (const m of entityMatches) {
+          const e = m.replace(/entity:\s*/, '').trim();
+          if (e.includes('.')) foundEntities.add(e);
+        }
+        // Také hledej entity v seznamech (- entity_id nebo - light.xxx)
+        const listMatches = content.match(/- ([\w]+\.[\w]+)/g) || [];
+        for (const m of listMatches) {
+          foundEntities.add(m.replace('- ', '').trim());
+        }
+
+        const allEntities = [...foundEntities];
+        if (allEntities.length === 0) return { content, entities_found: 0, note: 'Žádné entity nenalezeny v YAML' };
+
+        // Zkontroluj které existují v HA
+        const states = await haGet('states');
+        const existingIds = new Set(states.map(s => s.entity_id));
+
+        const valid = allEntities.filter(e => existingIds.has(e));
+        const missing = allEntities.filter(e => !existingIds.has(e));
+        const stateInfo = valid.map(e => {
+          const s = states.find(st => st.entity_id === e);
+          return { entity_id: e, name: s?.attributes?.friendly_name || e, state: s?.state, domain: e.split('.')[0] };
+        });
+
+        return {
+          filename: input.filename,
+          total_entities: allEntities.length,
+          valid: stateInfo,
+          missing,
+          missing_count: missing.length,
+          content,
+          summary: `${valid.length} entit existuje, ${missing.length} chybí v HA`,
+        };
+      }
+
+      case 'delete_dashboard': {
+        if (!isAdmin(chatId)) return { error: 'Smazání vyžaduje admin přístup.' };
+        const fp = getDashboardPath(input.filename);
+        try {
+          if (!fs.existsSync(fp)) return { error: `Dashboard ${input.filename} neexistuje` };
+          fs.unlinkSync(fp);
+          logAction(chatId, user.name, 'delete_dashboard', input.filename, 'ok');
+          return { success: true, message: `Dashboard ${input.filename} smazán` };
+        } catch (e) { return { error: e.message }; }
+      }
+
       case 'read_dashboard': {
         const fp = getDashboardPath(input.filename);
         const content = readYamlFile(fp);
@@ -1408,6 +1482,19 @@ Příklady doplnění:
 - Chybí CO2 → SenseAir S8 DIY nebo Aranet4 (~2500 Kč) nebo Aqara TVOC Air Quality Monitor (~900 Kč)
 - Chybí měření spotřeby → Shelly EM (~1200 Kč) nebo Sonoff POW Elite (~600 Kč)
 - Chybí dveřní senzor → Aqara Door/Window (~400 Kč) nebo Sonoff SNZB-04 (~250 Kč)
+
+ÚKLID DASHBOARDU — workflow (spusť když uživatel říká "udělej pořádek", "vyčisti dashboard", "bordel", "přepiš dashboard"):
+1. list_dashboards — zjisti jaké dashboardy existují
+2. validate_dashboard — přečti dashboard a zkontroluj které entity existují v HA a které ne
+3. Vyhodnoť co v dashboardu je:
+   - entity které neexistují v HA → smaž
+   - duplicitní karty → slij do jedné
+   - nesmyslné spouštěče/scény bez entity → odstraň
+   - entity které existují → zachovej a hezky uspořádej
+4. Navrhni novou strukturu dashboardu — popiš uživateli CO smažeš a CO přidáš, ČEKEJ na souhlas
+5. Po souhlasu: write_dashboard — přepiš dashboardem novým čistým YAML
+6. reload_ha (lovelace) — načti změny
+Nikdy nemaž dashboard bez výslovného souhlasu uživatele!
 
 TESTOVACÍ DASHBOARDY — kompletní workflow:
 Kdykoli uživatel chce "zkusit", "otestovat", "naplánovat" nebo "vyzkoušet" dashboard:
