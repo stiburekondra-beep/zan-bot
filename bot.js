@@ -102,7 +102,25 @@ function loadMemory() {
     if (fs.existsSync(MEMORY_FILE)) return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
   } catch (e) { console.error('Memory load error:', e.message); }
   return {
-    home_name: 'Dům Žán', residents: {}, rooms: {}, devices: {},
+    home_name: 'Dům Žán',
+    residents: {
+      ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
+      jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
+      stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
+      matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+      eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+    },
+    house: {
+      name: 'Dům Žán',
+      address: '',
+      type: '',
+      year_built: '',
+      photo_url: '',
+      info: '',
+      rooms_count: '',
+      floors: '',
+    },
+    rooms: {}, devices: {},
     preferences: {}, notes: [],
     known_entities: [],
     checkin: { last_asked: null, pending_topics: [], declined_at: null },
@@ -408,6 +426,31 @@ function buildTools(chatId) {
       name: 'generate_report',
       description: 'Vygeneruje report o stavu domu — teploty, pohyb, počasí, energie, co se dělo.',
       input_schema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'update_family_member',
+      description: 'Aktualizuje info o členu rodiny v paměti a přegeneruje rodinný dashboard. Použij kdykoli se dozvíš něco o členovi rodiny.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          member_id: { type: 'string', description: 'ondra, jana, stepan, matej, eliska' },
+          field: { type: 'string', description: 'Pole: info, preferences, photo_url, nebo libovolný klíč' },
+          value: { type: 'string' },
+        },
+        required: ['member_id', 'field', 'value'],
+      },
+    },
+    {
+      name: 'update_house_info',
+      description: 'Aktualizuje info o domě a přegeneruje rodinný dashboard.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          field: { type: 'string', description: 'Pole: name, address, type, year_built, photo_url, info, floors, rooms_count' },
+          value: { type: 'string' },
+        },
+        required: ['field', 'value'],
+      },
     },
     {
       name: 'checkin_schedule',
@@ -927,6 +970,22 @@ async function executeTool(name, input, chatId) {
         return { temps, motion, lightsOn, switchesOn, weather, energy, generated_at: new Date().toLocaleString('cs-CZ') };
       }
 
+      case 'update_family_member': {
+        if (!memory.residents[input.member_id]) return { error: `Člen "${input.member_id}" nenalezen. Dostupní: ondra, jana, stepan, matej, eliska` };
+        memory.residents[input.member_id][input.field] = input.value;
+        saveMemory(memory);
+        await createFamilyDashboard();
+        return { success: true, message: `${memory.residents[input.member_id].name}: ${input.field} aktualizováno. Dashboard přegenerován.` };
+      }
+
+      case 'update_house_info': {
+        if (!memory.house) memory.house = {};
+        memory.house[input.field] = input.value;
+        saveMemory(memory);
+        await createFamilyDashboard();
+        return { success: true, message: `Domeček: ${input.field} = ${input.value}. Dashboard přegenerován.` };
+      }
+
       case 'checkin_schedule': {
         if (!memory.checkin) memory.checkin = { last_asked: null, pending_topics: [], declined_at: null };
         const now = new Date().toISOString();
@@ -1264,10 +1323,25 @@ Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na map
 TVOJE CHOVÁNÍ:
 - Vždy potvrď SKUTEČNOU akci — nikdy netvrď že jsi něco provedl pokud jsi nezavolal nástroj
 - Po každé změně YAML popiš změny LIDSKY a srozumitelně, ne technicky
-- Automaticky si pamatuj nové info o domě
+- Automaticky si pamatuj nové info o domě, o lidech, o preferencích
 - Jednou týdně se nenásilně zeptej na věci o domě (přes checkin_schedule)
 - Navrhuj konkrétní IoT HW s modelem a cenou když vidíš příležitost
 - Pro testovací věci (plánování bez HW) používej dashboardy a balíčky s příponou -test
+- Kdykoli se dozvíš info o členovi rodiny nebo domě → update_family_member / update_house_info
+
+ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ ENTITY:
+Helpery (simulace) = entity začínající na: input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
+Reálné fyzické senzory = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
+Pokud NEVÍŠ jestli je entita reálná nebo helper → ZEPTEJ SE ("Je to fyzické zařízení nebo jen simulace v HA?")
+V dashboardech vždy označ helpery jako "(sim)", reálné entity bez označení.
+Při návrhu automatizací upozorni: "Tato automatizace funguje jen pokud [entita] je reálný senzor, ne helper."
+
+RODINA — ${Object.values(memory.residents || {}).map(r => `${r.emoji || ''} ${r.name} (*${r.born || ''}*)`).join(', ')}:
+- Detaily: ${JSON.stringify(memory.residents)}
+- Domeček: ${JSON.stringify(memory.house || {})}
+- update_family_member: kdykoli řeknou info o sobě (koníčky, oblíbené věci, zdraví atd.)
+- update_house_info: kdykoli řeknou info o domě (adresa, typ, rok stavby, foto)
+- Rodinný dashboard Rodina.yaml se automaticky přegeneruje po každé aktualizaci
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
@@ -1935,6 +2009,100 @@ Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`
 }
 
 // ═══════════════════════════════════════════════
+// RODINNÝ DASHBOARD
+// ═══════════════════════════════════════════════
+function generateFamilyDashboardYaml(residents, house) {
+  const r = residents || {};
+  const h = house || {};
+
+  function ageCard(member) {
+    const { name, born, emoji, info } = member;
+    const infoLine = info ? `\n${info}` : '\n_Žádné info — doplň mi to_ 🙂';
+    return `          - type: markdown
+            content: >
+              <center>
+              <h2>${emoji} ${name}</h2>
+              🎂 ${born.split('-').reverse().join('. ')}
+              **{{ ((as_timestamp(now()) - as_timestamp(strptime('${born}', '%Y-%m-%d'))) / (365.25 * 86400)) | int }} let**${infoLine}
+              </center>`;
+  }
+
+  const parents = ['ondra', 'jana'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
+  const kids    = ['stepan', 'matej', 'eliska'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
+
+  const housePhoto = h.photo_url
+    ? `      - type: picture\n        image: "${h.photo_url}"\n`
+    : '';
+  const houseInfo = [
+    h.address    && `📍 ${h.address}`,
+    h.type       && `🏠 ${h.type}`,
+    h.year_built && `📅 Rok stavby: ${h.year_built}`,
+    h.floors     && `🏢 Podlaží: ${h.floors}`,
+    h.rooms_count && `🚪 Místností: ${h.rooms_count}`,
+    h.info       && `ℹ️ ${h.info}`,
+  ].filter(Boolean).join('\n              ') || '_Zatím žádné info — řekni mi o domě víc_ 🏡';
+
+  return `title: Rodina
+views:
+  - title: Rodina
+    path: rodina
+    icon: mdi:home-heart
+    cards:
+
+      # ── HEADER ──
+      - type: markdown
+        content: >
+          <center><h2>🏠 ${h.name || 'Dům Žán'}</h2>
+          {{ now().strftime('%-d. %-m. %Y') }}</center>
+
+      # ── RODIČE ──
+      - type: horizontal-stack
+        cards:
+${parents}
+
+      # ── DĚTI ──
+      - type: horizontal-stack
+        cards:
+${kids}
+${housePhoto}
+      # ── DOMEČEK ──
+      - type: markdown
+        title: "🏠 Náš domeček"
+        content: >
+              ${houseInfo}
+`;
+}
+
+async function createFamilyDashboard() {
+  try {
+    const memory = loadMemory();
+    // Doplň chybějící členy rodiny pokud paměť existuje ale je stará
+    const defaults = {
+      ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
+      jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
+      stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
+      matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+      eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+    };
+    let changed = false;
+    for (const [key, val] of Object.entries(defaults)) {
+      if (!memory.residents[key]) { memory.residents[key] = val; changed = true; }
+      else if (!memory.residents[key].born) { memory.residents[key] = { ...val, ...memory.residents[key] }; changed = true; }
+    }
+    if (!memory.house) { memory.house = {}; changed = true; }
+    if (changed) saveMemory(memory);
+
+    const yaml = generateFamilyDashboardYaml(memory.residents, memory.house);
+    const fp = path.join(HA_CONFIG_PATH, 'dashboards', 'Rodina.yaml');
+    const ok = writeYamlFile(fp, yaml);
+    if (ok) console.log('👨‍👩‍👧‍👦 Rodinný dashboard vytvořen: dashboards/Rodina.yaml');
+    else console.warn('⚠️ Rodinný dashboard — zápis selhal (config path nedostupný)');
+  } catch (e) {
+    console.error('Family dashboard error:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════
 // ČASOVAČE
 // ═══════════════════════════════════════════════
 // Polluj stavy každých 5 minut
@@ -1948,7 +2116,7 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Startup — načti aktuální stavy jako baseline
+// Startup — načti aktuální stavy jako baseline + vytvoř rodinný dashboard
 setTimeout(async () => {
   try {
     const states = await haGet('states');
@@ -1958,6 +2126,7 @@ setTimeout(async () => {
     }
     console.log(`📊 Baseline načten: ${Object.keys(lastStates).length} sledovaných entit`);
   } catch {}
+  await createFamilyDashboard();
 }, 5000);
 
 // Startup
