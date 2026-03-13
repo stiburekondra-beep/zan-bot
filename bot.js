@@ -185,6 +185,13 @@ async function isHaOnline() {
   try { await haGet(''); return true; } catch { return false; }
 }
 
+// HA config registry — zkusí GET, pak POST (HA různé verze používají různé metody)
+async function haRegistry(name) {
+  try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch {}
+  try { const r = await haPost(`config/${name}/list`, {}); if (Array.isArray(r)) return r; } catch {}
+  return null;
+}
+
 async function isAiStopped() {
   try { const s = await haGet('states/input_boolean.ai_stop'); return s.state === 'on'; } catch { return false; }
 }
@@ -865,9 +872,9 @@ async function executeTool(name, input, chatId) {
       case 'scan_all_devices': {
         const errors = {};
         const [deviceReg, entityReg, areaReg] = await Promise.all([
-          haGet('config/device_registry/list').catch(e => { errors.device_registry = e.message; return null; }),
-          haGet('config/entity_registry/list').catch(e => { errors.entity_registry = e.message; return null; }),
-          haGet('config/area_registry/list').catch(e => { errors.area_registry = e.message; return null; }),
+          haRegistry('device_registry').catch(e => { errors.device_registry = e.message; return null; }),
+          haRegistry('entity_registry').catch(e => { errors.entity_registry = e.message; return null; }),
+          haRegistry('area_registry').catch(e => { errors.area_registry = e.message; return null; }),
         ]);
 
         if (Object.keys(errors).length) console.warn('scan_all_devices errors:', errors);
@@ -954,7 +961,7 @@ async function executeTool(name, input, chatId) {
       case 'assign_area': {
         if (!isAdmin(chatId)) return { error: 'Přiřazení oblasti vyžaduje admin přístup.' };
         try {
-          const areas = await haGet('config/area_registry/list').catch(() => []);
+          const areas = await haRegistry('area_registry').catch(() => []);
           const area = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === input.area_name.toLowerCase()) : null;
           if (!area) {
             return { error: `Oblast "${input.area_name}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
@@ -973,7 +980,7 @@ async function executeTool(name, input, chatId) {
           let area_id = input.area_id;
           // Pokud dostaneme název oblasti místo ID, vyhledáme area_id
           if (area_id && !area_id.match(/^[a-z0-9_]+$/)) {
-            const areas = await haGet('config/area_registry/list').catch(() => []);
+            const areas = await haRegistry('area_registry').catch(() => []);
             const found = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === area_id.toLowerCase()) : null;
             if (!found) return { error: `Oblast "${area_id}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
             area_id = found.area_id;
@@ -2256,7 +2263,7 @@ setTimeout(async () => {
 
   // 2. Sync místností z HA area registry → memory.rooms
   try {
-    const areas = await haGet('config/area_registry/list');
+    const areas = await haRegistry('area_registry');
     if (Array.isArray(areas) && areas.length > 0) {
       const memory = loadMemory();
       let changed = false;
