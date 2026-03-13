@@ -1417,7 +1417,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-
+  if (text === '/navyky' && isAdmin(chatId)) {
     const events = loadEvents();
     const habits = loadHabits();
     let out = '🧠 *Sledování návyků:*\n\n';
