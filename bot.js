@@ -2021,62 +2021,51 @@ function generateFamilyDashboardYaml(residents, house) {
   const r = residents || {};
   const h = house || {};
 
+  function esc(s) { return (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
   function ageCard(member) {
     const { name, born, emoji, info } = member;
-    const infoLine = info ? `\n${info}` : '\n_Žádné info — doplň mi to_ 🙂';
-    return `          - type: markdown
-            content: >
-              <center>
-              <h2>${emoji} ${name}</h2>
-              🎂 ${born.split('-').reverse().join('. ')}
-              **{{ ((as_timestamp(now()) - as_timestamp(strptime('${born}', '%Y-%m-%d'))) / (365.25 * 86400)) | int }} let**${infoLine}
-              </center>`;
+    const bornDisplay = born.split('-').reverse().join('. ');
+    const infoText = info ? esc(info) : 'Doplň mi info o sobě 🙂';
+    const age = `{{ ((as_timestamp(now()) - as_timestamp(strptime('${born}', '%Y-%m-%d'))) / (365.25 * 86400)) | int }}`;
+    return `          - type: markdown\n            content: "${emoji} **${name}** | 🎂 ${bornDisplay} · **${age} let**\\n${infoText}"`;
   }
 
   const parents = ['ondra', 'jana'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
   const kids    = ['stepan', 'matej', 'eliska'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
 
   const housePhoto = h.photo_url
-    ? `      - type: picture\n        image: "${h.photo_url}"\n`
+    ? `      - type: picture\n        image: "${esc(h.photo_url)}"\n`
     : '';
   const houseInfo = [
-    h.address    && `📍 ${h.address}`,
-    h.type       && `🏠 ${h.type}`,
-    h.year_built && `📅 Rok stavby: ${h.year_built}`,
-    h.floors     && `🏢 Podlaží: ${h.floors}`,
+    h.address     && `📍 ${h.address}`,
+    h.type        && `🏠 ${h.type}`,
+    h.year_built  && `📅 Rok stavby: ${h.year_built}`,
+    h.floors      && `🏢 Podlaží: ${h.floors}`,
     h.rooms_count && `🚪 Místností: ${h.rooms_count}`,
-    h.info       && `ℹ️ ${h.info}`,
-  ].filter(Boolean).join('\n              ') || '_Zatím žádné info — řekni mi o domě víc_ 🏡';
+    h.info        && `ℹ️ ${h.info}`,
+  ].filter(Boolean).join('\\n') || 'Zatím žádné info — řekni mi o domě víc 🏡';
 
-  return `title: Rodina
-views:
-  - title: Rodina
-    path: rodina
-    icon: mdi:home-heart
-    cards:
-
-      # ── HEADER ──
-      - type: markdown
-        content: >
-          <center><h2>🏠 ${h.name || 'Dům Žán'}</h2>
-          {{ now().strftime('%-d. %-m. %Y') }}</center>
-
-      # ── RODIČE ──
-      - type: horizontal-stack
-        cards:
-${parents}
-
-      # ── DĚTI ──
-      - type: horizontal-stack
-        cards:
-${kids}
-${housePhoto}
-      # ── DOMEČEK ──
-      - type: markdown
-        title: "🏠 Náš domeček"
-        content: >
-              ${houseInfo}
-`;
+  const homeName = esc(h.name || 'Dům Žán');
+  return [
+    'title: Rodina',
+    'views:',
+    '  - title: Rodina',
+    '    path: rodina',
+    '    icon: mdi:home-heart',
+    '    cards:',
+    `      - type: markdown`,
+    `        content: "<center><h2>🏠 ${homeName}</h2>{{ now().strftime('%-d. %-m. %Y') }}</center>"`,
+    '      - type: horizontal-stack',
+    '        cards:',
+    parents,
+    '      - type: horizontal-stack',
+    '        cards:',
+    kids,
+    housePhoto,
+    '      - type: markdown',
+    '        title: "🏠 Náš domeček"',
+    `        content: "${houseInfo}"`,
+  ].join('\n') + '\n';
 }
 
 async function createFamilyDashboard() {
