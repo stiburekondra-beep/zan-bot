@@ -1499,9 +1499,16 @@ Při návrhu automatizací upozorni: "Tato automatizace funguje jen pokud [entit
 RODINA — ${Object.values(memory.residents || {}).map(r => `${r.emoji || ''} ${r.name} (*${r.born || ''}*)`).join(', ')}:
 - Detaily: ${JSON.stringify(memory.residents)}
 - Domeček: ${JSON.stringify(memory.house || {})}
-- update_family_member: kdykoli řeknou info o sobě (koníčky, oblíbené věci, zdraví atd.)
+- update_family_member: VŽDY zavolej když se dozvíš cokoli o členovi rodiny — koníčky, práce, zdraví, oblíbené věci, nálada, plány. Pole "info" je volný text zobrazený v dashboardu. Ulož OKAMŽITĚ, nečekej na potvrzení.
 - update_house_info: kdykoli řeknou info o domě (adresa, typ, rok stavby, foto)
 - Rodinný dashboard Rodina.yaml se automaticky přegeneruje po každé aktualizaci
+
+DASHBOARD RODINA — volitelná pole pro každého člena (nastav přes update_family_member):
+- info: volný text zobrazený v dashboardě (koníčky, zajímavosti, aktuální stav) — DOPLŇUJ PRŮBĚŽNĚ
+- work_schedule: pracovní doba, např. "Po-Pá 7:30-16:00" nebo "Střídavé směny"
+- person_entity: HA entita pro sledování polohy, např. "person.ondra" (nastav až víš správné ID)
+- calendar_entity: HA entita kalendáře, např. "calendar.ondra" (nastav až víš správné ID)
+Dashboard automaticky zobrazuje: 📍 poloha (z person entity), 📅 aktuální událost + ⏰ čas konce (z calendar entity)
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
@@ -2156,16 +2163,63 @@ function generateFamilyDashboardYaml(residents, house) {
   const h = house || {};
 
   function esc(s) { return (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
-  function ageCard(member) {
-    const { name, born, emoji, info } = member;
-    const bornDisplay = born.split('-').reverse().join('. ');
-    const infoText = info ? esc(info) : 'Doplň mi info o sobě 🙂';
-    const age = `{{ ((as_timestamp(now()) - as_timestamp(strptime('${born}', '%Y-%m-%d'))) / (365.25 * 86400)) | int }}`;
-    return `          - type: markdown\n            content: "${emoji} **${name}** | 🎂 ${bornDisplay} · **${age} let**\\n${infoText}"`;
+
+  function ageExpr(born) {
+    return `{{ ((as_timestamp(now()) - as_timestamp(strptime('${born}', '%Y-%m-%d'))) / (365.25 * 86400)) | int }}`;
   }
 
-  const parents = ['ondra', 'jana'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
-  const kids    = ['stepan', 'matej', 'eliska'].filter(k => r[k]).map(k => ageCard(r[k])).join('\n');
+  // Karta pro dítě — jen věk + info
+  function kidCard(member) {
+    const { name, born, emoji, info } = member;
+    const bornDisplay = born.split('-').reverse().join('. ');
+    const infoText = esc(info || 'Doplň mi info o sobě 🙂');
+    return `          - type: markdown\n            content: "${emoji} **${name}** | 🎂 ${bornDisplay} · **${ageExpr(born)} let**\\n${infoText}"`;
+  }
+
+  // Karta pro dospělého — věk + poloha (person entity) + kalendář + info
+  function adultCard(key, member) {
+    const { name, born, emoji, info, work_schedule } = member;
+    const bornDisplay = born.split('-').reverse().join('. ');
+    const pEnt = member.person_entity || `person.${key}`;
+    const calEnt = member.calendar_entity || `calendar.${key}`;
+
+    // Poloha z person entity — 'home' → 🏠 Doma, zóna → 📍 název zóny, not_home → 📍 Mimo domov
+    const locTpl = `{% set _l=states('${pEnt}') %}` +
+      `{% if _l=='home' %}🏠 Doma` +
+      `{% elif _l in ['unavailable','unknown','not_home',''] %}📵 Nesledován` +
+      `{% else %}📍 {{ _l }}{% endif %}`;
+
+    // Kalendář — aktuální nebo nejbližší událost + čas konce (= návrat)
+    const calTpl = `{% set _e=state_attr('${calEnt}','message') %}` +
+      `{% set _t=state_attr('${calEnt}','end_time') %}` +
+      `{% if _e is not none %}` +
+        `📅 {{ _e }}{% if _t is not none %} · ⏰ návrat {{ _t[11:16] }}{% endif %}` +
+      `{% endif %}`;
+
+    const schedLine = work_schedule ? `⏰ Plán: ${esc(work_schedule)}` : '';
+    const infoText = esc(info || 'Doplň mi info o sobě 🙂');
+
+    const contentParts = [
+      `${emoji} **${name}** | 🎂 ${bornDisplay} · **${ageExpr(born)} let**`,
+      locTpl,
+      calTpl,
+      schedLine,
+      infoText,
+    ].filter(Boolean).join('\\n');
+
+    return [
+      `          - type: vertical-stack`,
+      `            cards:`,
+      `              - type: tile`,
+      `                entity: ${pEnt}`,
+      `                name: "${esc(name)}"`,
+      `              - type: markdown`,
+      `                content: "${contentParts}"`,
+    ].join('\n');
+  }
+
+  const parents = ['ondra', 'jana'].filter(k => r[k]).map(k => adultCard(k, r[k])).join('\n');
+  const kids    = ['stepan', 'matej', 'eliska'].filter(k => r[k]).map(k => kidCard(r[k])).join('\n');
 
   const housePhoto = h.photo_url
     ? `      - type: picture\n        image: "${esc(h.photo_url)}"\n`
