@@ -1811,68 +1811,6 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // ── ZAHRADA TRIGGER ──
-  const gardenTriggers = ['jdu na zahradu', 'idem na zahradu', 'jdu ven na zahradu', 'zahrada', 'co dělat na zahradě', 'co delat na zahrade'];
-  if (gardenTriggers.some(t => text.toLowerCase().includes(t))) {
-    bot.sendChatAction(chatId, 'typing');
-    try {
-      const garden = loadGarden();
-      const gardenKnown = Object.keys(garden.map || {}).length > 0 || garden.notes.length > 0;
-
-      // První kontakt — Žán se představí a nabídne dashboard
-      if (!gardenKnown) {
-        const intro = `🌱 *Ahoj Jano! Jsem Žán — a zahrada je moje oblíbená část domu!*\n\n` +
-          `Chci ti být dobrým zahradním pomocníkem. Tady je co spolu zvládneme:\n\n` +
-          `🗺️ *Mapa zahrady* — popíšeš mi kde co roste a já si to zapamatuji\n` +
-          `📸 *Fotky rostlin* — vyfotíš cokoliv a já to identifikuji, přidám do mapy a budu sledovat jak roste v průběhu roku\n` +
-          `🔍 *Diagnóza problémů* — vyfotíš nemocný list nebo škůdce a já navrhnu řešení\n` +
-          `📅 *Sezónní rady* — každý měsíc vím co je potřeba udělat s rajčaty, růžemi nebo jabloněmi\n` +
-          `🔄 *Střídání plodin* — pamatuji si co bylo kde a upozorním tě když by se něco nemělo opakovat\n` +
-          `📔 *Zahradní deník* — vše co mi řekneš si zapisuji s datem\n` +
-          `💧 *Automatizace* — až budeš mít chytrou závlahu, propojím ji s počasím\n\n` +
-          `Než začneme — *mám ti vytvořit přehledový dashboard "Zahrada" v Home Assistant?* ` +
-          `Zatím jako testovací verzi kde uvidíš počasí, teplotu, vlhkost a připravím tam místo pro budoucí senzory (závlaha, půdní vlhkost, kamera na zahradu).\n\n` +
-          `Napiš *"ano, udělej dashboard"* nebo rovnou popiš svoji zahradu a začneme! 🌻`;
-
-        bot.sendMessage(chatId, intro, { parse_mode: 'Markdown' });
-        return;
-      }
-
-      // Zahrada je známá — normální brief
-      const advice = await generateGardenAdvice(chatId);
-      bot.sendMessage(chatId, `🌱 *Zahradní brief:*\n\n${advice}`, { parse_mode: 'Markdown' });
-    } catch (e) {
-      bot.sendMessage(chatId, '❌ Nepodařilo se načíst zahradní rady: ' + e.message);
-    }
-    return;
-  }
-
-  // Zahradní dashboard trigger
-  const dashTriggers = ['ano, udělej dashboard', 'ano udělej dashboard', 'vytvoř zahradní dashboard', 'zahradní dashboard', 'dashboard zahrada'];
-  if (dashTriggers.some(t => text.toLowerCase().includes(t))) {
-    bot.sendChatAction(chatId, 'typing');
-    bot.sendMessage(chatId, '🌱 Vytvářím testovací dashboard Zahrada...');
-    try {
-      const response = await processMessage(chatId,
-        `Vytvoř testovací dashboard "zahrada-test.yaml" pro Janu. 
-Dashboard má obsahovat:
-1. Sekce "Počasí a podmínky" — karty pro weather entitu, venkovní teplotu a vlhkost pokud existují
-2. Sekce "Závlaha" — zatím prázdná s komentářem že čeká na chytrou závlahu (placeholder entity input_boolean.zavlaha_test)
-3. Sekce "Senzory půdy" — placeholder pro budoucí senzory vlhkosti půdy  
-4. Sekce "Kamera zahrada" — placeholder pro budoucí kameru
-5. Sekce "Rychlé akce" — tlačítka pro scény pokud existují
-
-Použij moderní Lovelace karty (weather-forecast, gauge, button). 
-Nezapomeň na YAML hlavičku dashboardu. Po vytvoření vysvětli Janě lidsky co dashboard obsahuje a jak ho přidat do HA.`
-      );
-      bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
-    } catch (e) {
-      bot.sendMessage(chatId, '❌ ' + e.message);
-    }
-    return;
-  }
-
-
   bot.sendChatAction(chatId, 'typing');
   try {
     const response = await processMessage(chatId, text);
