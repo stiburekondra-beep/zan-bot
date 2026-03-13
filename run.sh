@@ -10,8 +10,8 @@ export OPENAI_API_KEY=$(jq --raw-output '.OPENAI_API_KEY' /data/options.json)
 export PLANTID_API_KEY=$(jq --raw-output '.PLANTID_API_KEY // ""' /data/options.json)
 
 # HA přístup přes supervisor
-# s6-overlay v3 nepředává env vars z kontejneru — čteme z PID 1
-export SUPERVISOR_TOKEN=$(cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | grep '^SUPERVISOR_TOKEN=' | cut -d= -f2-)
+# s6-overlay v3 ukládá env vars jako soubory v /var/run/s6/container_environment/
+export SUPERVISOR_TOKEN=$(cat /var/run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || echo "")
 export HA_URL="http://supervisor/core"
 export HA_TOKEN="${SUPERVISOR_TOKEN}"
 export HA_CONFIG_PATH="/config"
