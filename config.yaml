@@ -1,0 +1,33 @@
+name: "Žán Bot"
+description: "AI správce domu Žán — Telegram bot pro Home Assistant"
+version: "5.0.0"
+slug: "zan_bot"
+init: false
+arch:
+  - amd64
+  - aarch64
+  - armv7
+homeassistant_api: true
+hassio_api: true
+auth_api: true
+ingress: false
+startup: application
+boot: auto
+map:
+  - config:rw
+options:
+  TELEGRAM_TOKEN: ""
+  CHAT_ID_ONDRA: ""
+  CHAT_ID_JANA: ""
+  EXTRA_CHAT_IDS: ""
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  PLANTID_API_KEY: ""
+schema:
+  TELEGRAM_TOKEN: str
+  CHAT_ID_ONDRA: str
+  CHAT_ID_JANA: str
+  EXTRA_CHAT_IDS: str?
+  ANTHROPIC_API_KEY: str
+  OPENAI_API_KEY: str
+  PLANTID_API_KEY: str?

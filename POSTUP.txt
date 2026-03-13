@@ -1,0 +1,49 @@
+POSTUP — nahrání na GitHub a instalace jako HA add-on
+======================================================
+
+1. PŘIPRAV SLOŽKU NA HLAVNÍM PC
+--------------------------------
+Vytvoř složku: C:\Users\Ondra\zan-bot\
+
+Zkopíruj do ní tyto soubory:
+  - bot.js          (stáhni z Claude chatu)
+  - package.json    (stáhni z notebooku)
+  - Dockerfile      (stáhni z Claude chatu)
+  - run.sh          (stáhni z Claude chatu)
+  - config.yaml     (stáhni z Claude chatu)
+  - repository.json (stáhni z Claude chatu)
+  - README.md       (stáhni z Claude chatu)
+
+2. NAHRAJ NA GITHUB
+--------------------
+Otevři příkazový řádek v té složce:
+
+  git init
+  git add .
+  git commit -m "Žán v5 - HA add-on"
+  git branch -M main
+  git remote add origin https://github.com/stiburekondra-beep/zan-bot
+  git push -u origin main
+
+3. PŘIDEJ REPOZITÁŘ DO HA
+--------------------------
+V Home Assistant:
+  Settings → Add-ons → Add-on Store
+  3 tečky vpravo nahoře → Repositories
+  Přidej: https://github.com/stiburekondra-beep/zan-bot
+  Klikni Add
+
+4. NAINSTALUJ ADD-ON
+---------------------
+  Najdi "Žán Bot" v Add-on Store
+  Klikni Install (trvá 2-5 minut)
+  Jdi na záložku Configuration
+  Vyplň všechny tokeny
+  Klikni Start
+
+5. BUDOUCÍ AKTUALIZACE
+-----------------------
+  Na hlavním PC uprav kód (nebo přes Claude Code)
+  git add . && git commit -m "popis změny" && git push
+  V HA klikni Update na add-onu
+  Hotovo!
