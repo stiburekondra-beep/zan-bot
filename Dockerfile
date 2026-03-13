@@ -1,19 +1,19 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-# Install Node.js
-RUN apk add --no-cache nodejs npm
+# Install Node.js and dependencies
+RUN apk add --no-cache nodejs npm bash
 
 # Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package.json ./
-RUN npm install --production
+# Copy package files first (better caching)
+COPY package.json package-lock.json* ./
+RUN npm ci --only=production 2>/dev/null || npm install --production
 
-# Copy bot
+# Copy bot files
 COPY bot.js ./
 COPY run.sh ./
-RUN chmod +x run.sh
+RUN chmod a+x /app/run.sh
 
-CMD ["/app/run.sh"]
+ENTRYPOINT ["/app/run.sh"]
