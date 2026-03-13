@@ -15,6 +15,9 @@ export HA_TOKEN="${SUPERVISOR_TOKEN}"
 export HA_CONFIG_PATH="/config"
 
 echo "Žán Bot startuje..."
+echo "DEBUG HA_URL: ${HA_URL}"
+echo "DEBUG SUPERVISOR_TOKEN délka: ${#SUPERVISOR_TOKEN}"
+echo "DEBUG HA_TOKEN délka: ${#HA_TOKEN}"
 
 cd /app
 exec node bot.js
