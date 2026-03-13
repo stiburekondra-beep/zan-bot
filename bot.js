@@ -1440,7 +1440,7 @@ bot.on('message', async (msg) => {
     return;
   }
 
-
+  if (text === '/log' && isAdmin(chatId)) {
     try {
       if (!fs.existsSync(LOG_FILE)) { bot.sendMessage(chatId, '📋 Log je prázdný.'); return; }
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-20);
