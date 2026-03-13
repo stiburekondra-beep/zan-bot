@@ -187,8 +187,10 @@ async function isHaOnline() {
 
 // HA config registry — zkusí GET, pak POST (HA různé verze používají různé metody)
 async function haRegistry(name) {
-  try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch {}
-  try { const r = await haPost(`config/${name}/list`, {}); if (Array.isArray(r)) return r; } catch {}
+  let lastErr = '';
+  try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch (e) { lastErr = 'GET: ' + e.message; }
+  try { const r = await haPost(`config/${name}/list`, {}); if (Array.isArray(r)) return r; } catch (e) { lastErr += ' | POST: ' + e.message; }
+  console.warn(`haRegistry(${name}) failed: ${lastErr}`);
   return null;
 }
 
@@ -2318,6 +2320,7 @@ setTimeout(async () => {
   // 2. Sync místností z HA area registry → memory.rooms
   try {
     const areas = await haRegistry('area_registry');
+    console.log(`🏠 Area registry raw:`, JSON.stringify(areas)?.substring(0, 200));
     if (Array.isArray(areas) && areas.length > 0) {
       const memory = loadMemory();
       let changed = false;
