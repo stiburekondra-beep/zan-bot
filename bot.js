@@ -528,7 +528,7 @@ Po zápisu vždy popsat změny LIDSKY.`,
         description: 'Reloadne část HA po změně YAML.',
         input_schema: {
           type: 'object',
-          properties: { what: { type: 'string', enum: ['automations', 'scripts', 'scenes', 'helpers'] } },
+          properties: { what: { type: 'string', enum: ['automations', 'scripts', 'scenes', 'helpers', 'lovelace'] } },
           required: ['what'],
         },
       },
@@ -1066,7 +1066,13 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'reload_ha': {
-        const map = { automations: 'config/automation/reload', scripts: 'config/script/reload', scenes: 'config/scene/reload', helpers: 'config/helper/reload' };
+        const map = {
+          automations: 'config/automation/reload',
+          scripts: 'config/script/reload',
+          scenes: 'config/scene/reload',
+          helpers: 'config/helper/reload',
+          lovelace: 'lovelace/reload',
+        };
         await haPost(map[input.what]);
         logAction(chatId, user.name, 'reload_ha', input.what, 'ok');
         return { success: true };
@@ -2095,8 +2101,12 @@ async function createFamilyDashboard() {
     const yaml = generateFamilyDashboardYaml(memory.residents, memory.house);
     const fp = path.join(HA_CONFIG_PATH, 'dashboards', 'Rodina.yaml');
     const ok = writeYamlFile(fp, yaml);
-    if (ok) console.log('👨‍👩‍👧‍👦 Rodinný dashboard vytvořen: dashboards/Rodina.yaml');
-    else console.warn('⚠️ Rodinný dashboard — zápis selhal (config path nedostupný)');
+    if (ok) {
+      console.log('👨‍👩‍👧‍👦 Rodinný dashboard vytvořen: dashboards/Rodina.yaml');
+      try { await haPost('lovelace/reload'); } catch {} // tiše — dashboard nemusí být registrovaný
+    } else {
+      console.warn('⚠️ Rodinný dashboard — zápis selhal (config path nedostupný)');
+    }
   } catch (e) {
     console.error('Family dashboard error:', e.message);
   }
