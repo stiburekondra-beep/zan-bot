@@ -1,6 +1,6 @@
 name: "Žán Bot"
 description: "AI správce domu Žán — Telegram bot pro Home Assistant"
-version: "5.1.8"
+version: "5.1.9"
 slug: "zan_bot"
 init: false
 arch:

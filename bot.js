@@ -185,12 +185,22 @@ async function isHaOnline() {
   try { await haGet(''); return true; } catch { return false; }
 }
 
-// HA config registry — zkusí GET, pak POST (HA různé verze používají různé metody)
+// HA config registry — zkusí GET, pak POST, pak template API fallback
 async function haRegistry(name) {
-  let lastErr = '';
-  try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch (e) { lastErr = 'GET: ' + e.message; }
-  try { const r = await haPost(`config/${name}/list`, {}); if (Array.isArray(r)) return r; } catch (e) { lastErr += ' | POST: ' + e.message; }
-  console.warn(`haRegistry(${name}) failed: ${lastErr}`);
+  try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch {}
+  try { const r = await haPost(`config/${name}/list`, {}); if (Array.isArray(r)) return r; } catch {}
+
+  // Fallback přes template API (funguje vždy)
+  if (name === 'area_registry') {
+    try {
+      const tpl = `{% set ns = namespace(r=[]) %}{% for a in areas() %}{% set ns.r = ns.r + [{'area_id': a, 'name': area_name(a)}] %}{% endfor %}{{ ns.r | tojson }}`;
+      const raw = await haPost('template', { template: tpl });
+      const parsed = JSON.parse(typeof raw === 'string' ? raw : JSON.stringify(raw));
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch (e) { console.warn(`haRegistry template fallback failed: ${e.message}`); }
+  }
+
+  console.warn(`haRegistry(${name}) failed — žádná metoda nefunguje`);
   return null;
 }
 
