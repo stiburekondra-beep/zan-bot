@@ -9,13 +9,12 @@ export ANTHROPIC_API_KEY=$(bashio::config 'ANTHROPIC_API_KEY')
 export OPENAI_API_KEY=$(bashio::config 'OPENAI_API_KEY')
 export PLANTID_API_KEY=$(bashio::config 'PLANTID_API_KEY')
 
-# HA přístup přes supervisor (žádná Samba!)
+# HA přístup přes supervisor
 export HA_URL="http://supervisor/core"
 export HA_TOKEN="${SUPERVISOR_TOKEN}"
 export HA_CONFIG_PATH="/config"
 
-bashio::log.info "🏠 Žán Bot startuje..."
-bashio::log.info "📱 Ondra: ${CHAT_ID_ONDRA} | Jana: ${CHAT_ID_JANA}"
+bashio::log.info "Žán Bot startuje..."
 
 cd /app
-node bot.js
+exec node bot.js

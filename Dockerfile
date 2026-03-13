@@ -8,12 +8,14 @@ RUN apk add --no-cache nodejs npm bash
 WORKDIR /app
 
 # Copy package files first (better caching)
-COPY package.json package-lock.json* ./
-RUN npm ci --only=production 2>/dev/null || npm install --production
+COPY package.json ./
+RUN npm install --production
 
 # Copy bot files
 COPY bot.js ./
-COPY run.sh ./
-RUN chmod a+x /app/run.sh
 
-ENTRYPOINT ["/app/run.sh"]
+# Setup s6 service
+RUN mkdir -p /etc/services.d/zan/
+COPY run.sh /etc/services.d/zan/run
+RUN chmod a+x /etc/services.d/zan/run
+
