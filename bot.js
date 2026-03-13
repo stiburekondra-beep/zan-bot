@@ -2165,7 +2165,6 @@ function generateFamilyDashboardYaml(residents, house) {
     h.info        && `ℹ️ ${h.info}`,
   ].filter(Boolean).join('\\n') || 'Zatím žádné info — řekni mi o domě víc 🏡';
 
-  const homeName = esc(h.name || 'Dům Žán');
   return [
     'title: Rodina',
     'views:',
@@ -2174,7 +2173,7 @@ function generateFamilyDashboardYaml(residents, house) {
     '    icon: mdi:home-heart',
     '    cards:',
     `      - type: markdown`,
-    `        content: "<center><h2>🏠 ${homeName}</h2>{{ now().strftime('%-d. %-m. %Y') }}</center>"`,
+    `        content: "<center><h2>👨‍👩‍👧‍👦 Naše rodina</h2><i>{{ now().strftime('%-d. %-m. %Y') }}</i></center>"`,
     '      - type: horizontal-stack',
     '        cards:',
     parents,
@@ -2183,7 +2182,7 @@ function generateFamilyDashboardYaml(residents, house) {
     kids,
     housePhoto,
     '      - type: markdown',
-    '        title: "🏠 Náš domeček"',
+    '        title: "🏡 Náš dům"',
     `        content: "${houseInfo}"`,
   ].join('\n') + '\n';
 }
