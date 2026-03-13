@@ -903,14 +903,18 @@ async function executeTool(name, input, chatId) {
             if (!byDomain[domain]) byDomain[domain] = [];
             byDomain[domain].push({ entity_id: s.entity_id, name: s.attributes.friendly_name || s.entity_id, state: s.state });
           }
-          const areas = Array.isArray(areaReg) ? areaReg.map(a => ({ area_id: a.area_id, name: a.name })) : [];
+          // Oblasti: z registry nebo z memory.rooms jako poslední záloha
+          let areas = Array.isArray(areaReg) ? areaReg.map(a => ({ area_id: a.area_id, name: a.name })) : [];
+          if (areas.length === 0) {
+            areas = Object.values(memory.rooms || {}).filter(r => r.name).map(r => ({ area_id: r.area_id || r.name, name: r.name }));
+          }
           return {
             total_entities: filtered.length,
             total_areas: areas.length,
             areas,
             by_domain: byDomain,
             registry_errors: errors,
-            note: 'Registry API nedostupné — zobrazuji entity ze stavů. Oblasti jsou ' + (areas.length ? areas.map(a => a.name).join(', ') : 'prázdné, vytvoř je v HA: Nastavení → Oblasti'),
+            note: 'Registry API nedostupné — zobrazuji entity ze stavů. Oblasti: ' + (areas.length ? areas.map(a => a.name).join(', ') : 'prázdné'),
           };
         }
 
