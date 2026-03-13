@@ -681,43 +681,44 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'get_areas': {
-        // Načti entity a z nich extrahuj oblasti
-        const states = await haGet('states');
-        const areaMap = {};
-        for (const s of states) {
-          const area = s.attributes.area_id || s.area_id;
-          if (area) {
-            if (!areaMap[area]) areaMap[area] = { area_id: area, entities: [] };
-            areaMap[area].entities.push({
-              entity_id: s.entity_id,
-              name: s.attributes.friendly_name || s.entity_id,
-              state: s.state,
-              domain: s.entity_id.split('.')[0],
-            });
+        const [areaReg, entityReg, deviceReg] = await Promise.all([
+          haGet('config/area_registry/list').catch(() => []),
+          haGet('config/entity_registry/list').catch(() => []),
+          haGet('config/device_registry/list').catch(() => []),
+        ]);
+        const areas = Array.isArray(areaReg) ? areaReg : [];
+        const entities = Array.isArray(entityReg) ? entityReg : [];
+        const devices = Array.isArray(deviceReg) ? deviceReg : [];
+
+        // Mapuj entity a zařízení na oblasti
+        const entityByArea = {};
+        for (const e of entities) {
+          const aId = e.area_id;
+          if (aId) {
+            if (!entityByArea[aId]) entityByArea[aId] = [];
+            entityByArea[aId].push({ entity_id: e.entity_id, name: e.name || e.original_name || e.entity_id });
           }
         }
-        // Zkus také REST endpoint pro oblasti
-        let areas = [];
-        try {
-          const resp = await haGet('config/area_registry/list');
-          if (Array.isArray(resp)) {
-            areas = resp.map(a => ({
-              area_id: a.area_id,
-              name: a.name,
-              aliases: a.aliases || [],
-              entities: (areaMap[a.area_id] || {}).entities || [],
-            }));
+        const deviceByArea = {};
+        for (const d of devices) {
+          const aId = d.area_id;
+          if (aId) {
+            if (!deviceByArea[aId]) deviceByArea[aId] = [];
+            deviceByArea[aId].push({ device_id: d.id, name: d.name_by_user || d.name });
           }
-        } catch {
-          // Fallback — jen z entit
-          areas = Object.entries(areaMap).map(([id, data]) => ({ area_id: id, name: id, entities: data.entities }));
         }
-        // Oblasti bez entit
-        const areasWithoutEntities = areas.filter(a => a.entities.length === 0);
+
+        const result = areas.map(a => ({
+          area_id: a.area_id,
+          name: a.name,
+          entities: entityByArea[a.area_id] || [],
+          devices: deviceByArea[a.area_id] || [],
+        }));
+
         return {
-          areas,
-          count: areas.length,
-          note: areasWithoutEntities.length > 0 ? `${areasWithoutEntities.length} oblastí nemá přiřazené entity` : 'Všechny oblasti mají entity',
+          areas: result,
+          count: result.length,
+          empty_areas: result.filter(a => a.entities.length === 0 && a.devices.length === 0).map(a => a.name),
         };
       }
 
@@ -885,9 +886,15 @@ async function executeTool(name, input, chatId) {
         try {
           const result = await haPost('config/area_registry/create', { name: input.name });
           logAction(chatId, user.name, 'create_area', input.name, 'ok');
-          return { success: true, area_id: result.area_id, name: result.name };
+          // HA vrací přímo objekt oblasti nebo { area_id, name }
+          const area_id = result.area_id || result.id || null;
+          const name = result.name || input.name;
+          return { success: true, area_id, name, raw: result };
         } catch (e) {
-          return { error: `Vytvoření oblasti selhalo: ${e.message}` };
+          return {
+            error: `Vytvoření oblasti selhalo: ${e.message}`,
+            tip: 'Vytvoř místnost ručně v HA: Nastavení → Oblasti a zóny → Přidat oblast',
+          };
         }
       }
 
@@ -910,9 +917,17 @@ async function executeTool(name, input, chatId) {
       case 'assign_device_to_area': {
         if (!isAdmin(chatId)) return { error: 'Přiřazení vyžaduje admin přístup.' };
         try {
-          await haPost('config/device_registry/update', { device_id: input.device_id, area_id: input.area_id });
-          logAction(chatId, user.name, 'assign_device_area', input.device_id, input.area_id);
-          return { success: true, message: `Zařízení ${input.device_id} přiřazeno do oblasti ${input.area_id}` };
+          let area_id = input.area_id;
+          // Pokud dostaneme název oblasti místo ID, vyhledáme area_id
+          if (area_id && !area_id.match(/^[a-z0-9_]+$/)) {
+            const areas = await haGet('config/area_registry/list').catch(() => []);
+            const found = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === area_id.toLowerCase()) : null;
+            if (!found) return { error: `Oblast "${area_id}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
+            area_id = found.area_id;
+          }
+          await haPost('config/device_registry/update', { device_id: input.device_id, area_id });
+          logAction(chatId, user.name, 'assign_device_area', input.device_id, area_id);
+          return { success: true, message: `Zařízení ${input.device_id} přiřazeno do oblasti ${area_id}` };
         } catch (e) {
           return { error: e.message };
         }
