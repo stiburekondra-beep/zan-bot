@@ -1,20 +1,20 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/bash
 
-# Načti config z HA add-on options
-export TELEGRAM_TOKEN=$(bashio::config 'TELEGRAM_TOKEN')
-export CHAT_ID_ONDRA=$(bashio::config 'CHAT_ID_ONDRA')
-export CHAT_ID_JANA=$(bashio::config 'CHAT_ID_JANA')
-export EXTRA_CHAT_IDS=$(bashio::config 'EXTRA_CHAT_IDS')
-export ANTHROPIC_API_KEY=$(bashio::config 'ANTHROPIC_API_KEY')
-export OPENAI_API_KEY=$(bashio::config 'OPENAI_API_KEY')
-export PLANTID_API_KEY=$(bashio::config 'PLANTID_API_KEY')
+# Načti config přímo z HA options souboru
+export TELEGRAM_TOKEN=$(jq --raw-output '.TELEGRAM_TOKEN' /data/options.json)
+export CHAT_ID_ONDRA=$(jq --raw-output '.CHAT_ID_ONDRA' /data/options.json)
+export CHAT_ID_JANA=$(jq --raw-output '.CHAT_ID_JANA' /data/options.json)
+export EXTRA_CHAT_IDS=$(jq --raw-output '.EXTRA_CHAT_IDS // ""' /data/options.json)
+export ANTHROPIC_API_KEY=$(jq --raw-output '.ANTHROPIC_API_KEY' /data/options.json)
+export OPENAI_API_KEY=$(jq --raw-output '.OPENAI_API_KEY' /data/options.json)
+export PLANTID_API_KEY=$(jq --raw-output '.PLANTID_API_KEY // ""' /data/options.json)
 
 # HA přístup přes supervisor
 export HA_URL="http://supervisor/core"
 export HA_TOKEN="${SUPERVISOR_TOKEN}"
 export HA_CONFIG_PATH="/config"
 
-bashio::log.info "Žán Bot startuje..."
+echo "Žán Bot startuje..."
 
 cd /app
 exec node bot.js
