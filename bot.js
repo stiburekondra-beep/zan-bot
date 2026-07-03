@@ -96,6 +96,55 @@ const PACKAGE_CATEGORIES = {
 };
 
 // ═══════════════════════════════════════════════
+// SLEDOVÁNÍ SPOTŘEBY TOKENŮ (/budget)
+// Každé volání Claude API jde přes claudeCreate(), který sečte usage
+// do zan_usage.json (denní kyblíky). Ceny za MTok podle modelu.
+// ═══════════════════════════════════════════════
+const USAGE_FILE = path.join(__dirname, 'zan_usage.json');
+const USD_CZK = 23; // hrubý kurz pro orientační přepočet
+
+function modelPricing() {
+  // [input, output, cache_read, cache_write] USD za MTok
+  return MODEL.includes('haiku') ? [1, 5, 0.1, 1.25] : [3, 15, 0.3, 3.75];
+}
+
+function loadUsage() {
+  try { if (fs.existsSync(USAGE_FILE)) return JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch {}
+  return { days: {} };
+}
+
+function trackUsage(usage) {
+  if (!usage) return;
+  try {
+    const u = loadUsage();
+    const day = new Date().toISOString().slice(0, 10);
+    const d = u.days[day] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
+    d.calls += 1;
+    d.input += usage.input_tokens || 0;
+    d.output += usage.output_tokens || 0;
+    d.cache_read += usage.cache_read_input_tokens || 0;
+    d.cache_write += usage.cache_creation_input_tokens || 0;
+    u.days[day] = d;
+    // drž max 90 dní
+    const keys = Object.keys(u.days).sort();
+    while (keys.length > 90) delete u.days[keys.shift()];
+    fs.writeFileSync(USAGE_FILE, JSON.stringify(u, null, 2), 'utf8');
+    console.log(`💰 tokens: in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
+  } catch (e) { console.warn('trackUsage:', e.message); }
+}
+
+function usageCostUsd(d) {
+  const [pi, po, pcr, pcw] = modelPricing();
+  return (d.input * pi + d.output * po + d.cache_read * pcr + d.cache_write * pcw) / 1e6;
+}
+
+async function claudeCreate(params) {
+  const response = await anthropic.messages.create(params);
+  trackUsage(response.usage);
+  return response;
+}
+
+// ═══════════════════════════════════════════════
 // LOGGING
 // ═══════════════════════════════════════════════
 function logAction(chatId, user, action, entity, result) {
@@ -1418,7 +1467,7 @@ Tvůj úkol:
 
 Piš česky, přátelsky, jako Žán. Oslovi "Jano".`;
 
-  const response = await anthropic.messages.create({
+  const response = await claudeCreate({
     model: MODEL,
     max_tokens: 800,
     messages: [{
@@ -1488,7 +1537,7 @@ Brief pro Janu (max 12 řádků):
 
 Piš česky, přátelsky, oslovi "Jano".`;
 
-  const response = await anthropic.messages.create({
+  const response = await claudeCreate({
     model: MODEL,
     max_tokens: 700,
     messages: [{ role: 'user', content: prompt }],
@@ -1591,7 +1640,7 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
 
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
-    const response = await anthropic.messages.create({
+    const response = await claudeCreate({
       model: MODEL,
       max_tokens: 4096,
       system: [
@@ -1791,6 +1840,27 @@ bot.on('message', async (msg) => {
   if (text === '/reset') {
     conversationHistory[chatId] = [];
     sendSafe(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
+    return;
+  }
+
+  if (text === '/budget') {
+    const u = loadUsage();
+    const today = new Date().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    const empty = { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
+    const d = u.days[today] || empty;
+    const m = Object.entries(u.days).filter(([k]) => k.startsWith(month))
+      .reduce((a, [, v]) => ({ calls: a.calls + v.calls, input: a.input + v.input, output: a.output + v.output, cache_read: a.cache_read + v.cache_read, cache_write: a.cache_write + v.cache_write }), { ...empty });
+    const dUsd = usageCostUsd(d), mUsd = usageCostUsd(m);
+    sendSafe(chatId,
+      `💰 *Spotřeba Žána* (model: ${MODEL})\n\n` +
+      `*Dnes:* ${d.calls} volání\n` +
+      `• input ${d.input.toLocaleString('cs-CZ')} | output ${d.output.toLocaleString('cs-CZ')}\n` +
+      `• cache: čtení ${d.cache_read.toLocaleString('cs-CZ')} | zápis ${d.cache_write.toLocaleString('cs-CZ')}\n` +
+      `• ≈ $${dUsd.toFixed(3)} (${(dUsd * USD_CZK).toFixed(2)} Kč)\n\n` +
+      `*Tento měsíc:* ${m.calls} volání ≈ $${mUsd.toFixed(2)} (${(mUsd * USD_CZK).toFixed(0)} Kč)\n\n` +
+      `_Sleduje se od v5.3.3 — starší spotřeba v console.anthropic.com_`,
+      { parse_mode: 'Markdown' });
     return;
   }
 
@@ -2012,7 +2082,7 @@ Tvůj úkol:
 Piš česky, přátelsky, jako Žán. Zpráva půjde do Telegramu.
 Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`;
 
-    const response = await anthropic.messages.create({
+    const response = await claudeCreate({
       model: MODEL,
       max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }],
