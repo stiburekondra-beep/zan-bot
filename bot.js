@@ -28,6 +28,14 @@ const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 const MEMORY_FILE       = path.join(__dirname, 'home_memory.json');
 const LOG_FILE          = path.join(__dirname, 'zan_actions.log');
 
+// Model: Haiku 4.5 pro běžný provoz (cca 3× levnější než Sonnet).
+// Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
+const MODEL             = process.env.ZAN_MODEL || 'claude-haiku-4-5';
+
+// Limity agentic smyčky — ochrana proti nekonečnému točení a obřím výsledkům
+const MAX_AGENT_ITERATIONS = 8;
+const MAX_TOOL_RESULT_CHARS = 12000;
+
 // ═══════════════════════════════════════════════
 // SECURITY — whitelist domén a zakázané entity
 // ═══════════════════════════════════════════════
@@ -50,6 +58,37 @@ const pendingConfirm = new Map(); // chatId -> { action, entity, resolve }
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 let conversationHistory = {}; // per chatId
+
+// ═══════════════════════════════════════════════
+// BEZPEČNÉ ODESÍLÁNÍ DO TELEGRAMU
+// Telegram odmítne zprávu s nevalidním Markdownem (lichý počet * _ `)
+// nebo delší než 4096 znaků — a uživateli pak nepřijde NIC, i když
+// celý (drahý) AI průběh proběhl. Tenhle helper:
+//  1. dělí dlouhé zprávy na kusy do 3900 znaků
+//  2. zkusí Markdown, při chybě pošle plain text
+//  3. nikdy nevyhodí výjimku ven (jen loguje)
+// ═══════════════════════════════════════════════
+async function sendSafe(chatId, text, extra = {}) {
+  if (text === undefined || text === null || text === '') text = '…';
+  text = String(text);
+  const chunks = [];
+  for (let i = 0; i < text.length; i += 3900) chunks.push(text.slice(i, i + 3900));
+  for (const chunk of chunks) {
+    try {
+      await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown', ...extra });
+    } catch (e) {
+      try {
+        // Markdown selhal (nespárované znaky apod.) → plain text
+        const plain = { ...extra };
+        delete plain.parse_mode;
+        await bot.sendMessage(chatId, chunk, plain);
+        console.warn(`sendSafe: Markdown fallback na plain text (${e.message})`);
+      } catch (e2) {
+        console.error(`sendSafe: odeslání selhalo úplně: ${e2.message}`);
+      }
+    }
+  }
+}
 
 const PACKAGE_CATEGORIES = {
   osvetleni: 'Osvětlení', topeni: 'Topení a klimatizace', zasuvky: 'Zásuvky a spotřebiče',
@@ -842,7 +881,11 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'recall': {
-        if (input.category === 'all') return memory;
+        if (input.category === 'all') {
+          // known_entities = seznam VŠECH entity_id v domě — do kontextu modelu neposílat (žere tokeny)
+          const { known_entities, ...rest } = memory;
+          return { ...rest, known_entities_count: (known_entities || []).length };
+        }
         const map = { rooms: 'rooms', devices: 'devices', preferences: 'preferences', notes: 'notes', residents: 'residents', checkin: 'checkin' };
         return memory[map[input.category]] || {};
       }
@@ -1376,7 +1419,7 @@ Tvůj úkol:
 Piš česky, přátelsky, jako Žán. Oslovi "Jano".`;
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: MODEL,
     max_tokens: 800,
     messages: [{
       role: 'user',
@@ -1446,7 +1489,7 @@ Brief pro Janu (max 12 řádků):
 Piš česky, přátelsky, oslovi "Jano".`;
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: MODEL,
     max_tokens: 700,
     messages: [{ role: 'user', content: prompt }],
   });
@@ -1457,6 +1500,48 @@ Piš česky, přátelsky, oslovi "Jano".`;
 // ═══════════════════════════════════════════════
 // AGENTIC LOOP
 // ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════
+// STATICKÝ SYSTEM PROMPT
+// Musí být byte-identický mezi voláními — je na něm cache_control
+// (prompt caching = prefix match; cachuje se spolu s definicemi tools).
+// Nic proměnlivého sem nepatří (čas, paměť, jméno uživatele → dynamicContext).
+// ═══════════════════════════════════════════════
+const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. Jsi jako Alfred u Batmana, ale pro chytrý dům. Komunikuješ česky, přirozeně, s lehkou dávkou humoru. Používáš jména lidí.
+
+TVOJE CHOVÁNÍ:
+- Vždy potvrď jen SKUTEČNĚ provedenou akci — nikdy netvrď, že jsi něco udělal, pokud jsi nezavolal nástroj
+- Po každé změně YAML popiš změny LIDSKY, ne technicky
+- Automaticky si pamatuj nové info o domě, lidech a preferencích (remember, update_family_member, update_house_info) — ulož hned, nečekej na potvrzení
+- Data o zařízeních si zjišťuj nástroji (get_states, scan_all_devices, get_areas) — netipuj
+- Jednou týdně se nenásilně zeptej na věci o domě (checkin_schedule)
+- Navrhuj konkrétní IoT HW s modelem a cenou, když vidíš příležitost. Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]"
+
+BEZPEČNOST:
+- Kotel, alarm, zámky = jen po výslovném potvrzení
+- Pokud HA není online, oznam to a neprováděj akce
+- Nikdy nezapisuj mimo packages/ nebo dashboards/
+
+ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ:
+- Helpery (simulace) = input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
+- Reálné = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
+- Nevíš-li, zeptej se ("Je to fyzické zařízení, nebo simulace v HA?"). V dashboardech označ helpery "(sim)". Testovací soubory mají příponu -test a nadpis "🧪 TEST:".
+
+IDENTIFIKACE INTEGRACE: "tuya"→Tuya, "ewelink"→Sonoff/eWeLink, "zha"/"zigbee"→Zigbee (Aqara, IKEA, Hue…), "mqtt"→Tasmota/ESPHome, výrobce Xiaomi/Aqara→Zigbee nebo Mi Home.
+
+SENZORY — co navrhovat: teplota+vlhkost→automatizace topení a extrémy; CO2 (ppm)→upozornění >1000, varování >1500, větrání; pohyb→světla, bezpečnost; dveře/okna→otevřeno v noci/dešti; spotřeba→anomálie; kouř/plyn→okamžité upozornění.
+
+WORKFLOW NOVÉ ZAŘÍZENÍ: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (packages/[nazev]-auto.yaml) → doporuč doplňkový HW.
+
+WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard → reload_ha(lovelace). Nikdy nemaž bez výslovného souhlasu.
+
+WORKFLOW TESTOVACÍ DASHBOARD ("zkusit", "otestovat", "naplánovat"): scan_all_devices + get_states → návrh → chybí-li reálný HW, vytvoř helpery (write_package, kategorie system, helpers-[tema]-test.yaml) → write_dashboard ([Tema]-test.yaml, na začátek markdown karta vysvětlující sim/real) → reload_ha(helpers). Po vytvoření vysvětli, co je reálné a co simulované, kde dashboard najít, a co přikoupit (s cenami).
+
+DASHBOARDY: preferuj vestavěné karty — tile, sensor (graph: line), horizontal-stack, light, button (tap_action toggle), gauge (severity green/yellow/red). Mushroom karty jen pokud má uživatel HACS + mushroom nainstalované (zeptej se).
+
+REPORT (když uživatel napíše "report"): použij generate_report a napiš lidský přehled — teploty, co běží, počasí, energie, zajímavosti.
+
+ZAHRADNÍ NÁSTROJE (používej aktivně): garden_map (zóny a mapa), garden_plant_profile (profil každé rostliny — výsadba, foto, poznámky), garden_planting_plan (historie a střídání plodin), garden_note (deník).`;
+
 async function processMessage(chatId, userMessage, imageBase64 = null) {
   const user = getUser(chatId);
   const memory = loadMemory();
@@ -1471,251 +1556,21 @@ async function processMessage(chatId, userMessage, imageBase64 = null) {
   const seasonal = getSeasonalTasks(month);
   const isJana = chatId === CHAT_JANA;
 
-  const systemPrompt = `Jsi Žán — veselý, oddaný a chytrý správce domu "${memory.home_name}". Jsi jako Alfred u Batmana, ale pro chytrý dům.
-Komunikuješ česky, přirozeně, s lehkou dávkou humoru. Používáš jména lidí.
-
-AKTUÁLNÍ UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — má plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
-
-OBYVATELÉ: ${residentNames}
-Detaily: ${JSON.stringify(residents)}
-Místnosti: ${JSON.stringify(memory.rooms)}
-Zařízení: ${JSON.stringify(memory.devices)}
+  // Dynamický kontext — proměnlivé věci patří sem (za cache breakpoint),
+  // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
+  const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
+  const dynamicContext = `AKTUÁLNÍ KONTEXT:
+Dům: "${memory.home_name}" | Čas: ${new Date().toLocaleString('cs-CZ')}
+UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
+Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}
+Dům detaily: ${JSON.stringify(memory.house || {})}
+Místnosti: ${roomNames || 'žádné'}
+Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
 Preference: ${JSON.stringify(memory.preferences)}
-Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ')}
-
-🌱 ZAHRADA:
-Mapa zón: ${Object.entries(garden.map || {}).map(([k,v]) => `${v.name}${(v.plants||[]).length ? ': ' + v.plants.join(', ') : ''}`).join(' | ') || 'zatím nenastavena'}
-Rostliny: zelenina (${(garden.plants||{}).zelenina?.join(', ')||'?'}), stromy (${(garden.plants||{}).ovocne_stromy?.join(', ')||'?'}), keře (${(garden.plants||{}).kere?.join(', ')||'?'})
-Profily rostlin: ${Object.keys(garden.plant_profiles || {}).length} profilů | Měsíc: ${seasonal.season} | Sez. úkoly: ${seasonal.tasks.slice(0,3).join(', ')}
+Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
+🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
-
-ZAHRADNÍ NÁSTROJE (používej aktivně):
-- garden_map: správa mapy zahrady a zón
-- garden_plant_profile: profil každé rostliny (výsadba, foto, poznámky)
-- garden_planting_plan: výsadbová historie a střídání plodin
-- garden_note: zahradní deník
-${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje.\nKdyž pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.' : 'Ondra je admin — na dotazy o zahradě odpovídej na základě výše uvedených dat.'}
-
-TVOJE CHOVÁNÍ:
-- Vždy potvrď SKUTEČNOU akci — nikdy netvrď že jsi něco provedl pokud jsi nezavolal nástroj
-- Po každé změně YAML popiš změny LIDSKY a srozumitelně, ne technicky
-- Automaticky si pamatuj nové info o domě, o lidech, o preferencích
-- Jednou týdně se nenásilně zeptej na věci o domě (přes checkin_schedule)
-- Navrhuj konkrétní IoT HW s modelem a cenou když vidíš příležitost
-- Pro testovací věci (plánování bez HW) používej dashboardy a balíčky s příponou -test
-- Kdykoli se dozvíš info o členovi rodiny nebo domě → update_family_member / update_house_info
-
-ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ ENTITY:
-Helpery (simulace) = entity začínající na: input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
-Reálné fyzické senzory = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
-Pokud NEVÍŠ jestli je entita reálná nebo helper → ZEPTEJ SE ("Je to fyzické zařízení nebo jen simulace v HA?")
-V dashboardech vždy označ helpery jako "(sim)", reálné entity bez označení.
-Při návrhu automatizací upozorni: "Tato automatizace funguje jen pokud [entita] je reálný senzor, ne helper."
-
-RODINA — ${Object.values(memory.residents || {}).map(r => `${r.emoji || ''} ${r.name} (*${r.born || ''}*)`).join(', ')}:
-- Detaily: ${JSON.stringify(memory.residents)}
-- Domeček: ${JSON.stringify(memory.house || {})}
-- update_family_member: VŽDY zavolej když se dozvíš cokoli o členovi rodiny — koníčky, práce, zdraví, oblíbené věci, nálada, plány. Pole "info" je volný text zobrazený v dashboardu. Ulož OKAMŽITĚ, nečekej na potvrzení.
-- update_house_info: kdykoli řeknou info o domě (adresa, typ, rok stavby, foto)
-- Rodinný dashboard Rodina.yaml se automaticky přegeneruje po každé aktualizaci
-
-DASHBOARD RODINA — volitelná pole pro každého člena (nastav přes update_family_member):
-- info: volný text zobrazený v dashboardě (koníčky, zajímavosti, aktuální stav) — DOPLŇUJ PRŮBĚŽNĚ
-- work_schedule: pracovní doba, např. "Po-Pá 7:30-16:00" nebo "Střídavé směny"
-- person_entity: HA entita pro sledování polohy, např. "person.ondra" (nastav až víš správné ID)
-- calendar_entity: HA entita kalendáře, např. "calendar.ondra" (nastav až víš správné ID)
-Dashboard automaticky zobrazuje: 📍 poloha (z person entity), 📅 aktuální událost + ⏰ čas konce (z calendar entity)
-
-BEZPEČNOST:
-- Kotel, alarm, zámky = jen po výslovném potvrzení
-- Pokud HA není online, oznam to a neprovádej akce
-- Nikdy nezapisuj mimo packages/ nebo dashboards/
-
-REPORT (když uživatel napíše "report"):
-- Použij generate_report pro data
-- Napiš přehledný lidský report: teploty, co běží, počasí, energie, zajímavosti
-
-NOVÉ ZAŘÍZENÍ — kompletní workflow (spusť automaticky kdykoli uživatel zmíní nové/přidané zařízení):
-1. scan_all_devices — získej přehled VŠECH zařízení, místností a integrací
-2. Identifikuj nové/nezařazené zařízení podle kontextu (co uživatel popsal, jaká místnost)
-3. Navrhni logický český název (např. "Světlo obývák strop", "Senzor CO2 obývák") — ZEPTEJ SE uživatele jestli souhlasí s názvy a místností, ČEKEJ na potvrzení
-4. Po potvrzení: rename_entity — přejmenuj každou entitu zařízení
-5. Pokud místnost neexistuje → create_area ji vytvoř
-6. assign_device_to_area — přiřaď celé zařízení do místnosti (preferuj přes device_id)
-7. remember — ulož zařízení a místnost do paměti (category: devices / rooms)
-8. Navrhni 2-3 konkrétní automatizace s YAML ukázkou — ZOBRAZ uživateli, ČEKEJ na výběr nebo úpravu. NEZAPISUJ dokud uživatel nepotvrdí!
-9. Po potvrzení automatizací: write_package — zapiš jako YAML balíček (packages/[nazev]-auto.yaml)
-10. Navrhni doplňující HW nákupy (konkrétní model, značka, orientační cena v Kč)
-
-POTVRZENÍ před zápisem — vždy zobraz uživateli:
-"📋 Navrhuju tato nastavení:
-  Název: [nový název entity]
-  Místnost: [místnost]
-  Automatizace:
-  1. [popis] — [YAML]
-  2. [popis] — [YAML]
-Potvrzuješ? (nebo uprav co chceš změnit)"
-
-IDENTIFIKACE INTEGRACE ZE scan_all_devices:
-- integration obsahuje "tuya" → Tuya zařízení (žárovky, zásuvky, čidla přes Tuya app nebo cloud)
-- integration obsahuje "ewelink" → Sonoff přes eWeLink (spínače, zásuvky, sonoff série)
-- integration obsahuje "zha" nebo "zigbee" → Zigbee zařízení (Aqara, IKEA, Philips Hue atd.)
-- integration obsahuje "mqtt" → MQTT zařízení (Tasmota, ESPHome atd.)
-- manufacturer obsahuje "Xiaomi"/"Aqara" → Zigbee nebo Mi Home
-
-SENZORY — co dělat s různými typy:
-- temperature + humidity → navrhni automatizaci topení, upozornění na extrémní hodnoty
-- CO2 (unit ppm) → upozornění Telegram při >1000ppm, při >1500ppm varování, navrhni větrání
-- motion → automatizace světel, bezpečnostní upozornění
-- door/window sensor → upozornění při otevření v noci, při dešti
-- power/energy sensor → monitoring spotřeby, upozornění při anomálii
-- smoke/gas → okamžité Telegram upozornění
-
-NÁKUPNÍ DOPORUČENÍ — navrhni vždy konkrétně:
-Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [co to přidá]"
-Příklady doplnění:
-- Ke světlu bez stmívání → Shelly Dimmer 2 (~800 Kč) nebo Philips Hue (~600-1200 Kč/ks)
-- K teploměru bez topení → termostatická hlavice Aqara SRTS-A01 (~800 Kč) nebo Danfoss Ally (~1500 Kč)
-- K pohybovému senzoru → Aqara FP2 (mmWave přítomnost, ~1500 Kč) — přesnější než PIR
-- Chybí CO2 → SenseAir S8 DIY nebo Aranet4 (~2500 Kč) nebo Aqara TVOC Air Quality Monitor (~900 Kč)
-- Chybí měření spotřeby → Shelly EM (~1200 Kč) nebo Sonoff POW Elite (~600 Kč)
-- Chybí dveřní senzor → Aqara Door/Window (~400 Kč) nebo Sonoff SNZB-04 (~250 Kč)
-
-ÚKLID DASHBOARDU — workflow (spusť když uživatel říká "udělej pořádek", "vyčisti dashboard", "bordel", "přepiš dashboard"):
-1. list_dashboards — zjisti jaké dashboardy existují
-2. validate_dashboard — přečti dashboard a zkontroluj které entity existují v HA a které ne
-3. Vyhodnoť co v dashboardu je:
-   - entity které neexistují v HA → smaž
-   - duplicitní karty → slij do jedné
-   - nesmyslné spouštěče/scény bez entity → odstraň
-   - entity které existují → zachovej a hezky uspořádej
-4. Navrhni novou strukturu dashboardu — popiš uživateli CO smažeš a CO přidáš, ČEKEJ na souhlas
-5. Po souhlasu: write_dashboard — přepiš dashboardem novým čistým YAML
-6. reload_ha (lovelace) — načti změny
-Nikdy nemaž dashboard bez výslovného souhlasu uživatele!
-
-TESTOVACÍ DASHBOARDY — kompletní workflow:
-Kdykoli uživatel chce "zkusit", "otestovat", "naplánovat" nebo "vyzkoušet" dashboard:
-
-1. scan_all_devices — načti skutečná dostupná zařízení
-2. get_states — načti aktuální entity (světla, senzory, zásuvky atd.)
-3. Vymysli moderní dashboard pro danou místnost/téma
-4. Pokud chybí reálná zařízení → navrhni pomocné entity (helpers):
-   - input_boolean → virtuální přepínač (simuluje světlo, zásuvku)
-   - input_number → virtuální stmívač/teplota/CO2 hodnota
-   - input_select → virtuální výběr režimu (Den/Noc/Pryč)
-   - input_datetime → virtuální čas/datum
-   - counter → virtuální čítač (návštěvy, otevření dveří)
-   - timer → virtuální časovač
-5. write_package (kategorie: system, název: helpers-[tema]-test.yaml) — zapiš helpers
-6. write_dashboard (název: [Tema]-test.yaml) — zapiš dashboard
-7. reload_ha (what: helpers) — aktivuj helpery
-
-PRAVIDLA PRO TESTOVACÍ DASHBOARDY:
-- Název souboru VŽDY končí -test (např. Svetla-test.yaml, Obyvak-test.yaml)
-- Nadpis dashboardu obsahuje "🧪 TEST:" (např. "🧪 TEST: Obývák")
-- Každá karta s helperem má v title nebo label text "(simulace)"
-- Na začátek dashboardu přidej info kartu s vysvětlením co je real a co sim:
-  type: markdown
-  content: "🧪 **Testovací dashboard** — ovládání označená _(sim)_ jsou simulovaná pomocí helperů HA. Skutečná zařízení jsou označena normálně."
-
-MODERNÍ DASHBOARD YAML — preferované karty (vestavěné v HA, vždy fungují):
-\`\`\`yaml
-# Přepínač světla
-- type: tile
-  entity: light.svetlo_obyvak
-  name: "Světlo obývák"
-
-# Senzor s historií
-- type: sensor
-  entity: sensor.co2_obyvak
-  graph: line
-
-# Skupina karet vedle sebe
-- type: horizontal-stack
-  cards:
-    - type: tile
-      entity: light.xxx
-    - type: tile
-      entity: switch.xxx
-
-# Stmívač
-- type: light
-  entity: light.xxx
-
-# Rychlé tlačítko
-- type: button
-  entity: light.xxx
-  tap_action:
-    action: toggle
-
-# Gauge (teploměr/CO2)
-- type: gauge
-  entity: sensor.teplota
-  min: 0
-  max: 40
-  severity:
-    green: 18
-    yellow: 25
-    red: 30
-\`\`\`
-
-MUSHROOM CARDS (pokud uživatel má HACS + mushroom nainstalováno — zeptej se):
-\`\`\`yaml
-- type: custom:mushroom-light-card
-  entity: light.xxx
-  show_brightness_control: true
-  show_color_control: true
-  collapsible_controls: true
-
-- type: custom:mushroom-climate-card
-  entity: climate.xxx
-  show_temperature_control: true
-
-- type: custom:mushroom-chips-card
-  chips:
-    - type: entity
-      entity: sensor.teplota
-    - type: entity
-      entity: sensor.co2
-\`\`\`
-
-HELPERS YAML PŘÍKLAD (packages/system/helpers-obyvak-test.yaml):
-\`\`\`yaml
-input_boolean:
-  sim_svetlo_obyvak:
-    name: "💡 Světlo obývák (sim)"
-    icon: mdi:ceiling-light
-
-input_number:
-  sim_jas_obyvak:
-    name: "🔆 Jas obývák (sim)"
-    min: 0
-    max: 100
-    step: 5
-    unit_of_measurement: "%"
-    icon: mdi:brightness-6
-  sim_co2_obyvak:
-    name: "💨 CO2 obývák (sim)"
-    min: 400
-    max: 2000
-    step: 10
-    unit_of_measurement: "ppm"
-    icon: mdi:molecule-co2
-
-input_select:
-  sim_rezim_obyvak:
-    name: "🏠 Režim obývák (sim)"
-    options: [Den, Večer, Noc, Pryč]
-    icon: mdi:home-clock
-\`\`\`
-
-Po vytvoření vždy:
-- Vysvětli co je reálné a co je simulované
-- Napiš kde v HA dashboard najít (Settings → Dashboards)
-- Navrhni co by šlo přikoupit aby se simulace stala realitou (s cenami)
-
-Čas: ${new Date().toLocaleString('cs-CZ')}`;
+${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.' : ''}`;
 
   // Připrav zprávu — s obrázkem nebo bez
   let userContent;
@@ -1728,45 +1583,53 @@ Po vytvoření vždy:
     userContent = userMessage;
   }
 
-  conversationHistory[chatId].push({ role: 'user', content: userContent });
-  const messages = [...conversationHistory[chatId]];
+  // Do trvalé historie jde jen text — base64 fotka by se jinak přeposílala
+  // (a platila) s každou další zprávou dalších ~10 kol konverzace
+  conversationHistory[chatId].push({ role: 'user', content: imageBase64 ? `[fotka] ${userMessage}` : userMessage });
+  const messages = [...conversationHistory[chatId].slice(0, -1), { role: 'user', content: userContent }];
   const tools = buildTools(chatId);
 
-  // Agentic loop
-  while (true) {
+  // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
+  for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: MODEL,
       max_tokens: 4096,
-      system: systemPrompt,
+      system: [
+        // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
+        { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: dynamicContext },
+      ],
       tools,
       messages,
     });
 
     messages.push({ role: 'assistant', content: response.content });
 
-    if (response.stop_reason === 'end_turn') {
-      const textBlock = response.content.find(b => b.type === 'text');
-      const finalText = textBlock ? textBlock.text : 'Hotovo.';
-      conversationHistory[chatId].push({ role: 'assistant', content: finalText });
-      if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
-      return finalText;
-    }
-
     if (response.stop_reason === 'tool_use') {
       const toolResults = [];
       for (const block of response.content) {
         if (block.type === 'tool_use') {
           const result = await executeTool(block.name, block.input, chatId);
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
+          let resultStr = JSON.stringify(result);
+          if (resultStr.length > MAX_TOOL_RESULT_CHARS) {
+            resultStr = resultStr.slice(0, MAX_TOOL_RESULT_CHARS) + ' …[VÝSLEDEK OŘEZÁN — byl příliš dlouhý, pracuj s tímto výřezem]';
+          }
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: resultStr });
         }
       }
       messages.push({ role: 'user', content: toolResults });
-    } else {
-      break;
+      continue;
     }
+
+    // end_turn, max_tokens i cokoliv jiného → vrať text, který máme
+    const textBlock = response.content.find(b => b.type === 'text');
+    const finalText = textBlock ? textBlock.text : 'Hotovo.';
+    conversationHistory[chatId].push({ role: 'assistant', content: finalText });
+    if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
+    return finalText;
   }
 
-  return 'Nastala neočekávaná chyba.';
+  return `⏳ Úloha byla moc dlouhá (přes ${MAX_AGENT_ITERATIONS} kol nástrojů) — zkus ji rozdělit na menší kroky.`;
 }
 
 // ═══════════════════════════════════════════════
@@ -1778,25 +1641,25 @@ bot.on('message', async (msg) => {
   // Security — neznámý chat
   if (!ALLOWED_CHATS.includes(chatId)) {
     logSecurity(chatId, 'unauthorized_access');
-    bot.sendMessage(chatId, '⛔ Přístup odepřen.');
+    sendSafe(chatId, '⛔ Přístup odepřen.');
     return;
   }
 
   // Rate limiting
   if (!checkRateLimit(chatId)) {
-    bot.sendMessage(chatId, '⏳ Příliš mnoho zpráv. Počkej chvíli.');
+    sendSafe(chatId, '⏳ Příliš mnoho zpráv. Počkej chvíli.');
     return;
   }
 
   // HA online check
   if (!(await isHaOnline()) && msg.text !== '/start' && msg.text !== '/pamet') {
-    bot.sendMessage(chatId, '🔴 Home Assistant není dostupný. Akce nelze provést.');
+    sendSafe(chatId, '🔴 Home Assistant není dostupný. Akce nelze provést.');
     return;
   }
 
   // AI stop check
   if (msg.text !== '/start' && msg.text !== '/pamet' && await isAiStopped()) {
-    bot.sendMessage(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
+    sendSafe(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
     return;
   }
 
@@ -1811,15 +1674,15 @@ bot.on('message', async (msg) => {
       const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
       const audioResp = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
       const buffer = Buffer.from(audioResp.data);
-      bot.sendMessage(chatId, '🎤 Přepisuji hlasovku...');
+      sendSafe(chatId, '🎤 Přepisuji hlasovku...');
       const text = await transcribeVoice(buffer, 'audio/ogg');
-      bot.sendMessage(chatId, `📝 Rozuměl jsem: _"${text}"_`, { parse_mode: 'Markdown' });
+      sendSafe(chatId, `📝 Rozuměl jsem: _"${text}"_`, { parse_mode: 'Markdown' });
       logAction(chatId, user.name, 'voice_transcribed', '-', text.substring(0, 50));
       const response = await processMessage(chatId, text);
-      bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+      sendSafe(chatId, response, { parse_mode: 'Markdown' });
     } catch (e) {
       console.error('Voice error:', e.message);
-      bot.sendMessage(chatId, '❌ Nepodařilo se zpracovat hlasovku: ' + e.message);
+      sendSafe(chatId, '❌ Nepodařilo se zpracovat hlasovku: ' + e.message);
     }
     return;
   }
@@ -1859,24 +1722,24 @@ bot.on('message', async (msg) => {
         const localUrl = `/local/zan/${filename}`;
         logAction(chatId, user.name, 'image_saved', filename, 'ok');
         const saveMsg = `📸 Fotka uložena! Můžu ji použít v dashboardu jako:\n\`\`\`yaml\n- type: picture\n  image: "${localUrl}"\n\`\`\`\nURL: \`${localUrl}\``;
-        bot.sendMessage(chatId, saveMsg, { parse_mode: 'Markdown' });
+        sendSafe(chatId, saveMsg, { parse_mode: 'Markdown' });
         const userCaption = caption || 'Fotka uložena pro dashboard.';
         const response = await processMessage(chatId, `${userCaption} (fotka uložena jako ${localUrl})`, base64);
-        bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+        sendSafe(chatId, response, { parse_mode: 'Markdown' });
       } else if (isGardenPhoto) {
-        bot.sendMessage(chatId, '🌱 Koukám na fotku...');
+        sendSafe(chatId, '🌱 Koukám na fotku...');
         const garden = loadGarden();
         const memory = loadMemory();
         const analysis = await analyzeGardenPhoto(base64, caption, garden, memory);
-        bot.sendMessage(chatId, analysis, { parse_mode: 'Markdown' });
+        sendSafe(chatId, analysis, { parse_mode: 'Markdown' });
       } else {
         const userCaption = caption || 'Co vidíš na této fotce? Jak to souvisí s domem?';
         const response = await processMessage(chatId, userCaption, base64);
-        bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+        sendSafe(chatId, response, { parse_mode: 'Markdown' });
       }
     } catch (e) {
       console.error('Photo error:', e.message);
-      bot.sendMessage(chatId, '❌ Nepodařilo se zpracovat fotku: ' + e.message);
+      sendSafe(chatId, '❌ Nepodařilo se zpracovat fotku: ' + e.message);
     }
     return;
   }
@@ -1891,7 +1754,7 @@ bot.on('message', async (msg) => {
     const residentsKnown = Object.keys(memory.residents || {}).length > 0;
 
     if (!homeKnown || !residentsKnown) {
-      bot.sendMessage(chatId,
+      sendSafe(chatId,
         `👋 Ahoj ${user.name}! Jsem *Žán* — váš věrný správce domu! 🏠\n\n` +
         'Jsem tu aby se o vás postaral. Ale nejdřív se musím trochu seznámit!\n\n' +
         '*Kdo jste a jak vypadá váš dům?*\n\n' +
@@ -1901,7 +1764,7 @@ bot.on('message', async (msg) => {
     } else {
       const residents = memory.residents || {};
       const names = Object.values(residents).map(r => r.name).join(' a ');
-      bot.sendMessage(chatId,
+      sendSafe(chatId,
         `👋 Ahoj ${user.name}! Jsem zpět — správce domu ${memory.home_name}.\n\n` +
         `Pamatuji si ${names ? names : 'vás'}, ${Object.keys(memory.rooms).length} místností a ${Object.keys(memory.devices).length} zařízení.\n\n` +
         '*Co potřebuješ?* 😊\n\n' +
@@ -1921,13 +1784,13 @@ bot.on('message', async (msg) => {
     if (Object.keys(memory.devices).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
     if (memory.notes.length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
     if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
-    bot.sendMessage(chatId, out, { parse_mode: 'Markdown' });
+    sendSafe(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/reset') {
     conversationHistory[chatId] = [];
-    bot.sendMessage(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
+    sendSafe(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
     return;
   }
 
@@ -1938,14 +1801,14 @@ bot.on('message', async (msg) => {
         .filter(s => ['light', 'switch', 'climate', 'sensor'].some(d => s.entity_id.startsWith(d + '.')))
         .map(s => `${s.attributes.friendly_name || s.entity_id}: ${s.state}${s.attributes.unit_of_measurement || ''}`)
         .join('\n');
-      bot.sendMessage(chatId, `📊 *Zařízení:*\n\n${relevant}`, { parse_mode: 'Markdown' });
-    } catch (e) { bot.sendMessage(chatId, '❌ ' + e.message); }
+      sendSafe(chatId, `📊 *Zařízení:*\n\n${relevant}`, { parse_mode: 'Markdown' });
+    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
     return;
   }
 
   if (text === '/balicky') {
     const packages = listPackages();
-    if (Object.keys(packages).length === 0) { bot.sendMessage(chatId, '📦 Zatím žádné balíčky.'); return; }
+    if (Object.keys(packages).length === 0) { sendSafe(chatId, '📦 Zatím žádné balíčky.'); return; }
     let out = '📦 *YAML balíčky:*\n\n';
     for (const [cat, files] of Object.entries(packages)) {
       const testFiles = files.filter(f => f.includes('-test'));
@@ -1954,23 +1817,23 @@ bot.on('message', async (msg) => {
       if (testFiles.length) out += `*${cat}/ (testovací)*\n${testFiles.map(f => `  🧪 ${f}`).join('\n')}\n`;
       out += '\n';
     }
-    bot.sendMessage(chatId, out, { parse_mode: 'Markdown' });
+    sendSafe(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/dashboardy') {
     const dashDir = path.join(HA_CONFIG_PATH, 'dashboards');
     try {
-      if (!fs.existsSync(dashDir)) { bot.sendMessage(chatId, '📊 Složka dashboards neexistuje.'); return; }
+      if (!fs.existsSync(dashDir)) { sendSafe(chatId, '📊 Složka dashboards neexistuje.'); return; }
       const files = fs.readdirSync(dashDir).filter(f => f.endsWith('.yaml'));
-      if (files.length === 0) { bot.sendMessage(chatId, '📊 Zatím žádné dashboardy.'); return; }
+      if (files.length === 0) { sendSafe(chatId, '📊 Zatím žádné dashboardy.'); return; }
       const real = files.filter(f => !f.includes('-test'));
       const test = files.filter(f => f.includes('-test'));
       let out = '📊 *Dashboardy:*\n\n';
       if (real.length) out += `*Produkční:*\n${real.map(f => `• ${f}`).join('\n')}\n\n`;
       if (test.length) out += `*Testovací:*\n${test.map(f => `🧪 ${f}`).join('\n')}`;
-      bot.sendMessage(chatId, out, { parse_mode: 'Markdown' });
-    } catch (e) { bot.sendMessage(chatId, '❌ ' + e.message); }
+      sendSafe(chatId, out, { parse_mode: 'Markdown' });
+    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
     return;
   }
 
@@ -1978,8 +1841,8 @@ bot.on('message', async (msg) => {
     bot.sendChatAction(chatId, 'typing');
     try {
       const advice = await generateGardenAdvice(chatId);
-      bot.sendMessage(chatId, `🌱 *Zahradní brief:*\n\n${advice}`, { parse_mode: 'Markdown' });
-    } catch (e) { bot.sendMessage(chatId, '❌ ' + e.message); }
+      sendSafe(chatId, `🌱 *Zahradní brief:*\n\n${advice}`, { parse_mode: 'Markdown' });
+    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
     return;
   }
 
@@ -1996,32 +1859,32 @@ bot.on('message', async (msg) => {
       out += `\n*Poslední návrhy:*\n`;
       habits.suggestions_sent.slice(-3).forEach(s => out += `• ${s.date}: ${s.suggestion.substring(0, 60)}...\n`);
     }
-    bot.sendMessage(chatId, out, { parse_mode: 'Markdown' });
+    sendSafe(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/analyza' && isAdmin(chatId)) {
-    bot.sendMessage(chatId, '🧠 Spouštím analýzu návyků...');
+    sendSafe(chatId, '🧠 Spouštím analýzu návyků...');
     analyzeHabits();
     return;
   }
 
   if (text === '/log' && isAdmin(chatId)) {
     try {
-      if (!fs.existsSync(LOG_FILE)) { bot.sendMessage(chatId, '📋 Log je prázdný.'); return; }
+      if (!fs.existsSync(LOG_FILE)) { sendSafe(chatId, '📋 Log je prázdný.'); return; }
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-20);
-      bot.sendMessage(chatId, `📋 *Posledních 20 akcí:*\n\n\`\`\`\n${lines.join('\n')}\n\`\`\``, { parse_mode: 'Markdown' });
-    } catch (e) { bot.sendMessage(chatId, '❌ ' + e.message); }
+      sendSafe(chatId, `📋 *Posledních 20 akcí:*\n\n\`\`\`\n${lines.join('\n')}\n\`\`\``, { parse_mode: 'Markdown' });
+    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
     return;
   }
 
   bot.sendChatAction(chatId, 'typing');
   try {
     const response = await processMessage(chatId, text);
-    bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    sendSafe(chatId, response, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('Chyba:', error.message);
-    bot.sendMessage(chatId, '❌ Chyba: ' + error.message);
+    sendSafe(chatId, '❌ Chyba: ' + error.message);
   }
 });
 
@@ -2101,6 +1964,11 @@ async function pollStates() {
 // Každou neděli v 20:00 — analýza návyků a návrh automatizací
 async function analyzeHabits() {
   const habits = loadHabits();
+  // Guard: interval běží každou minutu a v okně 20:00–20:05 by analýzu spustil až 5×
+  if (habits.last_analysis && Date.now() - new Date(habits.last_analysis).getTime() < 6 * 24 * 60 * 60 * 1000) {
+    console.log('Analýza návyků: přeskočeno (poslední proběhla před méně než 6 dny)');
+    return;
+  }
   const events = loadEvents();
   if (events.length < 50) return; // Málo dat
 
@@ -2145,7 +2013,7 @@ Piš česky, přátelsky, jako Žán. Zpráva půjde do Telegramu.
 Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`;
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: MODEL,
       max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -2154,7 +2022,7 @@ Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`
     if (!suggestion) return;
 
     // Pošli návrh Ondrovi
-    await bot.sendMessage(CHAT_ONDRA, `🧠 *Týdenní analýza návyků:*\n\n${suggestion}`, { parse_mode: 'Markdown' });
+    await sendSafe(CHAT_ONDRA, `🧠 *Týdenní analýza návyků:*\n\n${suggestion}`, { parse_mode: 'Markdown' });
 
     // Ulož že jsme poslali návrh
     habits.last_analysis = new Date().toISOString();
