@@ -1,0 +1,7 @@
+# Base image pro build add-onu.
+# Novější Supervisor (2026.06+) už nedodává výchozí $BUILD_FROM —
+# bez tohoto souboru build spadne na "base name should not be blank".
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base:3.21
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.21
+  armv7: ghcr.io/home-assistant/armv7-base:3.21
