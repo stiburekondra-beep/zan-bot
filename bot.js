@@ -476,6 +476,17 @@ function buildTools(chatId) {
       input_schema: { type: 'object', properties: {}, required: [] },
     },
     {
+      name: 'zigbee_permit_join',
+      description: 'Zapne párování Zigbee sítě (permit join), aby šlo přidat nové zařízení. Sám detekuje integraci (Zigbee2MQTT, ZHA). Když párování nejde spustit dálkově (např. eWeLink most), vrátí instrukce pro uživatele — předej mu je.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          duration: { type: 'number', description: 'Doba párování v sekundách (výchozí 60, max 254)' },
+        },
+        required: [],
+      },
+    },
+    {
       name: 'scan_all_devices',
       description: 'Kompletní sken všech zařízení v HA — device registry, entity registry, oblasti. Vrátí zařízení podle místností, nezařazená zařízení, výrobce (Tuya, Sonoff, eWeLink, Zigbee apod.).',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -956,6 +967,44 @@ async function executeTool(name, input, chatId) {
           } catch { return { entity_id: e }; }
         }));
         return { new_entities: details, count: newEntities.length };
+      }
+
+      case 'zigbee_permit_join': {
+        const duration = Math.min(Math.max(input.duration || 60, 10), 254);
+        // 1) Zigbee2MQTT — bridge vystavuje přepínač permit join
+        try {
+          const states = await haGet('states');
+          const pj = states.find(s => s.entity_id.includes('permit_join') && ['switch', 'input_boolean'].includes(s.entity_id.split('.')[0]));
+          if (pj) {
+            await haPost(`services/${pj.entity_id.split('.')[0]}/turn_on`, { entity_id: pj.entity_id });
+            logAction(chatId, user.name, 'permit_join', pj.entity_id, 'ok');
+            return { success: true, backend: 'zigbee2mqtt', message: `✅ Párování zapnuto (Zigbee2MQTT). Aktivuj teď párování na zařízení a dej mi vědět — pak spustím sken.` };
+          }
+        } catch {}
+        // 2) ZHA — služba zha.permit
+        try {
+          const services = await haGet('services');
+          const domains = services.map(s => s.domain);
+          if (domains.includes('zha')) {
+            await haPost('services/zha/permit', { duration });
+            logAction(chatId, user.name, 'permit_join', 'zha', 'ok');
+            return { success: true, backend: 'zha', message: `✅ Párování zapnuto na ${duration} s (ZHA). Aktivuj teď párování na zařízení a dej mi vědět — pak spustím sken.` };
+          }
+          // 3) Z2M přes MQTT bez bridge entity
+          if (domains.includes('mqtt')) {
+            await haPost('services/mqtt/publish', { topic: 'zigbee2mqtt/bridge/request/permit_join', payload: JSON.stringify({ time: duration }) });
+            logAction(chatId, user.name, 'permit_join', 'mqtt', 'ok');
+            return { success: true, backend: 'zigbee2mqtt/mqtt', message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT. Aktivuj párování na zařízení a dej mi vědět.` };
+          }
+        } catch (e) {
+          return { error: `Spuštění párování selhalo: ${e.message}` };
+        }
+        // 4) Nic ovladatelného — typicky eWeLink/Sonoff most nebo Matter
+        return {
+          success: false,
+          backend: 'none',
+          user_instructions: 'Dálkové zapnutí párování tu není možné — Zigbee běží přes eWeLink most (nebo jde o Matter zařízení). Postup: Zigbee → otevři aplikaci eWeLink → vyber most ZBBridge-U → "Přidat podzařízení" a aktivuj párování na zásuvce. Matter → aplikace Home Assistant → Nastavení → Zařízení → Přidat zařízení → naskenuj QR kód. Až bude zařízení přidané, napiš mi a já ho pojmenuju, zařadím do místnosti a navrhnu automatizace.',
+        };
       }
 
       case 'rename_entity': {
@@ -1579,7 +1628,7 @@ IDENTIFIKACE INTEGRACE: "tuya"→Tuya, "ewelink"→Sonoff/eWeLink, "zha"/"zigbee
 
 SENZORY — co navrhovat: teplota+vlhkost→automatizace topení a extrémy; CO2 (ppm)→upozornění >1000, varování >1500, větrání; pohyb→světla, bezpečnost; dveře/okna→otevřeno v noci/dešti; spotřeba→anomálie; kouř/plyn→okamžité upozornění.
 
-WORKFLOW NOVÉ ZAŘÍZENÍ: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (packages/[nazev]-auto.yaml) → doporuč doplňkový HW.
+WORKFLOW NOVÉ ZAŘÍZENÍ: Pokud zařízení ještě není spárované (uživatel ho právě zapojil / scan ho nenajde): zigbee_permit_join → řekni uživateli, ať aktivuje párování na zařízení, a počkej na jeho potvrzení. Když nástroj vrátí user_instructions, předej je uživateli vlastními slovy. Pak: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (packages/[nazev]-auto.yaml) → doporuč doplňkový HW.
 
 WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard → reload_ha(lovelace). Nikdy nemaž bez výslovného souhlasu.
 
