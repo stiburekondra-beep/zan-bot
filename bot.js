@@ -486,6 +486,15 @@ function buildTools(chatId) {
       input_schema: { type: 'object', properties: { entity_id: { type: 'string' } }, required: ['entity_id'] },
     },
     {
+      name: 'camera_snapshot',
+      description: 'Pořídí aktuální snímek z kamery (camera.xxx) a rovnou se na něj podívá. Použij, když se někdo zeptá "co se děje na [místo s kamerou]" nebo podobně. Entity_id kamery zjistíš přes get_states s domain=camera. Po zavolání popiš vlastními slovy, co na snímku vidíš.',
+      input_schema: {
+        type: 'object',
+        properties: { entity_id: { type: 'string', description: 'entity_id kamery, např. camera.terasa' } },
+        required: ['entity_id'],
+      },
+    },
+    {
       name: 'turn_on',
       description: 'Zapne zařízení z whitelist domén.',
       input_schema: { type: 'object', properties: { entity_id: { type: 'string' } }, required: ['entity_id'] },
@@ -1005,6 +1014,21 @@ async function executeTool(name, input, chatId) {
       case 'get_state': {
         const s = await haGet(`states/${input.entity_id}`);
         return { entity_id: s.entity_id, name: s.attributes.friendly_name, state: s.state, attributes: s.attributes };
+      }
+
+      case 'camera_snapshot': {
+        try {
+          const r = await axios.get(`${HA_URL}/api/camera_proxy/${input.entity_id}`, {
+            headers: haHeaders(), responseType: 'arraybuffer', timeout: 10000,
+          });
+          const base64 = Buffer.from(r.data).toString('base64');
+          logAction(chatId, user.name, 'camera_snapshot', input.entity_id, 'ok');
+          // Speciální tvar — processMessage tohle pozná a vrátí Claudovi
+          // rovnou jako obrázek (multimodal tool_result), ne jako JSON text.
+          return { __image_base64: base64, __media_type: 'image/jpeg', note: `Snímek z ${input.entity_id}, ${new Date().toLocaleTimeString('cs-CZ')}.` };
+        } catch (e) {
+          return { error: `Nepodařilo se získat snímek z ${input.entity_id}: ${e.message}` };
+        }
       }
 
       case 'turn_on': {
@@ -1874,6 +1898,11 @@ D) Po A/B/C, kdykoliv je nastavení kompletní:
       (update_house_info, pole "onboarding_done" = "true"), ať se
       dotazník neopakuje znovu od začátku při každé konverzaci.
 
+KAMERA (camera_snapshot): podívej se JEN když se někdo výslovně zeptá
+("co se děje na terase", "mrkni na zahradu"), nikdy sám od sebe/pravidelně
+— Žán není špión, co nahrává všechno. Po snímku popiš věcně, co vidíš,
+bez přehnaného dramatu u ničeho neobvyklého.
+
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
 - Pokud HA není online, oznam to a neprováděj akce
@@ -1971,11 +2000,23 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
       for (const block of response.content) {
         if (block.type === 'tool_use') {
           const result = await executeTool(block.name, block.input, chatId);
-          let resultStr = JSON.stringify(result);
-          if (resultStr.length > MAX_TOOL_RESULT_CHARS) {
-            resultStr = resultStr.slice(0, MAX_TOOL_RESULT_CHARS) + ' …[VÝSLEDEK OŘEZÁN — byl příliš dlouhý, pracuj s tímto výřezem]';
+          let content;
+          if (result && result.__image_base64) {
+            // Nástroj vrátil obrázek (např. camera_snapshot) — pošli ho
+            // Claudovi jako skutečný obrázek, ne jako JSON text, ať ho
+            // může reálně "vidět" a popsat.
+            content = [
+              { type: 'image', source: { type: 'base64', media_type: result.__media_type || 'image/jpeg', data: result.__image_base64 } },
+              { type: 'text', text: result.note || 'Snímek z kamery.' },
+            ];
+          } else {
+            let resultStr = JSON.stringify(result);
+            if (resultStr.length > MAX_TOOL_RESULT_CHARS) {
+              resultStr = resultStr.slice(0, MAX_TOOL_RESULT_CHARS) + ' …[VÝSLEDEK OŘEZÁN — byl příliš dlouhý, pracuj s tímto výřezem]';
+            }
+            content = resultStr;
           }
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: resultStr });
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content });
         }
       }
       messages.push({ role: 'user', content: toolResults });
