@@ -907,10 +907,14 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'get_areas': {
+        // POZOR (oprava 2026-07-05): REST config/{area,entity,device}_registry
+        // vrací 404 — HA tyhle registry vystavuje jen přes WebSocket. Dřívější
+        // verze tohohle nástroje na to volala haGet(), chyby si tiše polykala
+        // (.catch(() => [])) a vždycky vracela prázdno. Opraveno na haWsCommand.
         const [areaReg, entityReg, deviceReg] = await Promise.all([
-          haGet('config/area_registry/list').catch(() => []),
-          haGet('config/entity_registry/list').catch(() => []),
-          haGet('config/device_registry/list').catch(() => []),
+          haWsCommand('config/area_registry/list').catch(() => []),
+          haWsCommand('config/entity_registry/list').catch(() => []),
+          haWsCommand('config/device_registry/list').catch(() => []),
         ]);
         const areas = Array.isArray(areaReg) ? areaReg : [];
         const entities = Array.isArray(entityReg) ? entityReg : [];
@@ -1744,6 +1748,25 @@ TVOJE CHOVÁNÍ:
 - Data o zařízeních si zjišťuj nástroji (get_states, scan_all_devices, get_areas) — netipuj
 - Jednou týdně se nenásilně zeptej na věci o domě (checkin_schedule)
 - Navrhuj konkrétní IoT HW s modelem a cenou, když vidíš příležitost. Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]"
+
+ONBOARDING NOVÉ DOMÁCNOSTI (poznáš podle toho, že get_areas vrátí 0 nebo skoro
+0 místností — dům ještě není nastavený):
+1. Zavolej get_areas — zjisti, co už existuje, ať nevytváříš duplicity.
+2. Doptej se rychle, po jedné otázce, Y/N nebo krátkou odpovědí (ne dlouhý
+   formulář najednou): kdo v domácnosti žije, jaká patra dům má a jak se
+   jim říká, jaké místnosti jsou na kterém patře, jak se topí a jaké
+   teploty vyhovují přes den/v noci, jde-li topení řídit po místnostech
+   nebo jen jako celek, jaká pravidla Žán musí vždy/nikdy dodržovat.
+3. Podle odpovědí vytvoř patra (ha_setup_create_floor) a místnosti
+   (ha_setup_create_area), pak zjištěná zařízení přiřaď (ha_setup_assign_device).
+4. Ulož odpovědi (update_family_member, update_house_info) — vytápění jako
+   pole u domu (heating_type, temp_day, temp_night, heating_control).
+5. Porovnej přání s realitou: pokud si rodina přeje řídit teplotu po
+   místnostech, ale místnost nemá teplotní senzor (zkontroluj get_states),
+   řekni to a navrhni konkrétní senzor ke koupi (stejný formát jako výše
+   u obecného HW návrhu) — neslibuj funkci, na kterou chybí senzor.
+6. Až je základ hotový, řekni to nahlas a ulož si (update_house_info,
+   pole "onboarding_done" = "true"), ať se celý dotazník neopakuje znovu.
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
