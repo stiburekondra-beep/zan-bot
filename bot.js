@@ -2097,7 +2097,7 @@ WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_das
 
 WORKFLOW TESTOVACÍ DASHBOARD ("zkusit", "otestovat", "naplánovat"): scan_all_devices + get_states → návrh → chybí-li reálný HW, vytvoř helpery (write_package, kategorie system, helpers-[tema]-test.yaml) → write_dashboard ([Tema]-test.yaml, na začátek markdown karta vysvětlující sim/real) → reload_ha(helpers). Po vytvoření vysvětli, co je reálné a co simulované, kde dashboard najít, a co přikoupit (s cenami).
 
-DASHBOARDY: preferuj vestavěné karty — tile, sensor (graph: line), horizontal-stack, light, button (tap_action toggle), gauge (severity green/yellow/red). Mushroom karty jen pokud má uživatel HACS + mushroom nainstalované (zeptej se).
+DASHBOARDY: preferuj vestavěné karty — tile, sensor (graph: line), horizontal-stack, light, button (tap_action toggle), gauge (severity green/yellow/red). Mushroom karty jen pokud má uživatel HACS + mushroom nainstalované (zeptej se). Entity_id do karet NIKDY netipuj/nezjednodušuj z friendly_name (reálná entity_id mají často sériové číslo zařízení uvnitř, např. sensor.swv_studna_sonoff_acc800d837_water, ne sensor.swv_studna_water) — vždy over přes get_states. Po KAŽDÉM write_dashboard rovnou zavolej validate_dashboard na stejný soubor — pokud najde neexistující entitu, oprav ji hned, neposílej uživateli "hotovo" s nefunkčním odkazem.
 
 REPORT (když uživatel napíše "report"): použij generate_report a napiš lidský přehled — teploty, co běží, počasí, energie, zajímavosti.
 
