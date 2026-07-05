@@ -1,8 +1,8 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-# Install Node.js, jq and dependencies
-RUN apk add --no-cache nodejs npm bash jq
+# Install Node.js, jq, dependencies + nmap (sken domácí sítě — scan_network)
+RUN apk add --no-cache nodejs npm bash jq nmap
 
 # Set working directory
 WORKDIR /app

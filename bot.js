@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
@@ -227,6 +228,23 @@ function saveMemory(memory) {
     fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2), 'utf8');
     return true;
   } catch (e) { console.error('Memory save error:', e.message); return false; }
+}
+
+// ═══════════════════════════════════════════════
+// SÍŤ — sken LAN (scan_network), vyžaduje host_network+NET_RAW v config.yaml
+// ═══════════════════════════════════════════════
+function getLanSubnet() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal &&
+          (iface.address.startsWith('192.168.') || iface.address.startsWith('10.') || iface.address.startsWith('172.'))) {
+        const parts = iface.address.split('.');
+        return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+      }
+    }
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════
@@ -797,6 +815,11 @@ Po zápisu vždy popsat změny LIDSKY.`,
           },
           required: ['device_id', 'area_id'],
         },
+      },
+      {
+        name: 'scan_network',
+        description: 'Prohledá domácí síť (LAN) a najde připojená zařízení — IP adresu, MAC a výrobce, pokud jde zjistit. Použij, když potřebuješ najít IP nové kamery/zařízení, které uživatel nezná (např. při přidávání kamery). Trvá cca 15–30 sekund. Zařízení od TP-Link (Tapo kamery) pozná podle výrobce v MAC adrese.',
+        input_schema: { type: 'object', properties: {}, required: [] },
       },
       {
         name: 'setup_camera',
@@ -1598,6 +1621,31 @@ async function executeTool(name, input, chatId) {
         } catch (e) { return { error: e.message }; }
       }
 
+      case 'scan_network': {
+        if (!isAdmin(chatId)) return { error: 'Sken sítě vyžaduje admin přístup.' };
+        try {
+          const subnet = getLanSubnet();
+          if (!subnet) return { error: 'Nepodařilo se zjistit domácí síť (LAN rozhraní nenalezeno) — zkontroluj host_network v config.yaml add-onu.' };
+
+          const output = execSync(`nmap -sn ${subnet}`, { timeout: 45000 }).toString();
+          const lines = output.split('\n');
+          const hosts = [];
+          for (let i = 0; i < lines.length; i++) {
+            const m = lines[i].match(/Nmap scan report for (?:(\S+) )?\(?([\d.]+)\)?/);
+            if (m) {
+              const host = { ip: m[2], hostname: m[1] && m[1] !== m[2] ? m[1] : null, mac: null, vendor: null };
+              const macLine = lines[i + 1] ? lines[i + 1].match(/MAC Address: ([0-9A-Fa-f:]+) \(([^)]+)\)/) : null;
+              if (macLine) { host.mac = macLine[1]; host.vendor = macLine[2]; }
+              hosts.push(host);
+            }
+          }
+          logAction(chatId, user.name, 'scan_network', subnet, `${hosts.length} zařízení`);
+          return { subnet, count: hosts.length, hosts };
+        } catch (e) {
+          return { error: `Sken sítě selhal: ${e.message}` };
+        }
+      }
+
       case 'setup_camera': {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
@@ -1962,12 +2010,17 @@ KAMERA (camera_snapshot): podívej se JEN když se někdo výslovně zeptá
 bez přehnaného dramatu u ničeho neobvyklého.
 
 PŘIDÁNÍ KAMERY (setup_camera): když někdo řekne "chci přidat kameru" nebo
-podobně, NEČEKEJ na hotové údaje — doptej se sám, po jedné otázce (IP,
-Tapo Camera Account ano/ne + případně vysvětli jak ho založit, jméno/
-heslo, název místnosti), pak zavolej setup_camera. Je to nový, needs
-testing nástroj — když selže, řekni to na rovinu a nabídni návod na
-ruční přidání (Nastavení → Zařízení a služby → Přidat integraci →
-Generic Camera), ne aby to vypadalo jako tvoje chyba, kterou zatajuješ.
+podobně, NEČEKEJ na hotové údaje — doptej se sám, po jedné otázce. Když
+nezná IP kamery, NEPOSÍLEJ ho hledat do routeru sám — použij
+scan_network, najdi zařízení od výrobce TP-Link/TP-LINK (to jsou Tapo
+kamery) a nabídni je k výběru. Pak: Tapo Camera Account ano/ne + případně
+vysvětli jak ho založit, jméno/heslo, název místnosti — pak zavolej
+setup_camera. Upozorni, že bez statické IP (nebo DHCP rezervace v
+routeru) se kamera po čase může "ztratit" — doporuč to nastavit.
+Je to nový, needs testing nástroj — když selže, řekni to na rovinu a
+nabídni návod na ruční přidání (Nastavení → Zařízení a služby → Přidat
+integraci → Generic Camera), ne aby to vypadalo jako tvoje chyba, kterou
+zatajuješ.
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení

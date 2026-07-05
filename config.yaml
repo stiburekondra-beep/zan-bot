@@ -1,6 +1,6 @@
 name: "Žán Bot"
 description: "AI správce domu Žán — Telegram bot pro Home Assistant"
-version: "5.4.6"
+version: "5.4.7"
 slug: "zan_bot"
 init: false
 arch:
@@ -13,6 +13,10 @@ auth_api: true
 ingress: false
 startup: application
 boot: auto
+host_network: true
+privileged:
+  - NET_ADMIN
+  - NET_RAW
 map:
   - config:rw
 options:
