@@ -302,6 +302,23 @@ async function isAiStopped() {
 }
 
 // ═══════════════════════════════════════════════
+// FRONTA VELKÝCH ÚKOLŮ (queue_task)
+// Pro věci, co by "hodně stály" (velké dashboardy, hromadné přejmenování
+// apod.) — Žán rovnou neřekne "nezvládnu", ale zařadí to do fronty a
+// zpracuje v noci (processQueuedTasks), přes stejný agentic loop jako
+// běžná konverzace (processMessage), jen s chatId=Ondra a syntetickou
+// zprávou misto ruční zprávy z Telegramu.
+// ═══════════════════════════════════════════════
+const MAX_TASK_ATTEMPTS = 3; // po 3 nocích bez dokončení nahlásí a přestane zkoušet
+function loadTasks() {
+  try { if (fs.existsSync(TASKS_FILE)) return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8')); } catch {}
+  return { tasks: [] };
+}
+function saveTasks(t) {
+  try { fs.writeFileSync(TASKS_FILE, JSON.stringify(t, null, 2), 'utf8'); } catch {}
+}
+
+// ═══════════════════════════════════════════════
 // HA WEBSOCKET — registry operace (patra/místnosti/zařízení)
 // REST API config/{area,floor,device}_registry vrací 404 — HA tyhle
 // registry historicky vystavuje jen přes WebSocket. Ověřeno ručně
@@ -770,6 +787,19 @@ Po zápisu vždy popsat změny LIDSKY.`,
             area_id: { type: 'string' },
           },
           required: ['device_id', 'area_id'],
+        },
+      },
+      {
+        name: 'queue_task',
+        description: `Zařadí velký/drahý úkol (např. "hezké dashboardy pro celý dům", hromadné změny) do noční fronty místo okamžitého zpracování. Použij, když by úkol stál hodně tokenů vzhledem k dnešní útratě (viz AKTUÁLNÍ KONTEXT) NEBO by potřeboval víc iterací než zvládne jedna konverzace (mnoho místností/kroků najednou). Po zavolání VŽDY řekni uživateli lidsky, co a kdy uděláš (např. "je to hodně práce, zvládnu to přes noc, klidně na dvakrát").`,
+        input_schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['add', 'list', 'mark_done'] },
+            description: { type: 'string', description: 'Co přesně udělat — konkrétně, ať to noční zpracování ví, kde začít (add)' },
+            task_id: { type: 'string', description: 'ID úkolu (mark_done)' },
+          },
+          required: ['action'],
         },
       }
     );
@@ -1524,6 +1554,36 @@ async function executeTool(name, input, chatId) {
         } catch (e) { return { error: e.message }; }
       }
 
+      case 'queue_task': {
+        const t = loadTasks();
+        if (input.action === 'add') {
+          const task = {
+            id: `t${Date.now()}`,
+            description: input.description,
+            requested_by: user.name,
+            chat_id: chatId,
+            created_at: new Date().toISOString(),
+            status: 'queued',
+            attempts: 0,
+          };
+          t.tasks.push(task);
+          saveTasks(t);
+          logAction(chatId, user.name, 'queue_task_add', task.id, task.description);
+          return { success: true, task_id: task.id, message: 'Zařazeno do noční fronty.' };
+        }
+        if (input.action === 'list') {
+          return { tasks: t.tasks.filter(x => x.status !== 'done') };
+        }
+        if (input.action === 'mark_done') {
+          const task = t.tasks.find(x => x.id === input.task_id);
+          if (!task) return { error: 'Úkol nenalezen' };
+          task.status = 'done';
+          saveTasks(t);
+          return { success: true };
+        }
+        return { error: 'Neznámá action' };
+      }
+
       default: return { error: 'Neznámý nástroj' };
     }
   } catch (err) {
@@ -1754,6 +1814,15 @@ TVOJE CHOVÁNÍ:
 - Jednou týdně se nenásilně zeptej na věci o domě (checkin_schedule)
 - Navrhuj konkrétní IoT HW s modelem a cenou, když vidíš příležitost. Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]"
 
+VELKÉ/DRAHÉ ÚKOLY (hezké dashboardy pro víc místností, hromadné změny,
+cokoliv co by potřebovalo mnoho kroků najednou): NEODMÍTEJ a NEŘÍKEJ
+"to nezvládnu" — místo toho krátce zhodnoť rozsah, řekni na rovinu ("je
+toho hodně, klidně to zvládnu, ale radši přes noc — třeba na dvakrát"),
+zavolej queue_task (action=add) s konkrétním popisem, a jasně potvrď, kdy
+se to stane. Malé/rychlé věci (jedna místnost, jedna karta, drobná
+úprava) dělej rovnou, neptej se zbytečně. Neexistuje pevný denní limit —
+rozhoduj podle rozsahu úkolu a dnešní útraty v kontextu, ne podle strachu.
+
 ONBOARDING — VŽDY NEJDŘÍV ZJISTI STAV, NIKDY NEZAČÍNEJ NASLEPO:
 Zavolej ha_setup_list (počet pater/místností + unassigned_count) a zkontroluj
 paměť (pole house.onboarding_done). Podle toho poznáš, ve které situaci jsi —
@@ -1843,8 +1912,11 @@ async function processMessage(chatId, userMessage, imageBase64 = null) {
   // Dynamický kontext — proměnlivé věci patří sem (za cache breakpoint),
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
   const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
+  const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
+  const todayCzk = (usageCostUsd(todayUsage) * USD_CZK).toFixed(1);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${memory.home_name}" | Čas: ${new Date().toLocaleString('cs-CZ')}
+Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
 Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}
 Dům detaily: ${JSON.stringify(memory.house || {})}
@@ -2201,6 +2273,7 @@ bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 const EVENTS_FILE = path.join(__dirname, 'zan_events.json');
 const HABITS_FILE = path.join(__dirname, 'zan_habits.json');
 const UDRZBA_FILE = path.join(__dirname, 'zan_udrzba.json');
+const TASKS_FILE = path.join(__dirname, 'zan_tasks.json');
 
 // Sledované domény pro návyky
 const HABIT_DOMAINS = ['light', 'switch', 'climate', 'cover', 'input_boolean'];
@@ -2492,6 +2565,54 @@ async function runObchuzka() {
   }
 }
 
+// Zpracuje jeden čekající úkol z fronty (queue_task) — noční běh.
+// Používá stejný agentic loop jako běžná zpráva (processMessage), jen
+// se syntetickým promptem místo Telegram zprávy od člověka.
+async function processQueuedTasks() {
+  const t = loadTasks();
+  const pending = t.tasks.filter(x => x.status === 'queued' || x.status === 'in_progress');
+  if (pending.length === 0) return;
+  if (await isAiStopped()) { console.log('Fronta úkolů: přeskočeno (AI vypnuté)'); return; }
+
+  const task = pending[0]; // FIFO — jeden úkol za noc, ať se nekumuluje cena
+  console.log(`🌙 Zpracovávám úkol z fronty: ${task.description}`);
+  task.status = 'in_progress';
+  task.attempts = (task.attempts || 0) + 1;
+  saveTasks(t);
+
+  const prompt = task.attempts > 1
+    ? `Pokračuj v úkolu z fronty (pokus ${task.attempts}/${MAX_TASK_ATTEMPTS}), noční zpracování, nikdo teď nekouká: "${task.description}". Nejdřív zkontroluj, co už existuje (list_dashboards, read_package/read_dashboard...), ať neděláš práci znovu, a pokračuj tam, kde jsi minule skončil.`
+    : `Zpracuj úkol z fronty, noční zpracování, nikdo teď nekouká: "${task.description}"`;
+
+  try {
+    const result = await processMessage(task.chat_id || CHAT_ONDRA, prompt);
+    const hitLimit = typeof result === 'string' && result.includes('Úloha byla moc dlouhá');
+
+    const tt = loadTasks();
+    const tref = tt.tasks.find(x => x.id === task.id);
+    if (!tref) return;
+
+    if (hitLimit && tref.attempts < MAX_TASK_ATTEMPTS) {
+      tref.status = 'queued'; // zůstává ve frontě, pokračuje příští noc
+      saveTasks(tt);
+      await sendSafe(task.chat_id || CHAT_ONDRA, `🌙 Pracoval jsem na úkolu "${task.description}" — je toho víc, pokračuju další noc (pokus ${tref.attempts}/${MAX_TASK_ATTEMPTS}).`);
+    } else if (hitLimit) {
+      tref.status = 'stuck';
+      saveTasks(tt);
+      await sendSafe(task.chat_id || CHAT_ONDRA, `⚠️ Úkol "${task.description}" se mi po ${MAX_TASK_ATTEMPTS} nocích nepodařilo dokončit sám — mrkneme na to spolu?`);
+    } else {
+      tref.status = 'done';
+      saveTasks(tt);
+      await sendSafe(task.chat_id || CHAT_ONDRA, `✅ Hotovo přes noc — "${task.description}":\n\n${result}`);
+    }
+  } catch (e) {
+    console.error('Zpracování fronty selhalo:', e.message);
+    const tt = loadTasks();
+    const tref = tt.tasks.find(x => x.id === task.id);
+    if (tref) { tref.status = 'queued'; saveTasks(tt); }
+  }
+}
+
 // ═══════════════════════════════════════════════
 // RODINNÝ DASHBOARD
 // ═══════════════════════════════════════════════
@@ -2636,6 +2757,15 @@ setInterval(() => {
   const now = new Date();
   if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
     analyzeHabits();
+  }
+}, 60 * 1000);
+
+// Fronta velkých úkolů (queue_task) — jednou denně ve 2:30, jeden úkol
+// za noc. Mimo kolizi s měsíčním restartem (~02:05) a obchůzkou (18:00).
+setInterval(() => {
+  const now = new Date();
+  if (now.getHours() === 2 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
+    processQueuedTasks();
   }
 }, 60 * 1000);
 
