@@ -416,6 +416,10 @@ function haWsCommand(type, payload = {}, timeoutMs = 10000) {
 // YAML HELPERS
 // ═══════════════════════════════════════════════
 function getPackagePath(cat, fn) {
+  // Slug balíčku v HA nesmí obsahovat pomlčky/mezery — s nimi HA balíček
+  // tiše nenačte (jen warning v logu). Normalizujeme natvrdo, ať model
+  // nemůže vytvořit mrtvý soubor (viz voda-casovace.yaml, 2026-07-05).
+  fn = fn.replace(/[\s-]+/g, '_');
   return path.join(HA_CONFIG_PATH, 'packages', cat, fn.endsWith('.yaml') ? fn : fn + '.yaml');
 }
 function getDashboardPath(fn) {
@@ -731,8 +735,9 @@ function buildTools(chatId) {
       },
       {
         name: 'write_package',
-        description: `Zapíše YAML balíček. Kategorie: ${Object.keys(PACKAGE_CATEGORIES).join(', ')}. 
-Pro testovací účely přidej příponu -test k názvu souboru (např. zahrada-test.yaml).
+        description: `Zapíše YAML balíček. Kategorie: ${Object.keys(PACKAGE_CATEGORIES).join(', ')}.
+NÁZEV SOUBORU = slug balíčku v HA: jen malá písmena a-z, číslice a podtržítka (snake_case). POMLČKA ZAKÁZÁNA — balíček s pomlčkou HA TIŠE nenačte (jen warning v logu, entity nevzniknou).
+Pro testovací účely přidej příponu _test k názvu souboru (např. zahrada_test.yaml).
 VŽDY nejdřív list_packages + read_package. Nikdy nezapisuj mimo packages/ nebo dashboards/.
 Po zápisu vždy popsat změny LIDSKY.`,
         input_schema: {
@@ -748,7 +753,7 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'write_dashboard',
-        description: 'Zapíše YAML dashboard. Pro testovací dashboardy použij název s příponou -test (např. zahrada-test.yaml).',
+        description: 'Zapíše YAML dashboard. Pro testovací dashboardy použij název s příponou _test (např. zahrada_test.yaml).',
         input_schema: {
           type: 'object',
           properties: { filename: { type: 'string' }, content: { type: 'string' }, description: { type: 'string' } },
@@ -1486,7 +1491,7 @@ async function executeTool(name, input, chatId) {
         memory.notes.push({ text: `Balíček ${input.category}/${input.filename}: ${input.description}`, date: new Date().toLocaleDateString('cs-CZ') });
         saveMemory(memory);
         logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'ok');
-        const isTest = input.filename.includes('-test');
+        const isTest = input.filename.search(/[-_]test/) >= 0;
         return {
           success: true,
           path: `packages/${input.category}/${input.filename}`,
@@ -1503,7 +1508,7 @@ async function executeTool(name, input, chatId) {
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: 'Zápis dashboardu selhal.' };
         logAction(chatId, user.name, 'write_dashboard', input.filename, 'ok');
-        const isTest = input.filename.includes('-test');
+        const isTest = input.filename.search(/[-_]test/) >= 0;
         return { success: true, path: `dashboards/${input.filename}`, is_test: isTest };
       }
 
@@ -2100,16 +2105,20 @@ BEZPEČNOST:
 
 STRUKTURA KONFIGURACE (závazná konvence tohoto domu):
 - Veškerý YAML žije v packages/<kategorie>/<tema>.yaml — jeden balíček = jedno téma (např. zahrada/voda.yaml). Kategorie jsou dané nástrojem write_package.
-- Balíček je JEDEN soubor s více klíči najednou: input_number:, input_boolean:, automation:, script:, sensor:, template:… Automatizace patří do STEJNÉHO souboru jako helpery daného tématu, pod klíč automation:. Samostatný automations.yaml NEEXISTUJE a nevytvářej ho — ten používá jen GUI editor, my ne.
-- Každá automatizace musí mít unikátní id: (snake_case, např. zahrada_voda_rano) a český alias: — bez id nejde editovat a rozbíjí reload.
+- NÁZEV SOUBORU = slug balíčku: jen [a-z0-9_], snake_case. POMLČKA/mezera/diakritika v názvu = HA balíček TIŠE nenačte (žádná chyba, jen warning v logu — entity prostě nevzniknou). Přesně tohle rozbilo zahradu 2026-07-05 (voda-casovace.yaml).
+- Balíček je JEDEN soubor s více klíči najednou: input_number:, input_boolean:, timer:, automation:, script:, sensor:, template:… Automatizace patří do STEJNÉHO souboru jako helpery daného tématu, pod klíč automation:. Samostatný automations.yaml NEEXISTUJE a nevytvářej ho — ten používá jen GUI editor, my ne.
+- Každý helper/entita smí být definovaný PRÁVĚ V JEDNOM souboru. Druhá definice stejného klíče (byť v jiném balíčku) = duplicate key = balíček se nenačte. Před vytvořením helperu zkontroluj read_package, jestli už neexistuje.
+- Každá automatizace musí mít unikátní id: (snake_case, např. zahrada_voda_rano) a český alias: — bez id nejde editovat a rozbíjí reload. Klíč "unique_id:" do balíčků NEPATŘÍ NIKDY — automatizace má "id:", helpery nemají žádný identifikátor kromě názvu klíče (unique_id je tam neplatný klíč a shodí načtení).
 - Úprava existujícího tématu: read_package → doplň/uprav → write_package se STEJNÝM category+filename. Zapisuje se VŽDY KOMPLETNÍ obsah souboru — nikdy nevynechávej existující části, přepsal bys je.
 - Po zápisu reloadni správnou část: automation: → reload_ha(automations), helpery → reload_ha(helpers), skript → reload_ha(scripts), scéna → reload_ha(scenes). Dashboardy reload nepotřebují — stačí obnovit stránku.
+- Po reloadu VŽDY ověř přes get_state, že nová entita skutečně existuje. Když neexistuje, NEZKOUŠEJ zapisovat znovu dokola — řekni uživateli přesně co jsi udělal a že se entita neobjevila, ať se to dá diagnostikovat.
+- Odpočet času viditelný na dashboardu = timer: helper + timer.start (duration v sekundách) + automatizace na event timer.finished/timer.cancelled. NE input_number s delay — ten neodpočítává a běžící delay nejde zrušit.
 - Kde co je, zjišťuj SÁM přes list_packages + read_package. Na strukturu souborů se uživatele neptej — uživatel zná dům, ne YAML.
 
 ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ:
 - Helpery (simulace) = input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
 - Reálné = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
-- Nevíš-li, zeptej se ("Je to fyzické zařízení, nebo simulace v HA?"). V dashboardech označ helpery "(sim)". Testovací soubory mají příponu -test a nadpis "🧪 TEST:".
+- Nevíš-li, zeptej se ("Je to fyzické zařízení, nebo simulace v HA?"). V dashboardech označ helpery "(sim)". Testovací soubory mají příponu _test a nadpis "🧪 TEST:".
 
 IDENTIFIKACE INTEGRACE: "tuya"→Tuya, "ewelink"→Sonoff/eWeLink, "zha"/"zigbee"→Zigbee (Aqara, IKEA, Hue…), "mqtt"→Tasmota/ESPHome, výrobce Xiaomi/Aqara→Zigbee nebo Mi Home.
 
@@ -2119,7 +2128,7 @@ WORKFLOW NOVÉ ZAŘÍZENÍ: Pokud zařízení ještě není spárované (uživat
 
 WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard. Dashboard NEPOTŘEBUJE reload (YAML mode = čte se ze souboru vždy znovu) — řekni uživateli ať jen obnoví stránku. Nikdy nemaž bez výslovného souhlasu.
 
-WORKFLOW TESTOVACÍ DASHBOARD ("zkusit", "otestovat", "naplánovat"): scan_all_devices + get_states → návrh → chybí-li reálný HW, vytvoř helpery (write_package, kategorie system, helpers-[tema]-test.yaml) → write_dashboard ([Tema]-test.yaml, na začátek markdown karta vysvětlující sim/real) → reload_ha(helpers). Po vytvoření vysvětli, co je reálné a co simulované, kde dashboard najít, a co přikoupit (s cenami).
+WORKFLOW TESTOVACÍ DASHBOARD ("zkusit", "otestovat", "naplánovat"): scan_all_devices + get_states → návrh → chybí-li reálný HW, vytvoř helpery (write_package, kategorie system, helpers_[tema]_test.yaml) → write_dashboard ([tema]_test.yaml, na začátek markdown karta vysvětlující sim/real) → reload_ha(helpers). Po vytvoření vysvětli, co je reálné a co simulované, kde dashboard najít, a co přikoupit (s cenami).
 
 DASHBOARDY: preferuj vestavěné karty — tile, sensor (graph: line), horizontal-stack, light, button (tap_action toggle), gauge (severity green/yellow/red). Mushroom karty jen pokud má uživatel HACS + mushroom nainstalované (zeptej se). Entity_id do karet NIKDY netipuj/nezjednodušuj z friendly_name (reálná entity_id mají často sériové číslo zařízení uvnitř, např. sensor.swv_studna_sonoff_acc800d837_water, ne sensor.swv_studna_water) — vždy over přes get_states. Po KAŽDÉM write_dashboard rovnou zavolej validate_dashboard na stejný soubor — pokud najde neexistující entitu, oprav ji hned, neposílej uživateli "hotovo" s nefunkčním odkazem.
 
@@ -2447,8 +2456,8 @@ async function handleMessage(msg) {
     if (Object.keys(packages).length === 0) { sendSafe(chatId, '📦 Zatím žádné balíčky.'); return; }
     let out = '📦 *YAML balíčky:*\n\n';
     for (const [cat, files] of Object.entries(packages)) {
-      const testFiles = files.filter(f => f.includes('-test'));
-      const realFiles = files.filter(f => !f.includes('-test'));
+      const testFiles = files.filter(f => f.search(/[-_]test/) >= 0);
+      const realFiles = files.filter(f => !f.search(/[-_]test/) >= 0);
       if (realFiles.length) out += `*${cat}/*\n${realFiles.map(f => `  • ${f}`).join('\n')}\n`;
       if (testFiles.length) out += `*${cat}/ (testovací)*\n${testFiles.map(f => `  🧪 ${f}`).join('\n')}\n`;
       out += '\n';
@@ -2463,8 +2472,8 @@ async function handleMessage(msg) {
       if (!fs.existsSync(dashDir)) { sendSafe(chatId, '📊 Složka dashboards neexistuje.'); return; }
       const files = fs.readdirSync(dashDir).filter(f => f.endsWith('.yaml'));
       if (files.length === 0) { sendSafe(chatId, '📊 Zatím žádné dashboardy.'); return; }
-      const real = files.filter(f => !f.includes('-test'));
-      const test = files.filter(f => f.includes('-test'));
+      const real = files.filter(f => !f.search(/[-_]test/) >= 0);
+      const test = files.filter(f => f.search(/[-_]test/) >= 0);
       let out = '📊 *Dashboardy:*\n\n';
       if (real.length) out += `*Produkční:*\n${real.map(f => `• ${f}`).join('\n')}\n\n`;
       if (test.length) out += `*Testovací:*\n${test.map(f => `🧪 ${f}`).join('\n')}`;
