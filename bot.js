@@ -297,6 +297,45 @@ async function isAiStopped() {
 }
 
 // ═══════════════════════════════════════════════
+// HA WEBSOCKET — registry operace (patra/místnosti/zařízení)
+// REST API config/{area,floor,device}_registry vrací 404 — HA tyhle
+// registry historicky vystavuje jen přes WebSocket. Ověřeno ručně
+// 2026-07-05 (config/area_registry/list, config/floor_registry/list,
+// config/device_registry/list fungují). Create/update commandy zatím
+// NEJSOU ověřené naostro — teprve budou, s Ondrovým souhlasem.
+// Krátkodobé spojení na jeden příkaz — nastavování domu je vzácná
+// operace (onboarding), netřeba držet perzistentní WS spojení.
+// ═══════════════════════════════════════════════
+let wsMsgId = 1;
+function haWsCommand(type, payload = {}, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const wsUrl = HA_URL.replace(/^http/, 'ws') + '/api/websocket';
+    let ws;
+    try { ws = new WebSocket(wsUrl); } catch (e) { return reject(e); }
+    const id = wsMsgId++;
+    const timer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error('HA WebSocket timeout')); }, timeoutMs);
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === 'auth_required') {
+        ws.send(JSON.stringify({ type: 'auth', access_token: process.env.HA_TOKEN || HA_TOKEN }));
+      } else if (msg.type === 'auth_invalid') {
+        clearTimeout(timer); try { ws.close(); } catch {}
+        reject(new Error('HA WebSocket autentizace selhala'));
+      } else if (msg.type === 'auth_ok') {
+        ws.send(JSON.stringify({ id, type, ...payload }));
+      } else if (msg.type === 'result' && msg.id === id) {
+        clearTimeout(timer); try { ws.close(); } catch {}
+        if (msg.success) resolve(msg.result);
+        else reject(new Error(msg.error?.message || `HA WS příkaz ${type} selhal`));
+      }
+    };
+    ws.onerror = (e) => { clearTimeout(timer); reject(new Error(e?.message || 'HA WebSocket chyba')); };
+  });
+}
+
+// ═══════════════════════════════════════════════
 // YAML HELPERS
 // ═══════════════════════════════════════════════
 function getPackagePath(cat, fn) {
@@ -683,6 +722,49 @@ Po zápisu vždy popsat změny LIDSKY.`,
           type: 'object',
           properties: { reason: { type: 'string' } },
           required: ['reason'],
+        },
+      },
+      {
+        name: 'ha_setup_list',
+        description: 'Zobrazí aktuální patra, místnosti a zařízení bez přiřazené místnosti. Vždy zavolat jako první krok před vytvářením pater/místností nebo přiřazováním zařízení — ať se nevytváří duplicity.',
+        input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'ha_setup_create_floor',
+        description: 'Vytvoří nové patro domu (onboarding nové domácnosti). Level: 0 = přízemí, kladná čísla = patra nahoru, záporná = sklep/suterén.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Např. "Přízemí", "1. patro", "Sklep"' },
+            level: { type: 'integer' },
+            icon: { type: 'string', description: 'Volitelně, mdi ikona, např. mdi:home' },
+          },
+          required: ['name', 'level'],
+        },
+      },
+      {
+        name: 'ha_setup_create_area',
+        description: 'Vytvoří novou místnost a přiřadí ji k patru (floor_id z ha_setup_list).',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Např. "Obývací pokoj"' },
+            floor_id: { type: 'string' },
+            icon: { type: 'string' },
+          },
+          required: ['name', 'floor_id'],
+        },
+      },
+      {
+        name: 'ha_setup_assign_device',
+        description: 'Přiřadí zařízení (device_id z ha_setup_list) do místnosti (area_id z ha_setup_list).',
+        input_schema: {
+          type: 'object',
+          properties: {
+            device_id: { type: 'string' },
+            area_id: { type: 'string' },
+          },
+          required: ['device_id', 'area_id'],
         },
       }
     );
@@ -1382,6 +1464,55 @@ async function executeTool(name, input, chatId) {
         logAction(chatId, user.name, 'restart_ha', '-', input.reason);
         await haPost('config/core/restart');
         return { success: true, message: 'HA restartuje — bude dostupný za ~60 sekund.' };
+      }
+
+      case 'ha_setup_list': {
+        try {
+          const [areas, floors, devices] = await Promise.all([
+            haWsCommand('config/area_registry/list'),
+            haWsCommand('config/floor_registry/list'),
+            haWsCommand('config/device_registry/list'),
+          ]);
+          const unassigned = devices
+            .filter(d => !d.area_id && d.entry_type !== 'service')
+            .map(d => ({ device_id: d.id, name: d.name_by_user || d.name, manufacturer: d.manufacturer }));
+          return {
+            floors: floors.map(f => ({ floor_id: f.floor_id, name: f.name, level: f.level })),
+            areas: areas.map(a => ({ area_id: a.area_id, name: a.name, floor_id: a.floor_id })),
+            unassigned_devices: unassigned.slice(0, 50),
+            unassigned_count: unassigned.length,
+          };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_create_floor': {
+        try {
+          const result = await haWsCommand('config/floor_registry/create', {
+            name: input.name, level: input.level, icon: input.icon,
+          });
+          logAction(chatId, user.name, 'ha_setup_create_floor', input.name, 'ok');
+          return { success: true, floor: result };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_create_area': {
+        try {
+          const result = await haWsCommand('config/area_registry/create', {
+            name: input.name, floor_id: input.floor_id, icon: input.icon,
+          });
+          logAction(chatId, user.name, 'ha_setup_create_area', input.name, 'ok');
+          return { success: true, area: result };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_assign_device': {
+        try {
+          await haWsCommand('config/device_registry/update', {
+            device_id: input.device_id, area_id: input.area_id,
+          });
+          logAction(chatId, user.name, 'ha_setup_assign_device', `${input.device_id} -> ${input.area_id}`, 'ok');
+          return { success: true };
+        } catch (e) { return { error: e.message }; }
       }
 
       default: return { error: 'Neznámý nástroj' };
