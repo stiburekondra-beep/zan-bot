@@ -1672,33 +1672,33 @@ async function executeTool(name, input, chatId) {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
           const streamPath = input.stream_path || '/stream1';
-          const streamUrl = `rtsp://${input.username}:${input.password}@${input.host}:554${streamPath}`;
+          // Bez přihlašovacích údajů v URL — Generic Camera integrace má
+          // username/password jako samostatná pole (ověřeno živě 2026-07-05).
+          const streamUrl = `rtsp://${input.host}:554${streamPath}`;
 
-          // HA config_entries flow — vytvoří se přes WS, "generic" integrace
-          // (Generic Camera/RTSP). NEOVĚŘENO na reálné kameře — první test
-          // bude to, co se skutečně stane. Pokud schéma pole nesedí, vrátíme
-          // raw odpověď HA, ať je vidět přesně na čem to spadlo.
-          let flow = await haWsCommand('config_entries/flow/create', {
+          // Oprava 2026-07-05: config_entries/flow je REST, ne WebSocket
+          // (opak area/floor/device registry, které jsou WS-only) — ověřeno
+          // přímým testem, "Unknown command" byla chyba ve špatném kanálu.
+          let flow = await haPost('config/config_entries/flow', {
             handler: 'generic', show_advanced_options: false,
           });
           console.log(`📷 setup_camera krok 0 (create): ${JSON.stringify(flow).slice(0, 400)}`);
 
           let step = 0;
-          while (flow && flow.type === 'form' && step < 4) {
+          while (flow && flow.type === 'form' && step < 3) {
             const stepId = flow.step_id;
             let userInput;
             if (stepId === 'user') {
               userInput = {
                 stream_source: streamUrl,
-                framerate: 2,
-                verify_ssl: false,
+                username: input.username,
+                password: input.password,
+                advanced: { framerate: 2, verify_ssl: false, rtsp_transport: 'tcp', authentication: 'basic' },
               };
             } else {
               userInput = {}; // potvrzovací/confirm krok — prázdný submit
             }
-            flow = await haWsCommand('config_entries/flow/configure', {
-              flow_id: flow.flow_id, user_input: userInput,
-            });
+            flow = await haPost(`config/config_entries/flow/${flow.flow_id}`, userInput);
             step++;
             console.log(`📷 setup_camera krok ${step} (step_id=${stepId}): ${JSON.stringify(flow).slice(0, 500)}`);
           }
@@ -1708,7 +1708,14 @@ async function executeTool(name, input, chatId) {
             return { success: true, message: `Kamera "${input.name}" přidána do HA.`, raw: flow };
           }
           console.error(`🔴 setup_camera neskončilo create_entry, finální stav: ${JSON.stringify(flow).slice(0, 600)}`);
-          return { error: 'Přidání kamery neskončilo úspěchem (create_entry).', raw: flow };
+          const stepErrors = flow && flow.errors ? flow.errors : null;
+          return {
+            error: stepErrors ? `HA odmítlo: ${JSON.stringify(stepErrors)}` : 'Přidání kamery neskončilo úspěchem (create_entry).',
+            tip: stepErrors && stepErrors.stream_source === 'timeout'
+              ? 'HA se nedokázalo připojit ke kameře (timeout) — zkontroluj, jestli kamera na téhle IP skutečně běží a jestli má RTSP/Camera Account opravdu povolený.'
+              : undefined,
+            raw: flow,
+          };
         } catch (e) {
           console.error(`🔴 setup_camera vyjimka: ${e.message}`);
           return { error: `Nastavení kamery selhalo: ${e.message}`, tip: 'Zkus přidat ručně: Nastavení → Zařízení a služby → Přidat integraci → Generic Camera.' };
