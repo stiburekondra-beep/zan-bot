@@ -1,0 +1,21 @@
+# Tenhle repo je SDÍLENÝ KÓD produktu Žán — žádná konkrétní domácnost
+# sem nepatří. Runtime data a tajné klíče jsou vždy per-instalace a
+# nikdy se necommitujou (viz CHoS- projects/baklazan/rozhodnuti.md
+# "Oddělit Žánovu ústavu/paměť od Claude Code paměti").
+
+# Tajné klíče (Telegram token, HA token, Anthropic klíč...)
+.env
+.env.*
+!.env.example
+
+# Rodinná ústava a paměť — patří konkrétní domácnosti, ne kódu
+home_memory.json
+zan_habits.json
+zan_events.json
+zan_udrzba.json
+zan_usage.json
+zan_garden.json
+zan_actions.log
+
+# Node
+node_modules/

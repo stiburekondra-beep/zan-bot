@@ -297,6 +297,45 @@ async function isAiStopped() {
 }
 
 // ═══════════════════════════════════════════════
+// HA WEBSOCKET — registry operace (patra/místnosti/zařízení)
+// REST API config/{area,floor,device}_registry vrací 404 — HA tyhle
+// registry historicky vystavuje jen přes WebSocket. Ověřeno ručně
+// 2026-07-05 (config/area_registry/list, config/floor_registry/list,
+// config/device_registry/list fungují). Create/update commandy zatím
+// NEJSOU ověřené naostro — teprve budou, s Ondrovým souhlasem.
+// Krátkodobé spojení na jeden příkaz — nastavování domu je vzácná
+// operace (onboarding), netřeba držet perzistentní WS spojení.
+// ═══════════════════════════════════════════════
+let wsMsgId = 1;
+function haWsCommand(type, payload = {}, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const wsUrl = HA_URL.replace(/^http/, 'ws') + '/api/websocket';
+    let ws;
+    try { ws = new WebSocket(wsUrl); } catch (e) { return reject(e); }
+    const id = wsMsgId++;
+    const timer = setTimeout(() => { try { ws.close(); } catch {} reject(new Error('HA WebSocket timeout')); }, timeoutMs);
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === 'auth_required') {
+        ws.send(JSON.stringify({ type: 'auth', access_token: process.env.HA_TOKEN || HA_TOKEN }));
+      } else if (msg.type === 'auth_invalid') {
+        clearTimeout(timer); try { ws.close(); } catch {}
+        reject(new Error('HA WebSocket autentizace selhala'));
+      } else if (msg.type === 'auth_ok') {
+        ws.send(JSON.stringify({ id, type, ...payload }));
+      } else if (msg.type === 'result' && msg.id === id) {
+        clearTimeout(timer); try { ws.close(); } catch {}
+        if (msg.success) resolve(msg.result);
+        else reject(new Error(msg.error?.message || `HA WS příkaz ${type} selhal`));
+      }
+    };
+    ws.onerror = (e) => { clearTimeout(timer); reject(new Error(e?.message || 'HA WebSocket chyba')); };
+  });
+}
+
+// ═══════════════════════════════════════════════
 // YAML HELPERS
 // ═══════════════════════════════════════════════
 function getPackagePath(cat, fn) {
@@ -684,6 +723,49 @@ Po zápisu vždy popsat změny LIDSKY.`,
           properties: { reason: { type: 'string' } },
           required: ['reason'],
         },
+      },
+      {
+        name: 'ha_setup_list',
+        description: 'Zobrazí aktuální patra, místnosti a zařízení bez přiřazené místnosti. Vždy zavolat jako první krok před vytvářením pater/místností nebo přiřazováním zařízení — ať se nevytváří duplicity.',
+        input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'ha_setup_create_floor',
+        description: 'Vytvoří nové patro domu (onboarding nové domácnosti). Level: 0 = přízemí, kladná čísla = patra nahoru, záporná = sklep/suterén.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Např. "Přízemí", "1. patro", "Sklep"' },
+            level: { type: 'integer' },
+            icon: { type: 'string', description: 'Volitelně, mdi ikona, např. mdi:home' },
+          },
+          required: ['name', 'level'],
+        },
+      },
+      {
+        name: 'ha_setup_create_area',
+        description: 'Vytvoří novou místnost a přiřadí ji k patru (floor_id z ha_setup_list).',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Např. "Obývací pokoj"' },
+            floor_id: { type: 'string' },
+            icon: { type: 'string' },
+          },
+          required: ['name', 'floor_id'],
+        },
+      },
+      {
+        name: 'ha_setup_assign_device',
+        description: 'Přiřadí zařízení (device_id z ha_setup_list) do místnosti (area_id z ha_setup_list).',
+        input_schema: {
+          type: 'object',
+          properties: {
+            device_id: { type: 'string' },
+            area_id: { type: 'string' },
+          },
+          required: ['device_id', 'area_id'],
+        },
       }
     );
   }
@@ -825,10 +907,14 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'get_areas': {
+        // POZOR (oprava 2026-07-05): REST config/{area,entity,device}_registry
+        // vrací 404 — HA tyhle registry vystavuje jen přes WebSocket. Dřívější
+        // verze tohohle nástroje na to volala haGet(), chyby si tiše polykala
+        // (.catch(() => [])) a vždycky vracela prázdno. Opraveno na haWsCommand.
         const [areaReg, entityReg, deviceReg] = await Promise.all([
-          haGet('config/area_registry/list').catch(() => []),
-          haGet('config/entity_registry/list').catch(() => []),
-          haGet('config/device_registry/list').catch(() => []),
+          haWsCommand('config/area_registry/list').catch(() => []),
+          haWsCommand('config/entity_registry/list').catch(() => []),
+          haWsCommand('config/device_registry/list').catch(() => []),
         ]);
         const areas = Array.isArray(areaReg) ? areaReg : [];
         const entities = Array.isArray(entityReg) ? entityReg : [];
@@ -1384,6 +1470,55 @@ async function executeTool(name, input, chatId) {
         return { success: true, message: 'HA restartuje — bude dostupný za ~60 sekund.' };
       }
 
+      case 'ha_setup_list': {
+        try {
+          const [areas, floors, devices] = await Promise.all([
+            haWsCommand('config/area_registry/list'),
+            haWsCommand('config/floor_registry/list'),
+            haWsCommand('config/device_registry/list'),
+          ]);
+          const unassigned = devices
+            .filter(d => !d.area_id && d.entry_type !== 'service')
+            .map(d => ({ device_id: d.id, name: d.name_by_user || d.name, manufacturer: d.manufacturer }));
+          return {
+            floors: floors.map(f => ({ floor_id: f.floor_id, name: f.name, level: f.level })),
+            areas: areas.map(a => ({ area_id: a.area_id, name: a.name, floor_id: a.floor_id })),
+            unassigned_devices: unassigned.slice(0, 50),
+            unassigned_count: unassigned.length,
+          };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_create_floor': {
+        try {
+          const result = await haWsCommand('config/floor_registry/create', {
+            name: input.name, level: input.level, icon: input.icon,
+          });
+          logAction(chatId, user.name, 'ha_setup_create_floor', input.name, 'ok');
+          return { success: true, floor: result };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_create_area': {
+        try {
+          const result = await haWsCommand('config/area_registry/create', {
+            name: input.name, floor_id: input.floor_id, icon: input.icon,
+          });
+          logAction(chatId, user.name, 'ha_setup_create_area', input.name, 'ok');
+          return { success: true, area: result };
+        } catch (e) { return { error: e.message }; }
+      }
+
+      case 'ha_setup_assign_device': {
+        try {
+          await haWsCommand('config/device_registry/update', {
+            device_id: input.device_id, area_id: input.area_id,
+          });
+          logAction(chatId, user.name, 'ha_setup_assign_device', `${input.device_id} -> ${input.area_id}`, 'ok');
+          return { success: true };
+        } catch (e) { return { error: e.message }; }
+      }
+
       default: return { error: 'Neznámý nástroj' };
     }
   } catch (err) {
@@ -1613,6 +1748,25 @@ TVOJE CHOVÁNÍ:
 - Data o zařízeních si zjišťuj nástroji (get_states, scan_all_devices, get_areas) — netipuj
 - Jednou týdně se nenásilně zeptej na věci o domě (checkin_schedule)
 - Navrhuj konkrétní IoT HW s modelem a cenou, když vidíš příležitost. Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]"
+
+ONBOARDING NOVÉ DOMÁCNOSTI (poznáš podle toho, že get_areas vrátí 0 nebo skoro
+0 místností — dům ještě není nastavený):
+1. Zavolej get_areas — zjisti, co už existuje, ať nevytváříš duplicity.
+2. Doptej se rychle, po jedné otázce, Y/N nebo krátkou odpovědí (ne dlouhý
+   formulář najednou): kdo v domácnosti žije, jaká patra dům má a jak se
+   jim říká, jaké místnosti jsou na kterém patře, jak se topí a jaké
+   teploty vyhovují přes den/v noci, jde-li topení řídit po místnostech
+   nebo jen jako celek, jaká pravidla Žán musí vždy/nikdy dodržovat.
+3. Podle odpovědí vytvoř patra (ha_setup_create_floor) a místnosti
+   (ha_setup_create_area), pak zjištěná zařízení přiřaď (ha_setup_assign_device).
+4. Ulož odpovědi (update_family_member, update_house_info) — vytápění jako
+   pole u domu (heating_type, temp_day, temp_night, heating_control).
+5. Porovnej přání s realitou: pokud si rodina přeje řídit teplotu po
+   místnostech, ale místnost nemá teplotní senzor (zkontroluj get_states),
+   řekni to a navrhni konkrétní senzor ke koupi (stejný formát jako výše
+   u obecného HW návrhu) — neslibuj funkci, na kterou chybí senzor.
+6. Až je základ hotový, řekni to nahlas a ulož si (update_house_info,
+   pole "onboarding_done" = "true"), ať se celý dotazník neopakuje znovu.
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
@@ -2014,6 +2168,7 @@ bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 // ═══════════════════════════════════════════════
 const EVENTS_FILE = path.join(__dirname, 'zan_events.json');
 const HABITS_FILE = path.join(__dirname, 'zan_habits.json');
+const UDRZBA_FILE = path.join(__dirname, 'zan_udrzba.json');
 
 // Sledované domény pro návyky
 const HABIT_DOMAINS = ['light', 'switch', 'climate', 'cover', 'input_boolean'];
@@ -2155,6 +2310,153 @@ Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`
     console.log('✅ Analýza návyků odeslána');
   } catch (e) {
     console.error('Analýza návyků selhala:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════
+// ÚDRŽBÁŘ — servisní obchůzka (středa + sobota 18:00)
+// Spec: projects/baklazan/research/2026-07-03_zan-udrzbar-obchuzka.md
+// (repo CHoS-, upřesněno 2026-07-05: St/So 18:00 místo denně).
+//
+// v1 rozsah — VĚDOMĚ jen diagnostika, žádné automatické zásahy:
+// restart add-onu / reload integrace jde přes Supervisor API, který má
+// podle zkušeností z deploy pipeline (docs/memory/project_zan_bot.md)
+// nespolehlivé endpointy (401 na některých cestách) — než se to pořádně
+// otestuje, obchůzka jen hlásí a ptá se, nikdy sama nezasahuje.
+// ═══════════════════════════════════════════════
+function loadUdrzba() {
+  try { if (fs.existsSync(UDRZBA_FILE)) return JSON.parse(fs.readFileSync(UDRZBA_FILE, 'utf8')); } catch {}
+  return { last_run_date: null, last_announce_date: null };
+}
+function saveUdrzba(u) {
+  try { fs.writeFileSync(UDRZBA_FILE, JSON.stringify(u, null, 2), 'utf8'); } catch {}
+}
+
+function todayStr() {
+  // YYYY-MM-DD v lokálním čase (ne UTC) — konzistentní s "jednou za den" guardem
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Ranní ohlášení dopředu — ať Ondra ví, že dnes večer proběhne obchůzka
+async function announceObchuzka() {
+  const u = loadUdrzba();
+  const today = todayStr();
+  if (u.last_announce_date === today) return; // už ohlášeno dnes
+
+  await sendSafe(CHAT_ONDRA, '🔧 Dnes večer v 18:00 se podívám na dům (servisní obchůzka) — dám ti vědět, jak to dopadlo.');
+  u.last_announce_date = today;
+  saveUdrzba(u);
+}
+
+async function runObchuzka() {
+  const u = loadUdrzba();
+  const today = todayStr();
+  if (u.last_run_date === today) {
+    console.log('Obchůzka: přeskočeno (dnes už proběhla)');
+    return;
+  }
+  if (await isAiStopped()) {
+    console.log('Obchůzka: přeskočeno (AI je vypnuté přes input_boolean.ai_stop)');
+    return;
+  }
+
+  try {
+    console.log('🔧 Spouštím servisní obchůzku...');
+    if (!(await isHaOnline())) {
+      await sendSafe(CHAT_ONDRA, '🔧 Servisní obchůzka: HA momentálně neodpovídá, zkusím to příště.');
+      return;
+    }
+
+    const states = await haGet('states');
+
+    // 1. Nedostupná/neznámá entita
+    const unavailable = states.filter(s => s.state === 'unavailable' || s.state === 'unknown');
+
+    // 2. Čekající aktualizace (core i add-ony jsou update.* entity)
+    const updates = states
+      .filter(s => s.entity_id.startsWith('update.') && s.state === 'on')
+      .map(s => ({
+        name: s.attributes.friendly_name || s.entity_id,
+        installed: s.attributes.installed_version,
+        latest: s.attributes.latest_version,
+      }));
+
+    // 3. Nízká baterie — podle device_class, ne podle názvu entity
+    const lowBattery = states.filter(s =>
+      s.attributes?.device_class === 'battery' &&
+      !isNaN(parseFloat(s.state)) &&
+      parseFloat(s.state) < 20
+    );
+
+    // 4. Kamera — dokud není v HA žádná entita domény camera.*, Žán ji nevidí
+    const cameras = states.filter(s => s.entity_id.startsWith('camera.'));
+
+    // Sestav zprávu
+    const lines = [`🔧 *Servisní obchůzka* — ${new Date().toLocaleDateString('cs-CZ')} 18:00`, ''];
+
+    if (unavailable.length === 0) {
+      lines.push('✅ Všechna zařízení dostupná.');
+    } else {
+      lines.push(`⚠️ *${unavailable.length}× nedostupné/neznámé zařízení:*`);
+      for (const s of unavailable.slice(0, 15)) {
+        lines.push(`  • ${s.attributes.friendly_name || s.entity_id}`);
+      }
+      if (unavailable.length > 15) lines.push(`  • ...a ${unavailable.length - 15} dalších`);
+    }
+
+    lines.push('');
+    if (updates.length === 0) {
+      lines.push('✅ Žádné čekající aktualizace.');
+    } else {
+      lines.push(`🔄 *${updates.length}× čekající aktualizace* (žádnou jsem sám nenainstaloval):`);
+      for (const up of updates) {
+        lines.push(`  • ${up.name}: ${up.installed} → ${up.latest}`);
+      }
+    }
+
+    lines.push('');
+    if (lowBattery.length === 0) {
+      lines.push('✅ Žádná baterie pod 20 %.');
+    } else {
+      lines.push(`🔋 *${lowBattery.length}× nízká baterie:*`);
+      for (const s of lowBattery) lines.push(`  • ${s.attributes.friendly_name || s.entity_id}: ${s.state}%`);
+    }
+
+    if (cameras.length === 0) {
+      lines.push('');
+      lines.push('📷 Kamera v domě není napojená na Home Assistant — nevidím ji a nemůžu na ni dohlížet.');
+    }
+
+    // Žádost o rozhodnutí, ne jen informace — jen když je vůbec co řešit
+    const needsDecision = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0 || cameras.length === 0;
+    if (needsDecision) {
+      lines.push('');
+      lines.push('*Co bych potřeboval rozhodnout:*');
+      let n = 1;
+      if (updates.some(u => u.name.toLowerCase().includes('core') || u.name.toLowerCase().includes('operating system'))) {
+        lines.push(`${n++}. Mám nainstalovat aktualizaci HA Core/OS, nebo počkat na klidnější chvíli? (jen s tvým souhlasem — nikdy sám)`);
+      }
+      if (unavailable.length > 0) {
+        lines.push(`${n++}. Něco z nedostupných zařízení stojí za fyzickou kontrolu — mrkneš na to, až budeš mít chvíli?`);
+      }
+      if (cameras.length === 0) {
+        lines.push(`${n++}. Chceš, ať kameru zapojím do Home Assistantu? Pak na ni budu moct dohlížet a hlásit ti, co se děje.`);
+      }
+      lines.push('');
+      lines.push('Odpověz mi, až budeš mít čas 🙂');
+    } else {
+      lines.push('');
+      lines.push('Všechno vypadá v pořádku, nic ode mě teď nepotřebuješ.');
+    }
+
+    await sendSafe(CHAT_ONDRA, lines.join('\n'), { parse_mode: 'Markdown' });
+
+    u.last_run_date = today;
+    saveUdrzba(u);
+    console.log('✅ Servisní obchůzka odeslána');
+  } catch (e) {
+    console.error('Servisní obchůzka selhala:', e.message);
   }
 }
 
@@ -2302,6 +2604,19 @@ setInterval(() => {
   const now = new Date();
   if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
     analyzeHabits();
+  }
+}, 60 * 1000);
+
+// Servisní obchůzka — středa (3) a sobota (6) v 18:00, s ranním ohlášením
+// v 7:00 téhož dne. getDay(): 0=ne, 1=po, 2=út, 3=st, 4=čt, 5=pá, 6=so.
+setInterval(() => {
+  const now = new Date();
+  const isObchuzkaDen = now.getDay() === 3 || now.getDay() === 6;
+  if (isObchuzkaDen && now.getHours() === 7 && now.getMinutes() < 5) {
+    announceObchuzka();
+  }
+  if (isObchuzkaDen && now.getHours() === 18 && now.getMinutes() < 5) {
+    runObchuzka();
   }
 }, 60 * 1000);
 
