@@ -1591,20 +1591,36 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'reload_ha': {
-        const map = {
-          automations: 'config/automation/reload',
-          scripts: 'config/script/reload',
-          scenes: 'config/scene/reload',
-          helpers: 'config/helper/reload',
-        };
-        await haPost(map[input.what]);
+        // Oprava 2026-07-05: config/{domain}/reload vrací 404 - správný tvar
+        // je REST služba services/{domain}/reload (ověřeno curlem). "helpers"
+        // navíc není jedna služba - každý typ helperu má svůj vlastní reload
+        // (input_number, input_boolean, input_select, input_datetime,
+        // input_text, timer - counter reload vůbec nemá).
+        if (input.what === 'helpers') {
+          const helperDomains = ['input_number', 'input_boolean', 'input_select', 'input_datetime', 'input_text', 'timer'];
+          const results = {};
+          for (const dom of helperDomains) {
+            try { await haPost(`services/${dom}/reload`); results[dom] = 'ok'; }
+            catch (e) { results[dom] = `chyba: ${e.message}`; }
+          }
+          logAction(chatId, user.name, 'reload_ha', 'helpers', JSON.stringify(results));
+          return { success: true, detail: results };
+        }
+        const domainMap = { automations: 'automation', scripts: 'script', scenes: 'scene' };
+        const domain = domainMap[input.what];
+        if (!domain) return { error: `Neznámý typ reloadu: ${input.what}` };
+        await haPost(`services/${domain}/reload`);
         logAction(chatId, user.name, 'reload_ha', input.what, 'ok');
         return { success: true };
       }
 
       case 'restart_ha': {
+        // Oprava 2026-07-05: config/core/restart vrací 404 (stejná chyba jako
+        // u reload_ha) - správná REST služba je services/homeassistant/restart.
+        // NEOTESTOVÁNO naostro (test by opravdu restartoval živý HA) - založeno
+        // na stejném, teď ověřeném vzoru services/{domain}/{service}.
         logAction(chatId, user.name, 'restart_ha', '-', input.reason);
-        await haPost('config/core/restart');
+        await haPost('services/homeassistant/restart');
         return { success: true, message: 'HA restartuje — bude dostupný za ~60 sekund.' };
       }
 
