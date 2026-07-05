@@ -31,9 +31,39 @@ const HA_SAMBA_PASS     = process.env.HA_SAMBA_PASS;
 const ANTHROPIC_KEY     = process.env.ANTHROPIC_API_KEY;
 const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 
-const MEMORY_FILE       = path.join(__dirname, 'home_memory.json');
-const LOG_FILE          = path.join(__dirname, 'zan_actions.log');
-const CONVO_LOG_FILE    = path.join(__dirname, 'zan_conversation.log');
+// Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
+// add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
+// (config.yaml: map config:rw) → data přežijí updaty a jsou vidět přes Sambu.
+const DATA_DIR = (() => {
+  try { fs.mkdirSync('/config/zan_data', { recursive: true }); return '/config/zan_data'; }
+  catch { return __dirname; } // fallback pro vývoj mimo add-on
+})();
+// Jednorázová migrace dat z /app (verze <= 5.4.16 ukládaly vedle bot.js)
+if (DATA_DIR !== __dirname) {
+  for (const f of ['home_memory.json', 'zan_actions.log', 'zan_conversation.log',
+    'zan_usage.json', 'zan_garden.json', 'zan_events.json', 'zan_habits.json',
+    'zan_udrzba.json', 'zan_tasks.json', 'zan_lessons.json']) {
+    try {
+      const src = path.join(__dirname, f), dst = path.join(DATA_DIR, f);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) fs.copyFileSync(src, dst);
+    } catch {}
+  }
+}
+
+const MEMORY_FILE       = path.join(DATA_DIR, 'home_memory.json');
+const LOG_FILE          = path.join(DATA_DIR, 'zan_actions.log');
+const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
+
+// Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
+// v každém dynamickém kontextu, aby stejnou chybu neopakoval
+const LESSONS_FILE      = path.join(DATA_DIR, 'zan_lessons.json');
+function loadLessons() {
+  try { if (fs.existsSync(LESSONS_FILE)) return JSON.parse(fs.readFileSync(LESSONS_FILE, 'utf8')); } catch {}
+  return [];
+}
+function saveLessons(lessons) {
+  try { fs.writeFileSync(LESSONS_FILE, JSON.stringify(lessons.slice(-50), null, 2), 'utf8'); } catch {}
+}
 
 // Model: Haiku 4.5 pro běžný provoz (cca 3× levnější než Sonnet).
 // Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
@@ -124,7 +154,7 @@ const PACKAGE_CATEGORIES = {
 // Každé volání Claude API jde přes claudeCreate(), který sečte usage
 // do zan_usage.json (denní kyblíky). Ceny za MTok podle modelu.
 // ═══════════════════════════════════════════════
-const USAGE_FILE = path.join(__dirname, 'zan_usage.json');
+const USAGE_FILE = path.join(DATA_DIR, 'zan_usage.json');
 const USD_CZK = 23; // hrubý kurz pro orientační přepočet
 
 function modelPricing() {
@@ -761,6 +791,30 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'read_error_log',
+        description: 'Přečte log s chybami — zdroj "ha" = error log Home Assistantu (filtrované ERROR/WARNING řádky), "zan_actions" = tvůj log akcí, "zan_conversation" = tvůj log konverzací. Použij VŽDY, když se něco nepovedlo (entita nevznikla, služba selhala) a hledáš příčinu.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            source: { type: 'string', enum: ['ha', 'zan_actions', 'zan_conversation'] },
+            lines: { type: 'number', description: 'kolik posledních řádků (default 60, max 200)' },
+          },
+          required: ['source'],
+        },
+      },
+      {
+        name: 'save_lesson',
+        description: 'Uloží poučení z chyby. Piš krátce a obecně: co se stalo → jak to příště udělat jinak. Poučení dostáváš v každém kontextu — slouží k tomu, abys stejnou chybu neopakoval. Ukládej po každé opravené chybě nebo když tě uživatel opraví.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            topic: { type: 'string', description: 'krátký štítek, např. "yaml-balicky", "dashboardy"' },
+            text: { type: 'string' },
+          },
+          required: ['text'],
+        },
+      },
+      {
         name: 'list_dashboards',
         description: 'Zobrazí dashboardy.',
         input_schema: { type: 'object', properties: {}, required: [] },
@@ -905,7 +959,7 @@ async function executeTool(name, input, chatId) {
   const memory = loadMemory();
 
   // Security check — admin-only nástroje
-  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha'];
+  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'save_lesson'];
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
@@ -1483,6 +1537,27 @@ async function executeTool(name, input, chatId) {
         return { content };
       }
 
+      case 'read_error_log': {
+        const lines = Math.min(input.lines || 60, 200);
+        if (input.source === 'zan_actions' || input.source === 'zan_conversation') {
+          const f = input.source === 'zan_actions' ? LOG_FILE : CONVO_LOG_FILE;
+          const txt = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
+          return { log: txt.split('\n').slice(-lines).join('\n') || '(prázdný log)' };
+        }
+        const raw = await axios.get(`${HA_URL}/api/error_log`, { headers: haHeaders(), timeout: 10000 });
+        const filtrovane = String(raw.data || '').split('\n')
+          .filter(l => /ERROR|WARNING|Invalid|failed|Traceback/i.test(l));
+        return { log: filtrovane.slice(-lines).join('\n') || '(žádné chyby ani warningy)' };
+      }
+
+      case 'save_lesson': {
+        const lessons = loadLessons();
+        lessons.push({ date: new Date().toISOString().slice(0, 10), topic: input.topic || 'obecné', text: input.text });
+        saveLessons(lessons);
+        logAction(chatId, user.name, 'save_lesson', input.topic || '-', 'ok');
+        return { success: true, celkem: lessons.length, note: 'Poučení uloženo — od teď ho dostáváš v každém kontextu.' };
+      }
+
       case 'write_package': {
         const fp = getPackagePath(input.category, input.filename);
         const oldContent = readYamlFile(fp);
@@ -1800,7 +1875,7 @@ async function executeTool(name, input, chatId) {
 // ═══════════════════════════════════════════════
 // ZAHRADNÍ SYSTÉM — plná verze
 // ═══════════════════════════════════════════════
-const GARDEN_FILE = path.join(__dirname, 'zan_garden.json');
+const GARDEN_FILE = path.join(DATA_DIR, 'zan_garden.json');
 
 function loadGarden() {
   try { if (fs.existsSync(GARDEN_FILE)) return JSON.parse(fs.readFileSync(GARDEN_FILE, 'utf8')); } catch {}
@@ -2115,6 +2190,8 @@ STRUKTURA KONFIGURACE (závazná konvence tohoto domu):
 - Odpočet času viditelný na dashboardu = timer: helper + timer.start (duration v sekundách) + automatizace na event timer.finished/timer.cancelled. NE input_number s delay — ten neodpočítává a běžící delay nejde zrušit.
 - Kde co je, zjišťuj SÁM přes list_packages + read_package. Na strukturu souborů se uživatele neptej — uživatel zná dům, ne YAML.
 
+UČENÍ Z CHYB: Když něco nefunguje (entita po zápisu neexistuje, služba selže) nebo tě uživatel opraví: 1) read_error_log (zdroj "ha", případně vlastní logy), 2) najdi skutečnou příčinu — nehádej, 3) oprav, 4) save_lesson s krátkým obecným poučením. Ponaučení dostáváš v každém kontextu — chybu, na kterou už máš poučení, NIKDY neopakuj.
+
 ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ:
 - Helpery (simulace) = input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
 - Reálné = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
@@ -2166,6 +2243,7 @@ Místnosti: ${roomNames || 'žádné'}
 Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
+Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${loadLessons().slice(-8).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
 ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.' : ''}`;
@@ -2538,10 +2616,10 @@ bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 // ═══════════════════════════════════════════════
 // SLEDOVÁNÍ NÁVYKŮ — state poller každých 5 minut
 // ═══════════════════════════════════════════════
-const EVENTS_FILE = path.join(__dirname, 'zan_events.json');
-const HABITS_FILE = path.join(__dirname, 'zan_habits.json');
-const UDRZBA_FILE = path.join(__dirname, 'zan_udrzba.json');
-const TASKS_FILE = path.join(__dirname, 'zan_tasks.json');
+const EVENTS_FILE = path.join(DATA_DIR, 'zan_events.json');
+const HABITS_FILE = path.join(DATA_DIR, 'zan_habits.json');
+const UDRZBA_FILE = path.join(DATA_DIR, 'zan_udrzba.json');
+const TASKS_FILE = path.join(DATA_DIR, 'zan_tasks.json');
 
 // Sledované domény pro návyky
 const HABIT_DOMAINS = ['light', 'switch', 'climate', 'cover', 'input_boolean'];
