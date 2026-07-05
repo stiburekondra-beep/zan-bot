@@ -1659,7 +1659,9 @@ async function executeTool(name, input, chatId) {
               hosts.push(host);
             }
           }
-          logAction(chatId, user.name, 'scan_network', subnet, `${hosts.length} zařízení`);
+          const withMac = hosts.filter(h => h.mac).length;
+          console.log(`🔍 scan_network: subnet=${subnet} hosts=${hosts.length} s_MAC=${withMac} (0 = chybí NET_RAW/root, ARP fallback nefunguje)`);
+          logAction(chatId, user.name, 'scan_network', subnet, `${hosts.length} zařízení, ${withMac} s MAC`);
           return { subnet, count: hosts.length, hosts };
         } catch (e) {
           return { error: `Sken sítě selhal: ${e.message}` };
@@ -1679,6 +1681,7 @@ async function executeTool(name, input, chatId) {
           let flow = await haWsCommand('config_entries/flow/create', {
             handler: 'generic', show_advanced_options: false,
           });
+          console.log(`📷 setup_camera krok 0 (create): ${JSON.stringify(flow).slice(0, 400)}`);
 
           let step = 0;
           while (flow && flow.type === 'form' && step < 4) {
@@ -1697,14 +1700,17 @@ async function executeTool(name, input, chatId) {
               flow_id: flow.flow_id, user_input: userInput,
             });
             step++;
+            console.log(`📷 setup_camera krok ${step} (step_id=${stepId}): ${JSON.stringify(flow).slice(0, 500)}`);
           }
 
           if (flow && flow.type === 'create_entry') {
             logAction(chatId, user.name, 'setup_camera', input.name, 'ok');
             return { success: true, message: `Kamera "${input.name}" přidána do HA.`, raw: flow };
           }
+          console.error(`🔴 setup_camera neskončilo create_entry, finální stav: ${JSON.stringify(flow).slice(0, 600)}`);
           return { error: 'Přidání kamery neskončilo úspěchem (create_entry).', raw: flow };
         } catch (e) {
+          console.error(`🔴 setup_camera vyjimka: ${e.message}`);
           return { error: `Nastavení kamery selhalo: ${e.message}`, tip: 'Zkus přidat ručně: Nastavení → Zařízení a služby → Přidat integraci → Generic Camera.' };
         }
       }
@@ -2140,6 +2146,13 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
       for (const block of response.content) {
         if (block.type === 'tool_use') {
           const result = await executeTool(block.name, block.input, chatId);
+          if (result && result.error) {
+            // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
+            // něco selhalo, jen že Žán o tom slušně informoval uživatele.
+            const safeInput = { ...block.input };
+            if (safeInput.password) safeInput.password = '[REDACTED]';
+            console.error(`🔴 TOOL ERROR ${block.name} input=${JSON.stringify(safeInput)} → ${JSON.stringify(result).slice(0, 500)}`);
+          }
           let content;
           if (result && result.__image_base64) {
             // Nástroj vrátil obrázek (např. camera_snapshot) — pošli ho
