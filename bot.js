@@ -799,6 +799,21 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'setup_camera',
+        description: `Přidá kameru do Home Assistant (Generic Camera / RTSP — funguje na Tapo a většinu IP kamer). NEČEKEJ, že budou všechny údaje hned k dispozici — doptej se na ně sám, po jedné otázce: 1) lokální IP kamery na síti, 2) u Tapo: má uživatel v appce Tapo vytvořený "Camera Account" (Advanced Settings → Camera Account — JINÝ účet než cloudové přihlášení, bez něj RTSP nejde)? Pokud ne, vysvětli mu krok za krokem jak ho vytvořit. 3) přihlašovací jméno/heslo z toho Camera Account. 4) jak se má kamera/místnost jmenovat. Teprve pak zavolej tenhle nástroj.`,
+        input_schema: {
+          type: 'object',
+          properties: {
+            host: { type: 'string', description: 'Lokální IP kamery, např. 192.168.0.50' },
+            username: { type: 'string', description: 'Uživatel z Tapo Camera Account (ne cloudový účet)' },
+            password: { type: 'string' },
+            stream_path: { type: 'string', description: 'Výchozí /stream1 pro Tapo (vyšší kvalita) nebo /stream2 (nižší, úspornější)' },
+            name: { type: 'string', description: 'Název kamery/místnosti pro HA, např. Terasa' },
+          },
+          required: ['host', 'username', 'password', 'name'],
+        },
+      },
+      {
         name: 'queue_task',
         description: `Zařadí velký/drahý úkol (např. "hezké dashboardy pro celý dům", hromadné změny) do noční fronty místo okamžitého zpracování. Použij, když by úkol stál hodně tokenů vzhledem k dnešní útratě (viz AKTUÁLNÍ KONTEXT) NEBO by potřeboval víc iterací než zvládne jedna konverzace (mnoho místností/kroků najednou). Po zavolání VŽDY řekni uživateli lidsky, co a kdy uděláš (např. "je to hodně práce, zvládnu to přes noc, klidně na dvakrát").`,
         input_schema: {
@@ -1583,6 +1598,49 @@ async function executeTool(name, input, chatId) {
         } catch (e) { return { error: e.message }; }
       }
 
+      case 'setup_camera': {
+        if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
+        try {
+          const streamPath = input.stream_path || '/stream1';
+          const streamUrl = `rtsp://${input.username}:${input.password}@${input.host}:554${streamPath}`;
+
+          // HA config_entries flow — vytvoří se přes WS, "generic" integrace
+          // (Generic Camera/RTSP). NEOVĚŘENO na reálné kameře — první test
+          // bude to, co se skutečně stane. Pokud schéma pole nesedí, vrátíme
+          // raw odpověď HA, ať je vidět přesně na čem to spadlo.
+          let flow = await haWsCommand('config_entries/flow/create', {
+            handler: 'generic', show_advanced_options: false,
+          });
+
+          let step = 0;
+          while (flow && flow.type === 'form' && step < 4) {
+            const stepId = flow.step_id;
+            let userInput;
+            if (stepId === 'user') {
+              userInput = {
+                stream_source: streamUrl,
+                framerate: 2,
+                verify_ssl: false,
+              };
+            } else {
+              userInput = {}; // potvrzovací/confirm krok — prázdný submit
+            }
+            flow = await haWsCommand('config_entries/flow/configure', {
+              flow_id: flow.flow_id, user_input: userInput,
+            });
+            step++;
+          }
+
+          if (flow && flow.type === 'create_entry') {
+            logAction(chatId, user.name, 'setup_camera', input.name, 'ok');
+            return { success: true, message: `Kamera "${input.name}" přidána do HA.`, raw: flow };
+          }
+          return { error: 'Přidání kamery neskončilo úspěchem (create_entry).', raw: flow };
+        } catch (e) {
+          return { error: `Nastavení kamery selhalo: ${e.message}`, tip: 'Zkus přidat ručně: Nastavení → Zařízení a služby → Přidat integraci → Generic Camera.' };
+        }
+      }
+
       case 'queue_task': {
         const t = loadTasks();
         if (input.action === 'add') {
@@ -1902,6 +1960,14 @@ KAMERA (camera_snapshot): podívej se JEN když se někdo výslovně zeptá
 ("co se děje na terase", "mrkni na zahradu"), nikdy sám od sebe/pravidelně
 — Žán není špión, co nahrává všechno. Po snímku popiš věcně, co vidíš,
 bez přehnaného dramatu u ničeho neobvyklého.
+
+PŘIDÁNÍ KAMERY (setup_camera): když někdo řekne "chci přidat kameru" nebo
+podobně, NEČEKEJ na hotové údaje — doptej se sám, po jedné otázce (IP,
+Tapo Camera Account ano/ne + případně vysvětli jak ho založit, jméno/
+heslo, název místnosti), pak zavolej setup_camera. Je to nový, needs
+testing nástroj — když selže, řekni to na rovinu a nabídni návod na
+ruční přidání (Nastavení → Zařízení a služby → Přidat integraci →
+Generic Camera), ne aby to vypadalo jako tvoje chyba, kterou zatajuješ.
 
 BEZPEČNOST:
 - Kotel, alarm, zámky = jen po výslovném potvrzení
