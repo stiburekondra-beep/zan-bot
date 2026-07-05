@@ -60,6 +60,23 @@ const RATE_WINDOW = 60 * 1000;
 const pendingConfirm = new Map(); // chatId -> { action, entity, resolve }
 
 // ═══════════════════════════════════════════════
+// FRONTA ZPRÁV PER CHAT — bez tohohle se zprávy stejného chatu (např.
+// když uživatel netrpělivě napíše druhou zprávu, než stihne dorazit
+// odpověď na první) zpracovávaly SOUBĚŽNĚ — dva nezávislé běhy nad
+// stejnou conversationHistory, dvě různé odpovědi za sebou (zjištěno
+// 2026-07-05 — "pomoz mi přiřadit zařízení" + netrpělivé "heeej" =
+// dvě mírně odlišné odpovědi na to samé). Teď se zprávy stejného chatu
+// zpracují striktně jedna po druhé.
+// ═══════════════════════════════════════════════
+const chatQueues = new Map(); // chatId -> Promise (řetězec čekajících zpráv)
+function enqueueForChat(chatId, fn) {
+  const prev = chatQueues.get(chatId) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  chatQueues.set(chatId, next.catch(() => {}));
+  return next;
+}
+
+// ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -1981,6 +1998,12 @@ TVOJE CHOVÁNÍ:
 - Data o zařízeních si zjišťuj nástroji (get_states, scan_all_devices, get_areas) — netipuj
 - Jednou týdně se nenásilně zeptej na věci o domě (checkin_schedule)
 - Navrhuj konkrétní IoT HW s modelem a cenou, když vidíš příležitost. Formát: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]"
+- Když se ptáš na víc věcí najednou (např. přiřazování víc zařízení, víc
+  otázek k rozhodnutí) — VŽDY je očísluj a napiš tak, aby šlo odpovědět
+  co nejkratší formou ("3: kuchyň", "6: ano"), ne dlouhou větou. Cíl:
+  člověk odpovídá z mobilu, ne píše esej. Nikdy neroztříštěj stejné
+  otázky do dvou zpráv za sebou s jiným číslováním — jedno očíslované
+  zadání, jedna odpověď.
 
 VELKÉ/DRAHÉ ÚKOLY (hezké dashboardy pro víc místností, hromadné změny,
 cokoliv co by potřebovalo mnoho kroků najednou): NEODMÍTEJ a NEŘÍKEJ
@@ -2200,7 +2223,11 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
 // ═══════════════════════════════════════════════
 // TELEGRAM HANDLERS
 // ═══════════════════════════════════════════════
-bot.on('message', async (msg) => {
+bot.on('message', (msg) => {
+  enqueueForChat(msg.chat.id, () => handleMessage(msg));
+});
+
+async function handleMessage(msg) {
   const chatId = msg.chat.id;
 
   // Security — neznámý chat
@@ -2472,7 +2499,7 @@ bot.on('message', async (msg) => {
     console.error('Chyba:', error.message);
     sendSafe(chatId, '❌ Chyba: ' + error.message);
   }
-});
+}
 
 bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 
