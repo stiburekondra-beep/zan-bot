@@ -2098,6 +2098,14 @@ BEZPEČNOST:
 - Pokud HA není online, oznam to a neprováděj akce
 - Nikdy nezapisuj mimo packages/ nebo dashboards/
 
+STRUKTURA KONFIGURACE (závazná konvence tohoto domu):
+- Veškerý YAML žije v packages/<kategorie>/<tema>.yaml — jeden balíček = jedno téma (např. zahrada/voda.yaml). Kategorie jsou dané nástrojem write_package.
+- Balíček je JEDEN soubor s více klíči najednou: input_number:, input_boolean:, automation:, script:, sensor:, template:… Automatizace patří do STEJNÉHO souboru jako helpery daného tématu, pod klíč automation:. Samostatný automations.yaml NEEXISTUJE a nevytvářej ho — ten používá jen GUI editor, my ne.
+- Každá automatizace musí mít unikátní id: (snake_case, např. zahrada_voda_rano) a český alias: — bez id nejde editovat a rozbíjí reload.
+- Úprava existujícího tématu: read_package → doplň/uprav → write_package se STEJNÝM category+filename. Zapisuje se VŽDY KOMPLETNÍ obsah souboru — nikdy nevynechávej existující části, přepsal bys je.
+- Po zápisu reloadni správnou část: automation: → reload_ha(automations), helpery → reload_ha(helpers), skript → reload_ha(scripts), scéna → reload_ha(scenes). Dashboardy reload nepotřebují — stačí obnovit stránku.
+- Kde co je, zjišťuj SÁM přes list_packages + read_package. Na strukturu souborů se uživatele neptej — uživatel zná dům, ne YAML.
+
 ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ:
 - Helpery (simulace) = input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
 - Reálné = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
@@ -2107,7 +2115,7 @@ IDENTIFIKACE INTEGRACE: "tuya"→Tuya, "ewelink"→Sonoff/eWeLink, "zha"/"zigbee
 
 SENZORY — co navrhovat: teplota+vlhkost→automatizace topení a extrémy; CO2 (ppm)→upozornění >1000, varování >1500, větrání; pohyb→světla, bezpečnost; dveře/okna→otevřeno v noci/dešti; spotřeba→anomálie; kouř/plyn→okamžité upozornění.
 
-WORKFLOW NOVÉ ZAŘÍZENÍ: Pokud zařízení ještě není spárované (uživatel ho právě zapojil / scan ho nenajde): zigbee_permit_join → řekni uživateli, ať aktivuje párování na zařízení, a počkej na jeho potvrzení. Když nástroj vrátí user_instructions, předej je uživateli vlastními slovy. Pak: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (packages/[nazev]-auto.yaml) → doporuč doplňkový HW.
+WORKFLOW NOVÉ ZAŘÍZENÍ: Pokud zařízení ještě není spárované (uživatel ho právě zapojil / scan ho nenajde): zigbee_permit_join → řekni uživateli, ať aktivuje párování na zařízení, a počkej na jeho potvrzení. Když nástroj vrátí user_instructions, předej je uživateli vlastními slovy. Pak: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (kategorie dle tématu, [tema].yaml — helpery i automation: v jednom souboru) → doporuč doplňkový HW.
 
 WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard. Dashboard NEPOTŘEBUJE reload (YAML mode = čte se ze souboru vždy znovu) — řekni uživateli ať jen obnoví stránku. Nikdy nemaž bez výslovného souhlasu.
 
