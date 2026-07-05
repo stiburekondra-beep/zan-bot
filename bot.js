@@ -618,11 +618,11 @@ function buildTools(chatId) {
     },
     {
       name: 'rename_entity',
-      description: 'Přejmenuje entitu v HA registru (friendly_name).',
+      description: 'Přejmenuje entitu v HA registru (friendly_name). DŮLEŽITÉ: entity_id NIKDY netipuj z názvu — vždy si ho napřed ověř přes get_states/scan_all_devices, jinak nástroj vrátí "Entity not found".',
       input_schema: {
         type: 'object',
         properties: {
-          entity_id: { type: 'string' },
+          entity_id: { type: 'string', description: 'Přesné entity_id ověřené přes get_states, ne odhad z friendly_name' },
           new_name: { type: 'string', description: 'Nový friendly_name' },
         },
         required: ['entity_id', 'new_name'],
@@ -794,10 +794,10 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'reload_ha',
-        description: 'Reloadne část HA po změně YAML.',
+        description: 'Reloadne část HA po změně YAML. Dashboardy (Lovelace) reload NEPOTŘEBUJÍ — YAML dashboard se čte ze souboru vždy znovu, stačí obnovit stránku v prohlížeči/appce.',
         input_schema: {
           type: 'object',
-          properties: { what: { type: 'string', enum: ['automations', 'scripts', 'scenes', 'helpers', 'lovelace'] } },
+          properties: { what: { type: 'string', enum: ['automations', 'scripts', 'scenes', 'helpers'] } },
           required: ['what'],
         },
       },
@@ -1596,7 +1596,6 @@ async function executeTool(name, input, chatId) {
           scripts: 'config/script/reload',
           scenes: 'config/scene/reload',
           helpers: 'config/helper/reload',
-          lovelace: 'lovelace/reload',
         };
         await haPost(map[input.what]);
         logAction(chatId, user.name, 'reload_ha', input.what, 'ok');
@@ -2094,7 +2093,7 @@ SENZORY — co navrhovat: teplota+vlhkost→automatizace topení a extrémy; CO2
 
 WORKFLOW NOVÉ ZAŘÍZENÍ: Pokud zařízení ještě není spárované (uživatel ho právě zapojil / scan ho nenajde): zigbee_permit_join → řekni uživateli, ať aktivuje párování na zařízení, a počkej na jeho potvrzení. Když nástroj vrátí user_instructions, předej je uživateli vlastními slovy. Pak: scan_all_devices → identifikuj nové → navrhni české názvy a místnost → ČEKEJ na potvrzení → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML ukázkou → ČEKEJ na potvrzení → write_package (packages/[nazev]-auto.yaml) → doporuč doplňkový HW.
 
-WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard → reload_ha(lovelace). Nikdy nemaž bez výslovného souhlasu.
+WORKFLOW ÚKLID DASHBOARDU ("udělej pořádek", "bordel", "vyčisti"): list_dashboards → validate_dashboard → smaž neexistující entity a duplicity, zachovej platné → navrhni strukturu, popiš CO smažeš/přidáš a ČEKEJ na souhlas → write_dashboard. Dashboard NEPOTŘEBUJE reload (YAML mode = čte se ze souboru vždy znovu) — řekni uživateli ať jen obnoví stránku. Nikdy nemaž bez výslovného souhlasu.
 
 WORKFLOW TESTOVACÍ DASHBOARD ("zkusit", "otestovat", "naplánovat"): scan_all_devices + get_states → návrh → chybí-li reálný HW, vytvoř helpery (write_package, kategorie system, helpers-[tema]-test.yaml) → write_dashboard ([Tema]-test.yaml, na začátek markdown karta vysvětlující sim/real) → reload_ha(helpers). Po vytvoření vysvětli, co je reálné a co simulované, kde dashboard najít, a co přikoupit (s cenami).
 
@@ -2973,7 +2972,8 @@ async function createFamilyDashboard() {
     const ok = writeYamlFile(fp, yaml);
     if (ok) {
       console.log('👨‍👩‍👧‍👦 Rodinný dashboard vytvořen: dashboards/Rodina.yaml');
-      try { await haPost('lovelace/reload'); } catch {} // tiše — dashboard nemusí být registrovaný
+      // Reload zbytečný — YAML dashboard se čte ze souboru vždy znovu
+      // (žádná služba "lovelace" v HA neexistuje, ověřeno 2026-07-05).
     } else {
       console.warn('⚠️ Rodinný dashboard — zápis selhal (config path nedostupný)');
     }
