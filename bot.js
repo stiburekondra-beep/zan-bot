@@ -2014,6 +2014,7 @@ bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 // ═══════════════════════════════════════════════
 const EVENTS_FILE = path.join(__dirname, 'zan_events.json');
 const HABITS_FILE = path.join(__dirname, 'zan_habits.json');
+const UDRZBA_FILE = path.join(__dirname, 'zan_udrzba.json');
 
 // Sledované domény pro návyky
 const HABIT_DOMAINS = ['light', 'switch', 'climate', 'cover', 'input_boolean'];
@@ -2155,6 +2156,153 @@ Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`
     console.log('✅ Analýza návyků odeslána');
   } catch (e) {
     console.error('Analýza návyků selhala:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════
+// ÚDRŽBÁŘ — servisní obchůzka (středa + sobota 18:00)
+// Spec: projects/baklazan/research/2026-07-03_zan-udrzbar-obchuzka.md
+// (repo CHoS-, upřesněno 2026-07-05: St/So 18:00 místo denně).
+//
+// v1 rozsah — VĚDOMĚ jen diagnostika, žádné automatické zásahy:
+// restart add-onu / reload integrace jde přes Supervisor API, který má
+// podle zkušeností z deploy pipeline (docs/memory/project_zan_bot.md)
+// nespolehlivé endpointy (401 na některých cestách) — než se to pořádně
+// otestuje, obchůzka jen hlásí a ptá se, nikdy sama nezasahuje.
+// ═══════════════════════════════════════════════
+function loadUdrzba() {
+  try { if (fs.existsSync(UDRZBA_FILE)) return JSON.parse(fs.readFileSync(UDRZBA_FILE, 'utf8')); } catch {}
+  return { last_run_date: null, last_announce_date: null };
+}
+function saveUdrzba(u) {
+  try { fs.writeFileSync(UDRZBA_FILE, JSON.stringify(u, null, 2), 'utf8'); } catch {}
+}
+
+function todayStr() {
+  // YYYY-MM-DD v lokálním čase (ne UTC) — konzistentní s "jednou za den" guardem
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Ranní ohlášení dopředu — ať Ondra ví, že dnes večer proběhne obchůzka
+async function announceObchuzka() {
+  const u = loadUdrzba();
+  const today = todayStr();
+  if (u.last_announce_date === today) return; // už ohlášeno dnes
+
+  await sendSafe(CHAT_ONDRA, '🔧 Dnes večer v 18:00 se podívám na dům (servisní obchůzka) — dám ti vědět, jak to dopadlo.');
+  u.last_announce_date = today;
+  saveUdrzba(u);
+}
+
+async function runObchuzka() {
+  const u = loadUdrzba();
+  const today = todayStr();
+  if (u.last_run_date === today) {
+    console.log('Obchůzka: přeskočeno (dnes už proběhla)');
+    return;
+  }
+  if (await isAiStopped()) {
+    console.log('Obchůzka: přeskočeno (AI je vypnuté přes input_boolean.ai_stop)');
+    return;
+  }
+
+  try {
+    console.log('🔧 Spouštím servisní obchůzku...');
+    if (!(await isHaOnline())) {
+      await sendSafe(CHAT_ONDRA, '🔧 Servisní obchůzka: HA momentálně neodpovídá, zkusím to příště.');
+      return;
+    }
+
+    const states = await haGet('states');
+
+    // 1. Nedostupná/neznámá entita
+    const unavailable = states.filter(s => s.state === 'unavailable' || s.state === 'unknown');
+
+    // 2. Čekající aktualizace (core i add-ony jsou update.* entity)
+    const updates = states
+      .filter(s => s.entity_id.startsWith('update.') && s.state === 'on')
+      .map(s => ({
+        name: s.attributes.friendly_name || s.entity_id,
+        installed: s.attributes.installed_version,
+        latest: s.attributes.latest_version,
+      }));
+
+    // 3. Nízká baterie — podle device_class, ne podle názvu entity
+    const lowBattery = states.filter(s =>
+      s.attributes?.device_class === 'battery' &&
+      !isNaN(parseFloat(s.state)) &&
+      parseFloat(s.state) < 20
+    );
+
+    // 4. Kamera — dokud není v HA žádná entita domény camera.*, Žán ji nevidí
+    const cameras = states.filter(s => s.entity_id.startsWith('camera.'));
+
+    // Sestav zprávu
+    const lines = [`🔧 *Servisní obchůzka* — ${new Date().toLocaleDateString('cs-CZ')} 18:00`, ''];
+
+    if (unavailable.length === 0) {
+      lines.push('✅ Všechna zařízení dostupná.');
+    } else {
+      lines.push(`⚠️ *${unavailable.length}× nedostupné/neznámé zařízení:*`);
+      for (const s of unavailable.slice(0, 15)) {
+        lines.push(`  • ${s.attributes.friendly_name || s.entity_id}`);
+      }
+      if (unavailable.length > 15) lines.push(`  • ...a ${unavailable.length - 15} dalších`);
+    }
+
+    lines.push('');
+    if (updates.length === 0) {
+      lines.push('✅ Žádné čekající aktualizace.');
+    } else {
+      lines.push(`🔄 *${updates.length}× čekající aktualizace* (žádnou jsem sám nenainstaloval):`);
+      for (const up of updates) {
+        lines.push(`  • ${up.name}: ${up.installed} → ${up.latest}`);
+      }
+    }
+
+    lines.push('');
+    if (lowBattery.length === 0) {
+      lines.push('✅ Žádná baterie pod 20 %.');
+    } else {
+      lines.push(`🔋 *${lowBattery.length}× nízká baterie:*`);
+      for (const s of lowBattery) lines.push(`  • ${s.attributes.friendly_name || s.entity_id}: ${s.state}%`);
+    }
+
+    if (cameras.length === 0) {
+      lines.push('');
+      lines.push('📷 Kamera v domě není napojená na Home Assistant — nevidím ji a nemůžu na ni dohlížet.');
+    }
+
+    // Žádost o rozhodnutí, ne jen informace — jen když je vůbec co řešit
+    const needsDecision = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0 || cameras.length === 0;
+    if (needsDecision) {
+      lines.push('');
+      lines.push('*Co bych potřeboval rozhodnout:*');
+      let n = 1;
+      if (updates.some(u => u.name.toLowerCase().includes('core') || u.name.toLowerCase().includes('operating system'))) {
+        lines.push(`${n++}. Mám nainstalovat aktualizaci HA Core/OS, nebo počkat na klidnější chvíli? (jen s tvým souhlasem — nikdy sám)`);
+      }
+      if (unavailable.length > 0) {
+        lines.push(`${n++}. Něco z nedostupných zařízení stojí za fyzickou kontrolu — mrkneš na to, až budeš mít chvíli?`);
+      }
+      if (cameras.length === 0) {
+        lines.push(`${n++}. Chceš, ať kameru zapojím do Home Assistantu? Pak na ni budu moct dohlížet a hlásit ti, co se děje.`);
+      }
+      lines.push('');
+      lines.push('Odpověz mi, až budeš mít čas 🙂');
+    } else {
+      lines.push('');
+      lines.push('Všechno vypadá v pořádku, nic ode mě teď nepotřebuješ.');
+    }
+
+    await sendSafe(CHAT_ONDRA, lines.join('\n'), { parse_mode: 'Markdown' });
+
+    u.last_run_date = today;
+    saveUdrzba(u);
+    console.log('✅ Servisní obchůzka odeslána');
+  } catch (e) {
+    console.error('Servisní obchůzka selhala:', e.message);
   }
 }
 
@@ -2302,6 +2450,19 @@ setInterval(() => {
   const now = new Date();
   if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
     analyzeHabits();
+  }
+}, 60 * 1000);
+
+// Servisní obchůzka — středa (3) a sobota (6) v 18:00, s ranním ohlášením
+// v 7:00 téhož dne. getDay(): 0=ne, 1=po, 2=út, 3=st, 4=čt, 5=pá, 6=so.
+setInterval(() => {
+  const now = new Date();
+  const isObchuzkaDen = now.getDay() === 3 || now.getDay() === 6;
+  if (isObchuzkaDen && now.getHours() === 7 && now.getMinutes() < 5) {
+    announceObchuzka();
+  }
+  if (isObchuzkaDen && now.getHours() === 18 && now.getMinutes() < 5) {
+    runObchuzka();
   }
 }, 60 * 1000);
 
