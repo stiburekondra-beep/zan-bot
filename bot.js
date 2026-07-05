@@ -33,6 +33,7 @@ const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 
 const MEMORY_FILE       = path.join(__dirname, 'home_memory.json');
 const LOG_FILE          = path.join(__dirname, 'zan_actions.log');
+const CONVO_LOG_FILE    = path.join(__dirname, 'zan_conversation.log');
 
 // Model: Haiku 4.5 pro běžný provoz (cca 3× levnější než Sonnet).
 // Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
@@ -163,6 +164,25 @@ function logSecurity(chatId, event) {
   const entry = `[${new Date().toISOString()}] SECURITY chatId=${chatId} event=${event}\n`;
   try { fs.appendFileSync(LOG_FILE, entry); } catch {}
   console.warn(entry.trim());
+}
+
+// ═══════════════════════════════════════════════
+// LOG KONVERZACE — ať Ondra s Claude Code nemusí kopírovat zprávy ručně,
+// stačí přečíst tenhle soubor. Nejde o "odposlech" v reálném čase (Telegram
+// dovoluje jen jednoho konzumenta long-pollingu na token), ale o čitelný
+// záznam, co se s Žánem řešilo. Drží se posledních ~2000 řádků.
+// ═══════════════════════════════════════════════
+function logConvo(role, chatId, userName, text) {
+  const line = `[${new Date().toISOString()}] ${role} chat=${chatId}(${userName}): ${String(text).replace(/\n/g, ' ⏎ ')}`;
+  // Hlavní cesta ke čtení zvenku: stdout → add-on log (/api/hassio/addons/{slug}/logs),
+  // stejná cesta, co se používá na kontrolu nasazení. Soubor v kontejneru
+  // (CONVO_LOG_FILE) není zvenku přímo dostupný, drží se jen jako záloha.
+  console.log(`💬 ${line}`);
+  try {
+    fs.appendFileSync(CONVO_LOG_FILE, line + '\n');
+    const lines = fs.readFileSync(CONVO_LOG_FILE, 'utf8').split('\n');
+    if (lines.length > 2000) fs.writeFileSync(CONVO_LOG_FILE, lines.slice(-2000).join('\n'));
+  } catch {}
 }
 
 // ═══════════════════════════════════════════════
@@ -2051,6 +2071,7 @@ ZAHRADNÍ NÁSTROJE (používej aktivně): garden_map (zóny a mapa), garden_pla
 async function processMessage(chatId, userMessage, imageBase64 = null) {
   const user = getUser(chatId);
   const memory = loadMemory();
+  logConvo('USER', chatId, user.name, imageBase64 ? `[fotka] ${userMessage}` : userMessage);
 
   if (!conversationHistory[chatId]) conversationHistory[chatId] = [];
   
@@ -2147,10 +2168,13 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
     const finalText = textBlock ? textBlock.text : 'Hotovo.';
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
+    logConvo('ŽÁN', chatId, user.name, finalText);
     return finalText;
   }
 
-  return `⏳ Úloha byla moc dlouhá (přes ${MAX_AGENT_ITERATIONS} kol nástrojů) — zkus ji rozdělit na menší kroky.`;
+  const tooLong = `⏳ Úloha byla moc dlouhá (přes ${MAX_AGENT_ITERATIONS} kol nástrojů) — zkus ji rozdělit na menší kroky.`;
+  logConvo('ŽÁN', chatId, user.name, tooLong);
+  return tooLong;
 }
 
 // ═══════════════════════════════════════════════

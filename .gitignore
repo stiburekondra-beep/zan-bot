@@ -17,6 +17,7 @@ zan_tasks.json
 zan_usage.json
 zan_garden.json
 zan_actions.log
+zan_conversation.log
 
 # Node
 node_modules/
