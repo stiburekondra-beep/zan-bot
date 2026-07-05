@@ -1131,15 +1131,16 @@ async function executeTool(name, input, chatId) {
       case 'rename_entity': {
         if (!isAdmin(chatId)) return { error: 'Přejmenování vyžaduje admin přístup.' };
         try {
-          await haPost('config/entity_registry/update', {
+          // Oprava 2026-07-05: REST config/entity_registry/update vrací 404
+          // (HA to vystavuje jen přes WebSocket) — přepnuto na haWsCommand.
+          await haWsCommand('config/entity_registry/update', {
             entity_id: input.entity_id,
             name: input.new_name,
           });
           logAction(chatId, user.name, 'rename', input.entity_id, input.new_name);
           return { success: true, message: `Přejmenováno na: ${input.new_name}` };
         } catch (e) {
-          // Fallback — přes WS není vždy dostupné přes REST
-          return { error: `Přejmenování přes API selhalo: ${e.message}. Přejmenuj ručně v HA Settings → Entities.` };
+          return { error: `Přejmenování selhalo: ${e.message}. Přejmenuj ručně v HA Settings → Entities.` };
         }
       }
 
@@ -1222,12 +1223,13 @@ async function executeTool(name, input, chatId) {
       case 'create_area': {
         if (!isAdmin(chatId)) return { error: 'Vytvoření místnosti vyžaduje admin přístup.' };
         try {
-          const result = await haPost('config/area_registry/create', { name: input.name });
+          // Oprava 2026-07-05: REST config/area_registry/create vrací 404,
+          // stejný problém jako u ha_setup_create_area — přepnuto na WS.
+          // (Pozn.: ha_setup_create_area dělá totéž + rovnou i patro —
+          // pro rychlé vytvoření místnosti bez patra zůstává i tenhle.)
+          const result = await haWsCommand('config/area_registry/create', { name: input.name });
           logAction(chatId, user.name, 'create_area', input.name, 'ok');
-          // HA vrací přímo objekt oblasti nebo { area_id, name }
-          const area_id = result.area_id || result.id || null;
-          const name = result.name || input.name;
-          return { success: true, area_id, name, raw: result };
+          return { success: true, area_id: result.area_id, name: result.name, raw: result };
         } catch (e) {
           return {
             error: `Vytvoření oblasti selhalo: ${e.message}`,
@@ -1239,12 +1241,13 @@ async function executeTool(name, input, chatId) {
       case 'assign_area': {
         if (!isAdmin(chatId)) return { error: 'Přiřazení oblasti vyžaduje admin přístup.' };
         try {
-          const areas = await haRegistry('area_registry').catch(() => []);
+          const areas = await haWsCommand('config/area_registry/list').catch(() => []);
           const area = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === input.area_name.toLowerCase()) : null;
           if (!area) {
             return { error: `Oblast "${input.area_name}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
           }
-          await haPost('config/entity_registry/update', { entity_id: input.entity_id, area_id: area.area_id });
+          // Oprava 2026-07-05: REST config/entity_registry/update vrací 404 — WS.
+          await haWsCommand('config/entity_registry/update', { entity_id: input.entity_id, area_id: area.area_id });
           logAction(chatId, user.name, 'assign_area', input.entity_id, area.area_id);
           return { success: true, message: `${input.entity_id} přiřazena do oblasti ${area.name}` };
         } catch (e) {
@@ -1258,12 +1261,14 @@ async function executeTool(name, input, chatId) {
           let area_id = input.area_id;
           // Pokud dostaneme název oblasti místo ID, vyhledáme area_id
           if (area_id && !area_id.match(/^[a-z0-9_]+$/)) {
-            const areas = await haRegistry('area_registry').catch(() => []);
+            const areas = await haWsCommand('config/area_registry/list').catch(() => []);
             const found = Array.isArray(areas) ? areas.find(a => a.name.toLowerCase() === area_id.toLowerCase()) : null;
             if (!found) return { error: `Oblast "${area_id}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
             area_id = found.area_id;
           }
-          await haPost('config/device_registry/update', { device_id: input.device_id, area_id });
+          // Oprava 2026-07-05: REST config/device_registry/update vrací 404 — WS.
+          // (ha_setup_assign_device dělá totéž — tenhle navíc umí i název místo ID.)
+          await haWsCommand('config/device_registry/update', { device_id: input.device_id, area_id });
           logAction(chatId, user.name, 'assign_device_area', input.device_id, area_id);
           return { success: true, message: `Zařízení ${input.device_id} přiřazeno do oblasti ${area_id}` };
         } catch (e) {
