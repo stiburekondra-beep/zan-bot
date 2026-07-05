@@ -6,6 +6,11 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
+// Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
+// image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
+// aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
+// API, takže je to zaměnitelné 1:1.
+const WebSocket = require('ws');
 
 // ═══════════════════════════════════════════════
 // KONFIGURACE
