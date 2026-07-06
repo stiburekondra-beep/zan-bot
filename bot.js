@@ -86,6 +86,32 @@ function relevantLessons(userMessage) {
   return [...matched, ...newest];
 }
 
+// ── PLAYBOOKY (audit sekce 4.2) — Žánovy "skilly" ──
+// Ověřený postup se uloží jako pojmenovaný návod; do kontextu jdou jen
+// NÁZVY (lazy-loading jako Claude Code skills), obsah si Žán vytáhne
+// read_playbook, až ho potřebuje. Playbook ≠ lesson: lesson je "tohle
+// nedělej", playbook je "takhle se dělá X, ověřeno". Ukládá se jen na
+// pokyn/potvrzení Ondry — jinak by se zakonzervovaly i slepé uličky.
+const PLAYBOOK_DIR = path.join(DATA_DIR, 'playbooks');
+function playbookSlug(name) {
+  return stripDiacritics(String(name)).toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '');
+}
+function listPlaybooks() {
+  try { return fs.readdirSync(PLAYBOOK_DIR).filter(f => f.endsWith('.md')).map(f => f.slice(0, -3)); }
+  catch { return []; }
+}
+function savePlaybook(name, content) {
+  try {
+    fs.mkdirSync(PLAYBOOK_DIR, { recursive: true });
+    fs.writeFileSync(path.join(PLAYBOOK_DIR, playbookSlug(name) + '.md'), content, 'utf8');
+    return playbookSlug(name);
+  } catch (e) { console.error('savePlaybook:', e.message); return null; }
+}
+function readPlaybook(name) {
+  try { return fs.readFileSync(path.join(PLAYBOOK_DIR, playbookSlug(name) + '.md'), 'utf8'); }
+  catch { return null; }
+}
+
 // rodina.md — živý profil TÉHLE domácnosti (Žán #1: Stiburkovi).
 // Per-dům data, žijí mimo git sdíleného kódu (rozhodnuti.md 2026-07-05/06).
 // Plní se dotazníkem po jedné otázce (kickoff: /onboarding), čte se celý
@@ -172,8 +198,24 @@ const rateLimits = new Map(); // chatId -> [timestamps]
 const RATE_LIMIT = 10; // max zpráv za minutu
 const RATE_WINDOW = 60 * 1000;
 
-// Pending confirmations
-const pendingConfirm = new Map(); // chatId -> { action, entity, resolve }
+// Pending confirmations — VYNUCENÉ potvrzení citlivých akcí (fáze 2,
+// slabiny S3+S4): citlivou akci kód neprovede, dokud uživatel neťukne
+// na inline tlačítko ✅. Do té doby žije tady. Není to prosba v promptu,
+// je to závora v kódu.
+const pendingConfirm = new Map(); // chatId -> { name, input, desc, token, when }
+
+function isSensitiveAction(name, input) {
+  // Vrací lidský popis akce, když vyžaduje potvrzení; jinak null.
+  if (name === 'restart_ha') return 'restart Home Assistantu';
+  if (['turn_on', 'turn_off', 'toggle'].includes(name)) {
+    const domain = String(input.entity_id || '').split('.')[0];
+    if (SENSITIVE_DOMAINS.includes(domain)) return `${name === 'turn_on' ? 'zapnutí' : name === 'turn_off' ? 'vypnutí' : 'přepnutí'} ${input.entity_id}`;
+  }
+  if (name === 'call_service' && SENSITIVE_DOMAINS.includes(input.domain)) {
+    return `${input.domain}.${input.service} (${JSON.stringify(input.data || {}).slice(0, 120)})`;
+  }
+  return null;
+}
 
 // ═══════════════════════════════════════════════
 // FRONTA ZPRÁV PER CHAT — bez tohohle se zprávy stejného chatu (např.
@@ -886,6 +928,11 @@ function buildTools(chatId) {
       input_schema: { type: 'object', properties: {}, required: [] },
     },
     {
+      name: 'read_playbook',
+      description: 'Přečte uložený playbook (ověřený postup krok za krokem). Názvy dostupných playbooků máš v kontextu — před opakováním známého úkolu (přidání kamery, typ automatizace…) se podívej, jestli na to není návod.',
+      input_schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+    },
+    {
       name: 'generate_report',
       description: 'Vygeneruje report o stavu domu — teploty, pohyb, počasí, energie, co se dělo. Použij, když uživatel napíše "report" nebo chce přehled — výsledek pak podej jako lidský přehled se zajímavostmi.',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -1001,6 +1048,18 @@ Po zápisu vždy popsat změny LIDSKY.`,
             lines: { type: 'number', description: 'kolik posledních řádků (default 60, max 200)' },
           },
           required: ['source'],
+        },
+      },
+      {
+        name: 'save_playbook',
+        description: 'Uloží OVĚŘENÝ postup jako playbook (markdown, kroky za sebou, včetně čísel/nástrojů, které fungovaly). Ukládej JEN když postup prokazatelně funguje a Ondra řekl "ulož si to jako postup" (nebo to potvrdil na tvůj návrh). Playbook = "takhle se dělá X"; poučení (save_lesson) = "tohle nedělej".',
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'krátký název, např. "pridani tapo kamery"' },
+            content: { type: 'string', description: 'markdown: cíl, předpoklady, kroky, ověření' },
+          },
+          required: ['name', 'content'],
         },
       },
       {
@@ -1160,10 +1219,27 @@ async function executeTool(name, input, chatId) {
   const memory = loadMemory();
 
   // Security check — admin-only nástroje
-  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'save_lesson'];
+  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'save_lesson', 'save_playbook', 'undo_last_change'];
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
+  }
+
+  // Vynucené potvrzení citlivých akcí (kotel/žaluzie/restart) — akce se
+  // uloží a uživateli se zobrazí tlačítka ✅/❌. __confirmed smí nastavit
+  // JEN callback handler (agentic loop ho z modelového vstupu maže).
+  const sensitiveDesc = isSensitiveAction(name, input);
+  if (sensitiveDesc && !input.__confirmed) {
+    const token = String(Date.now());
+    pendingConfirm.set(chatId, { name, input, desc: sensitiveDesc, token, when: Date.now() });
+    await sendSafe(chatId, `⚠️ Citlivá akce: ${sensitiveDesc}\nMám to provést?`, {
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Ano', callback_data: `confirm:${token}` },
+        { text: '❌ Ne', callback_data: `cancel:${token}` },
+      ]] },
+    });
+    logAction(chatId, user.name, 'confirm_requested', sensitiveDesc, 'pending');
+    return { pending_confirmation: true, note: 'Akce ČEKÁ na potvrzení tlačítkem — uživateli se právě zobrazila tlačítka ✅/❌. Neprováděj ji znovu a netvrď, že je hotová; řekni jen, že čekáš na potvrzení.' };
   }
 
   console.log(`🔧 [${user.name}] ${name} ${JSON.stringify(input).substring(0, 100)}`);
@@ -1758,6 +1834,19 @@ async function executeTool(name, input, chatId) {
         const filtrovane = String(raw.data || '').split('\n')
           .filter(l => /ERROR|WARNING|Invalid|failed|Traceback/i.test(l));
         return { log: filtrovane.slice(-lines).join('\n') || '(žádné chyby ani warningy)' };
+      }
+
+      case 'save_playbook': {
+        const slug = savePlaybook(input.name, input.content);
+        if (!slug) return { error: 'Uložení playbooku selhalo (zkontroluj /config/zan_data).' };
+        logAction(chatId, user.name, 'save_playbook', slug, 'ok');
+        return { success: true, name: slug, note: 'Playbook uložen — jeho název od teď vidíš v kontextu.' };
+      }
+
+      case 'read_playbook': {
+        const content = readPlaybook(input.name);
+        if (!content) return { error: `Playbook "${input.name}" neexistuje. Dostupné: ${listPlaybooks().join(', ') || 'žádné'}` };
+        return { name: playbookSlug(input.name), content };
       }
 
       case 'save_lesson': {
@@ -2453,8 +2542,9 @@ KAMERA: camera_snapshot jen na výslovnou žádost („co se děje na terase"), 
 
 VELKÉ ÚKOLY: neodmítej a neříkej „to nezvládnu". Zhodnoť rozsah, řekni na rovinu („je toho hodně, zvládnu přes noc"), queue_task(add) s konkrétním popisem a potvrď kdy. Malé věci dělej hned. Rozhoduj podle rozsahu a dnešní útraty v kontextu, ne podle strachu.
 
-═══ 6. UČENÍ Z CHYB ═══
+═══ 6. UČENÍ Z CHYB A POSTUPŮ ═══
 Něco selhalo nebo tě uživatel opravil → 1) read_error_log (zdroj ha / vlastní logy), 2) najdi skutečnou příčinu, ne dohad, 3) oprav, 4) save_lesson (krátce, obecně, s topic). Ponaučení dostáváš v kontextu — chybu s existujícím ponaučením NIKDY neopakuj. Když si protiřečí ponaučení a tahle ústava, řekni to Ondrovi.
+Když se netriviální postup POVEDE a ověřil sis výsledek → navrhni „mám si to uložit jako postup?" a po OK save_playbook. Před opakováním známého úkolu zkontroluj playbooky v kontextu (read_playbook).
 
 ═══ 7. PROAKTIVITA ═══
 - Navrhuj HW, když vidíš příležitost: "💡 Doplnit by šlo: [název] ([značka] [model]) ~[cena] Kč — [přínos]".
@@ -2493,6 +2583,7 @@ Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si v
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
+Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
 PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
 ${(() => { const r = ensureRodina(); return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)'; })()}
 ${isJana ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
@@ -2556,6 +2647,9 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
       const toolResults = [];
       for (const block of response.content) {
         if (block.type === 'tool_use') {
+          // __confirmed smí nastavit jen callback handler tlačítek — model
+          // si potvrzení nesmí "přibalit" sám (schema ho nezná, ale poslat by šlo)
+          if (block.input && block.input.__confirmed) delete block.input.__confirmed;
           const result = await executeTool(block.name, block.input, chatId);
           if (result && result.error) {
             // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
@@ -2607,6 +2701,34 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
 // ═══════════════════════════════════════════════
 bot.on('message', (msg) => {
   enqueueForChat(msg.chat.id, () => handleMessage(msg));
+});
+
+// Inline tlačítka ✅/❌ pro citlivé akce — jediné místo, které smí nastavit
+// __confirmed a provést odloženou akci. Potvrzení platí 10 minut.
+bot.on('callback_query', async (q) => {
+  try {
+    const chatId = q.message?.chat?.id;
+    if (!chatId || !ALLOWED_CHATS.includes(chatId)) { await bot.answerCallbackQuery(q.id); return; }
+    const [act, token] = String(q.data || '').split(':');
+    const p = pendingConfirm.get(chatId);
+    if (!p || p.token !== token || Date.now() - p.when > 10 * 60 * 1000) {
+      pendingConfirm.delete(chatId);
+      await bot.answerCallbackQuery(q.id, { text: 'Tahle žádost už neplatí — řekni mi to znovu.' });
+      return;
+    }
+    pendingConfirm.delete(chatId);
+    if (act !== 'confirm') {
+      await bot.answerCallbackQuery(q.id, { text: 'Zrušeno' });
+      await sendSafe(chatId, `❌ Dobře, neprovádím: ${p.desc}`);
+      logAction(chatId, getUser(chatId).name, 'confirm_cancel', p.desc, 'user');
+      return;
+    }
+    await bot.answerCallbackQuery(q.id, { text: 'Provádím…' });
+    const result = await executeTool(p.name, { ...p.input, __confirmed: true }, chatId);
+    if (result && result.error) await sendSafe(chatId, `⚠️ Akce selhala: ${result.error}`);
+    else await sendSafe(chatId, `✅ Provedeno: ${p.desc}`);
+    logAction(chatId, getUser(chatId).name, 'confirm_execute', p.desc, result && result.error ? 'fail' : 'ok');
+  } catch (e) { console.error('callback_query:', e.message); }
 });
 
 async function handleMessage(msg) {
@@ -3062,6 +3184,12 @@ Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`
 
     // Pošli návrh Ondrovi
     await sendSafe(CHAT_ONDRA, `🧠 *Týdenní analýza návyků:*\n\n${suggestion}`, { parse_mode: 'Markdown' });
+
+    // Follow-up (slabina S5): návrh patří i do konverzační historie —
+    // jinak Žán neví, na co uživatel odpovídá "ano, udělej 2".
+    if (!conversationHistory[CHAT_ONDRA]) conversationHistory[CHAT_ONDRA] = [];
+    conversationHistory[CHAT_ONDRA].push({ role: 'assistant', content: `[Poslal jsem týdenní analýzu návyků s návrhy automatizací]\n${suggestion}` });
+    persistConversations();
 
     // Ulož že jsme poslali návrh
     habits.last_analysis = new Date().toISOString();
