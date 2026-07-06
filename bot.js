@@ -2,6 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
+const yaml = require('js-yaml'); // validace YAML před zápisem (fáze 0 auditu 2026-07-05)
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -193,9 +194,13 @@ const PACKAGE_CATEGORIES = {
 const USAGE_FILE = path.join(DATA_DIR, 'zan_usage.json');
 const USD_CZK = 23; // hrubý kurz pro orientační přepočet
 
-function modelPricing() {
-  // [input, output, cache_read, cache_write] USD za MTok
-  return MODEL.includes('haiku') ? [1, 5, 0.1, 1.25] : [3, 15, 0.3, 3.75];
+function modelPricing(model = MODEL) {
+  // [input, output, cache_read, cache_write] USD za MTok — per model,
+  // ne podle globálního MODEL (jinak /budget lže, jakmile běží víc modelů)
+  const m = String(model);
+  if (m.includes('haiku')) return [1, 5, 0.1, 1.25];
+  if (m.includes('opus'))  return [15, 75, 1.5, 18.75];
+  return [3, 15, 0.3, 3.75]; // sonnet a ostatní
 }
 
 function loadUsage() {
@@ -203,7 +208,7 @@ function loadUsage() {
   return { days: {} };
 }
 
-function trackUsage(usage) {
+function trackUsage(usage, model = MODEL) {
   if (!usage) return;
   try {
     const u = loadUsage();
@@ -214,6 +219,16 @@ function trackUsage(usage) {
     d.output += usage.output_tokens || 0;
     d.cache_read += usage.cache_read_input_tokens || 0;
     d.cache_write += usage.cache_creation_input_tokens || 0;
+    // Rozpad po modelech — bez něj /budget počítá špatné ceny, jakmile
+    // poběží víc modelů najednou (model routing). Starší dny d.models nemají.
+    d.models = d.models || {};
+    const md = d.models[model] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
+    md.calls += 1;
+    md.input += usage.input_tokens || 0;
+    md.output += usage.output_tokens || 0;
+    md.cache_read += usage.cache_read_input_tokens || 0;
+    md.cache_write += usage.cache_creation_input_tokens || 0;
+    d.models[model] = md;
     u.days[day] = d;
     // drž max 90 dní
     const keys = Object.keys(u.days).sort();
@@ -224,13 +239,21 @@ function trackUsage(usage) {
 }
 
 function usageCostUsd(d) {
+  // Dny s rozpadem po modelech se počítají přesně; starší dny (bez d.models)
+  // padají na cenu aktuálního globálního modelu jako dřív.
+  if (d.models && Object.keys(d.models).length) {
+    return Object.entries(d.models).reduce((sum, [m, v]) => {
+      const [pi, po, pcr, pcw] = modelPricing(m);
+      return sum + (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
+    }, 0);
+  }
   const [pi, po, pcr, pcw] = modelPricing();
   return (d.input * pi + d.output * po + d.cache_read * pcr + d.cache_write * pcw) / 1e6;
 }
 
 async function claudeCreate(params) {
   const response = await anthropic.messages.create(params);
-  trackUsage(response.usage);
+  trackUsage(response.usage, params.model || MODEL);
   return response;
 }
 
@@ -482,10 +505,12 @@ function haWsCommand(type, payload = {}, timeoutMs = 10000) {
 // YAML HELPERS
 // ═══════════════════════════════════════════════
 function getPackagePath(cat, fn) {
-  // Slug balíčku v HA nesmí obsahovat pomlčky/mezery — s nimi HA balíček
-  // tiše nenačte (jen warning v logu). Normalizujeme natvrdo, ať model
-  // nemůže vytvořit mrtvý soubor (viz voda-casovace.yaml, 2026-07-05).
-  fn = fn.replace(/[\s-]+/g, '_');
+  // Slug balíčku v HA smí obsahovat jen [a-z0-9_] — s pomlčkou/mezerou/
+  // diakritikou/velkými písmeny HA balíček tiše nenačte (jen warning
+  // v logu). Normalizujeme natvrdo, ať model nemůže vytvořit mrtvý
+  // soubor (viz voda-casovace.yaml, 2026-07-05; diakritika doplněna 2026-07-06).
+  fn = fn.normalize('NFD').replace(/[̀-ͯ]/g, '') // é→e, č→c…
+    .toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_.]/g, '_'); // rozsah výše = combining diacritics U+0300–U+036F
   return path.join(HA_CONFIG_PATH, 'packages', cat, fn.endsWith('.yaml') ? fn : fn + '.yaml');
 }
 function getDashboardPath(fn) {
@@ -502,6 +527,69 @@ function writeYamlFile(fp, content) {
     fs.writeFileSync(fp, content, 'utf8');
     return true;
   } catch (e) { console.error('Write error:', e.message); return false; }
+}
+
+// ═══════════════════════════════════════════════
+// OCHRANA ZÁPISŮ (fáze 0 auditu 2026-07-05) — validace před zápisem,
+// záloha před přepisem, undo, check_config po zápisu balíčku.
+// Bez tohohle Žán zapisoval YAML naslepo (slabina S1).
+// ═══════════════════════════════════════════════
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+
+// Poslední zápis (pro undo_last_change) — vědomě jen v RAM: undo je
+// záchrana "teď jsem to rozbil", ne archeologie. Historie je v backups/.
+let lastChange = null; // { file, backup, wasNew, when }
+
+function validateYamlSyntax(content) {
+  // null = OK, jinak text chyby pro model. js-yaml navíc sám chytá
+  // duplicitní klíče v jednom souboru (duplicated mapping key).
+  try { yaml.load(content); return null; }
+  catch (e) { return e.message; }
+}
+
+function backupFile(fp) {
+  // Kopie do /config/zan_data/backups/<soubor>.<timestamp>, drží se
+  // posledních 10 záloh na soubor. Vrací cestu k záloze, null když
+  // originál neexistuje (= nový soubor, zálohovat není co).
+  try {
+    if (!fs.existsSync(fp)) return null;
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const bp = path.join(BACKUP_DIR, `${path.basename(fp)}.${ts}`);
+    fs.copyFileSync(fp, bp);
+    const siblings = fs.readdirSync(BACKUP_DIR)
+      .filter(f => f.startsWith(path.basename(fp) + '.')).sort();
+    while (siblings.length > 10) {
+      try { fs.unlinkSync(path.join(BACKUP_DIR, siblings.shift())); } catch {}
+    }
+    return bp;
+  } catch (e) { console.warn('backupFile:', e.message); return null; }
+}
+
+function recordChange(fp, backupPath, wasNew) {
+  lastChange = { file: fp, backup: backupPath, wasNew, when: new Date().toISOString() };
+}
+
+function restoreLastChange() {
+  // Vrátí poslední zápis: nový soubor smaže, přepsaný obnoví ze zálohy.
+  if (!lastChange) return { error: 'Není co vracet — od startu add-onu žádný zaznamenaný zápis.' };
+  try {
+    const { file, backup, wasNew, when } = lastChange;
+    if (wasNew) { if (fs.existsSync(file)) fs.unlinkSync(file); }
+    else if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, file);
+    else return { error: 'Záloha se nenašla — obnov ručně z /config/zan_data/backups/.' };
+    lastChange = null;
+    return { success: true, restored: path.basename(file), was_new_file_deleted: wasNew, change_from: when };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function haCheckConfig() {
+  // POST /api/config/core/check_config — validuje CELOU konfiguraci HA
+  // (balíčky ano, lovelace dashboardy NE). Na N150 může trvat desítky
+  // sekund, proto vlastní volání s dlouhým timeoutem místo haPost (8 s).
+  const r = await axios.post(`${HA_URL}/api/config/core/check_config`, {},
+    { headers: haHeaders(), timeout: 90000 });
+  return r.data; // { result: 'valid'|'invalid', errors: string|null }
 }
 function listPackages() {
   const dir = path.join(HA_CONFIG_PATH, 'packages');
@@ -817,6 +905,7 @@ function buildTools(chatId) {
 NÁZEV SOUBORU = slug balíčku v HA: jen malá písmena a-z, číslice a podtržítka (snake_case). POMLČKA ZAKÁZÁNA — balíček s pomlčkou HA TIŠE nenačte (jen warning v logu, entity nevzniknou).
 Pro testovací účely přidej příponu _test k názvu souboru (např. zahrada_test.yaml).
 VŽDY nejdřív list_packages + read_package. Nikdy nezapisuj mimo packages/ nebo dashboards/.
+Zápis je jištěný: syntaxe se validuje předem (nevalidní YAML se nezapíše), starý obsah se zálohuje a po zápisu běží kontrola konfigurace HA (může trvat i minutu) — při chybě se změna sama vrátí. Vrátit poslední zápis umíš nástrojem undo_last_change.
 Po zápisu vždy popsat změny LIDSKY.`,
         input_schema: {
           type: 'object',
@@ -837,6 +926,11 @@ Po zápisu vždy popsat změny LIDSKY.`,
           properties: { filename: { type: 'string' }, content: { type: 'string' }, description: { type: 'string' } },
           required: ['filename', 'content', 'description'],
         },
+      },
+      {
+        name: 'undo_last_change',
+        description: 'Vrátí POSLEDNÍ zápis do configu (balíček, dashboard i smazání dashboardu): nový soubor smaže, přepsaný obnoví ze zálohy. Použij, když se změna nepovedla nebo si to uživatel rozmyslel. Po vrácení balíčku zavolej příslušný reload_ha. Starší zálohy: /config/zan_data/backups/.',
+        input_schema: { type: 'object', properties: {}, required: [] },
       },
       {
         name: 'read_error_log',
@@ -1616,10 +1710,40 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'write_package': {
+        // Fáze 0: 1) syntaxe se validuje PŘED zápisem, 2) starý obsah se
+        // zálohuje, 3) po zápisu běží HA check_config — invalid = automatický
+        // návrat zálohy. Nevalidní YAML se na disk nikdy nedostane.
+        const syntaxError = validateYamlSyntax(input.content);
+        if (syntaxError) {
+          logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'yaml-invalid');
+          return { error: `YAML není validní, nezapsáno. Oprav a zkus znovu:\n${syntaxError}` };
+        }
         const fp = getPackagePath(input.category, input.filename);
         const oldContent = readYamlFile(fp);
+        const backup = backupFile(fp);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: `Zápis selhal. Zkontroluj Samba připojení.` };
+        recordChange(fp, backup, !oldContent);
+
+        // check_config může na N150 trvat desítky sekund — řekni to uživateli,
+        // ať to nevypadá jako mlčení (poučení ze sendSafe éry).
+        sendSafe(chatId, '🧪 Zapsáno, ověřuju konfiguraci HA (může trvat i minutu)…');
+        let checkNote = '';
+        try {
+          const check = await haCheckConfig();
+          if (check && check.result === 'invalid') {
+            const restored = restoreLastChange();
+            logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'check_config-invalid-rollback');
+            return {
+              error: `HA check_config hlásí chybu — zápis jsem automaticky vrátil (${restored.success ? (restored.was_new_file_deleted ? 'nový soubor smazán' : 'obnovena záloha') : 'POZOR: návrat selhal, obnov ručně z backups/'}).\nChyby: ${String(check.errors || '').slice(0, 1500)}\nPokud chyba očividně nesouvisí s tímhle souborem, config byl rozbitý už před zápisem — řekni to uživateli.`,
+            };
+          }
+          checkNote = 'check_config: valid';
+        } catch (e) {
+          // check nedoběhl (timeout/síť) — zápis platí, ale bez ověření
+          checkNote = `check_config nedoběhl (${e.message}) — zápis platí, ale neověřený; po reloadu ověř entity o to pečlivěji`;
+        }
+
         memory.notes.push({ text: `Balíček ${input.category}/${input.filename}: ${input.description}`, date: new Date().toLocaleDateString('cs-CZ') });
         saveMemory(memory);
         logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'ok');
@@ -1629,6 +1753,8 @@ async function executeTool(name, input, chatId) {
           path: `packages/${input.category}/${input.filename}`,
           was_new: !oldContent,
           is_test: isTest,
+          check_config: checkNote,
+          undo_hint: 'Kdyby výsledek nebyl žádoucí, umíš ho vrátit nástrojem undo_last_change.',
           human_diff_hint: oldContent
             ? 'Soubor existoval — popiš uživateli CO KONKRÉTNĚ se změnilo, ne technické detaily'
             : `Nový soubor vytvořen${isTest ? ' (TESTOVACÍ — bez reálného HW)' : ''} — popiš co jsi vytvořil a proč to bude užitečné`,
@@ -1636,12 +1762,22 @@ async function executeTool(name, input, chatId) {
       }
 
       case 'write_dashboard': {
+        // Fáze 0: syntaxe + záloha. check_config lovelace nevaliduje,
+        // takže tady končíme u parsu — entity ověřuje validate_dashboard.
+        const syntaxError = validateYamlSyntax(input.content);
+        if (syntaxError) {
+          logAction(chatId, user.name, 'write_dashboard', input.filename, 'yaml-invalid');
+          return { error: `YAML není validní, nezapsáno. Oprav a zkus znovu:\n${syntaxError}` };
+        }
         const fp = getDashboardPath(input.filename);
+        const existed = fs.existsSync(fp);
+        const backup = backupFile(fp);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: 'Zápis dashboardu selhal.' };
+        recordChange(fp, backup, !existed);
         logAction(chatId, user.name, 'write_dashboard', input.filename, 'ok');
         const isTest = input.filename.search(/[-_]test/) >= 0;
-        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest };
+        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
       }
 
       case 'list_dashboards': {
@@ -1702,10 +1838,21 @@ async function executeTool(name, input, chatId) {
         const fp = getDashboardPath(input.filename);
         try {
           if (!fs.existsSync(fp)) return { error: `Dashboard ${input.filename} neexistuje` };
+          // Fáze 0: i smazání se zálohuje a jde vrátit přes undo_last_change
+          const backup = backupFile(fp);
           fs.unlinkSync(fp);
+          if (backup) lastChange = { file: fp, backup, wasNew: false, when: new Date().toISOString() };
           logAction(chatId, user.name, 'delete_dashboard', input.filename, 'ok');
-          return { success: true, message: `Dashboard ${input.filename} smazán` };
+          return { success: true, message: `Dashboard ${input.filename} smazán`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
         } catch (e) { return { error: e.message }; }
+      }
+
+      case 'undo_last_change': {
+        if (!isAdmin(chatId)) return { error: 'Undo vyžaduje admin přístup.' };
+        const res = restoreLastChange();
+        logAction(chatId, user.name, 'undo_last_change', res.restored || '-', res.error ? 'fail' : 'ok');
+        if (res.success) res.note = 'Po vrácení balíčku nezapomeň na příslušný reload_ha, ať se HA vrátí ke starému stavu i za běhu.';
+        return res;
       }
 
       case 'read_dashboard': {
@@ -2594,16 +2741,28 @@ async function handleMessage(msg) {
     const month = today.slice(0, 7);
     const empty = { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
     const d = u.days[today] || empty;
-    const m = Object.entries(u.days).filter(([k]) => k.startsWith(month))
+    const monthDays = Object.entries(u.days).filter(([k]) => k.startsWith(month));
+    const m = monthDays
       .reduce((a, [, v]) => ({ calls: a.calls + v.calls, input: a.input + v.input, output: a.output + v.output, cache_read: a.cache_read + v.cache_read, cache_write: a.cache_write + v.cache_write }), { ...empty });
-    const dUsd = usageCostUsd(d), mUsd = usageCostUsd(m);
+    const dUsd = usageCostUsd(d);
+    // Měsíc = součet dnů (den s rozpadem po modelech se počítá přesně,
+    // starší den cenou globálního modelu) — nesčítat tokeny napříč modely!
+    const mUsd = monthDays.reduce((s, [, v]) => s + usageCostUsd(v), 0);
+    // Rozpad dneška po modelech (od zavedení model trackingu)
+    const perModel = Object.entries(d.models || {})
+      .map(([mod, v]) => {
+        const [pi, po, pcr, pcw] = modelPricing(mod);
+        const usd = (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
+        return `• ${mod.replace('claude-', '')}: ${v.calls}× ≈ ${(usd * USD_CZK).toFixed(2)} Kč`;
+      }).join('\n');
     sendSafe(chatId,
-      `💰 *Spotřeba Žána* (model: ${MODEL})\n\n` +
+      `💰 *Spotřeba Žána* (výchozí model: ${MODEL})\n\n` +
       `*Dnes:* ${d.calls} volání\n` +
       `• input ${d.input.toLocaleString('cs-CZ')} | output ${d.output.toLocaleString('cs-CZ')}\n` +
       `• cache: čtení ${d.cache_read.toLocaleString('cs-CZ')} | zápis ${d.cache_write.toLocaleString('cs-CZ')}\n` +
-      `• ≈ $${dUsd.toFixed(3)} (${(dUsd * USD_CZK).toFixed(2)} Kč)\n\n` +
-      `*Tento měsíc:* ${m.calls} volání ≈ $${mUsd.toFixed(2)} (${(mUsd * USD_CZK).toFixed(0)} Kč)\n\n` +
+      `• ≈ $${dUsd.toFixed(3)} (${(dUsd * USD_CZK).toFixed(2)} Kč)\n` +
+      (perModel ? `${perModel}\n` : '') +
+      `\n*Tento měsíc:* ${m.calls} volání ≈ $${mUsd.toFixed(2)} (${(mUsd * USD_CZK).toFixed(0)} Kč)\n\n` +
       `_Sleduje se od v5.3.3 — starší spotřeba v console.anthropic.com_`,
       { parse_mode: 'Markdown' });
     return;
