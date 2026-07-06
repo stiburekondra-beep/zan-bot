@@ -3321,6 +3321,83 @@ async function runObchuzka() {
       lines.push('📷 Kamera v domě není napojená na Home Assistant — nevidím ji a nemůžu na ni dohlížet.');
     }
 
+    // ── DIAGNÓZA NA SERVIS MODELU + REAKTIVNÍ ZÁSAHY (fáze 2 auditu,
+    // slabina S12; reaktivní zásahy rovnou = rozhodnutí Ondry 2026-07-06,
+    // dům = lab). Mantinely VYNUCUJE KÓD, ne model:
+    //   - allowlist: JEN homeassistant.reload_config_entry, a JEN na
+    //     entity ze seznamu unavailable (členství ověřuje kód)
+    //   - max 2 stejné zásahy/den; po druhém už jen hlásí
+    //   - nic nevratného (žádné updaty, mazání, restarty — ty se jen ptají)
+    const hasFindings = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0;
+    if (hasFindings) {
+      try {
+        let errorExcerpt = '';
+        try {
+          const raw = await axios.get(`${HA_URL}/api/error_log`, { headers: haHeaders(), timeout: 15000 });
+          errorExcerpt = String(raw.data || '').split('\n').filter(l => /ERROR|WARNING/i.test(l)).slice(-40).join('\n');
+        } catch {}
+
+        const diagPrompt = `Jsi Žán, údržbář chytrého domu. Výsledky servisní obchůzky:
+NEDOSTUPNÉ ENTITY: ${JSON.stringify(unavailable.slice(0, 30).map(s => ({ id: s.entity_id, name: s.attributes.friendly_name || s.entity_id })))}
+ČEKAJÍCÍ UPDATY: ${JSON.stringify(updates)}
+SLABÉ BATERIE: ${JSON.stringify(lowBattery.map(s => ({ id: s.entity_id, pct: s.state })))}
+VÝŇATEK Z ERROR LOGU HA:
+${errorExcerpt.slice(0, 4000) || '(prázdný)'}
+
+Úkol: 1) urči pravděpodobné PŘÍČINY (skupiny entit stejné integrace = jedna příčina), 2) rozliš vážné od kosmetického, 3) navrhni zásahy.
+Jediný povolený zásah je reload integrace přes entitu (homeassistant.reload_config_entry) — dává smysl u zamrzlé integrace nebo síťového zařízení, NE u vybité baterie nebo fyzicky odpojeného zařízení. Max 3 zásahy.
+Vrať POUZE JSON bez komentářů: {"diagnoza":"stručně česky pro majitele — příčiny a co je vážné","zasahy":[{"entity_id":"...","duvod":"..."}]}`;
+
+        const diagResp = await claudeCreate({
+          model: MODEL_SERVIS, // ~12 volání/měsíc; rozhoduje o zásazích do živého domu
+          max_tokens: 900,
+          messages: [{ role: 'user', content: diagPrompt }],
+        });
+        const diagText = diagResp.content.find(b => b.type === 'text')?.text || '';
+        let diag = null;
+        try { diag = JSON.parse(diagText.replace(/^```(json)?|```$/gm, '').trim()); } catch {}
+
+        if (diag && diag.diagnoza) {
+          lines.push('');
+          lines.push(`🧠 *Diagnóza:* ${diag.diagnoza}`);
+        }
+
+        // Reaktivní zásahy s mantinely (vynucuje kód)
+        const unavailableIds = new Set(unavailable.map(s => s.entity_id));
+        u.interventions = u.interventions || {};
+        const dayKey = today;
+        u.interventions[dayKey] = u.interventions[dayKey] || {};
+        // drž jen posledních 14 dní
+        for (const k of Object.keys(u.interventions)) if (k < new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10)) delete u.interventions[k];
+
+        const proposed = Array.isArray(diag?.zasahy) ? diag.zasahy.slice(0, 3) : [];
+        for (const z of proposed) {
+          if (!z || !unavailableIds.has(z.entity_id)) continue; // mimo allowlist/seznam → ignoruj
+          const count = u.interventions[dayKey][z.entity_id] || 0;
+          if (count >= 2) {
+            lines.push(`🔧 ${z.entity_id}: dnes už jsem to zkoušel ${count}× — dál nezasahuju, chce to lidský pohled (${z.duvod})`);
+            continue;
+          }
+          u.interventions[dayKey][z.entity_id] = count + 1;
+          saveUdrzba(u);
+          try {
+            await haPost('services/homeassistant/reload_config_entry', { entity_id: z.entity_id });
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'reload_config_entry', z.entity_id, 'ok');
+            await new Promise(r => setTimeout(r, 10000)); // dej integraci čas naběhnout
+            let after = null;
+            try { after = await haGet(`states/${z.entity_id}`); } catch {}
+            const revived = after && after.state !== 'unavailable' && after.state !== 'unknown';
+            lines.push(`🔧 Obnovil jsem integraci ${z.entity_id} (${z.duvod}) → ${revived ? `✅ zase žije (${after.state})` : '⚠️ pořád nedostupná — nechávám na tobě'}`);
+          } catch (e) {
+            lines.push(`🔧 Pokus o obnovu ${z.entity_id} selhal: ${e.message}`);
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'reload_config_entry', z.entity_id, 'fail');
+          }
+        }
+      } catch (e) {
+        console.error('Diagnóza obchůzky selhala (posílám aspoň výčet):', e.message);
+      }
+    }
+
     // Žádost o rozhodnutí, ne jen informace — jen když je vůbec co řešit
     const needsDecision = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0 || cameras.length === 0;
     if (needsDecision) {
@@ -3343,13 +3420,79 @@ async function runObchuzka() {
       lines.push('Všechno vypadá v pořádku, nic ode mě teď nepotřebuješ.');
     }
 
-    await sendSafe(CHAT_ONDRA, lines.join('\n'), { parse_mode: 'Markdown' });
+    const reportText = lines.join('\n');
+    await sendSafe(CHAT_ONDRA, reportText, { parse_mode: 'Markdown' });
+
+    // Report patří i do konverzační historie — odpověď "1: ano" na
+    // číslovaná rozhodnutí musí mít kontext (stejný vzor jako u návyků).
+    if (!conversationHistory[CHAT_ONDRA]) conversationHistory[CHAT_ONDRA] = [];
+    conversationHistory[CHAT_ONDRA].push({ role: 'assistant', content: `[Poslal jsem report servisní obchůzky]\n${reportText}` });
+    persistConversations();
 
     u.last_run_date = today;
     saveUdrzba(u);
     console.log('✅ Servisní obchůzka odeslána');
   } catch (e) {
     console.error('Servisní obchůzka selhala:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════
+// TÝDENNÍ SEBEREFLEXE (fáze 2 auditu, sekce 4.3) — neděle 20:30, SERVIS
+// model projde poučení + logy týdne a NAVRHNE Ondrovi úpravy: které
+// lessons zobecnit/sloučit/smazat a co změnit v ústavě. Bot sám NIC
+// nemění — ústavu mění člověk commitem v zan-bot. Tím se učení uzavírá.
+// ═══════════════════════════════════════════════
+async function selfReflect() {
+  const u = loadUdrzba();
+  if (u.last_reflection && Date.now() - new Date(u.last_reflection).getTime() < 6 * 24 * 60 * 60 * 1000) return;
+  if (await isAiStopped()) { console.log('Sebereflexe: přeskočeno (AI vypnuté)'); return; }
+
+  try {
+    console.log('🪞 Spouštím týdenní sebereflexi...');
+    const lessons = loadLessons();
+    const actions = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8').split('\n').slice(-150).join('\n') : '';
+    let errors = '';
+    try {
+      const raw = await axios.get(`${HA_URL}/api/error_log`, { headers: haHeaders(), timeout: 15000 });
+      errors = String(raw.data || '').split('\n').filter(l => /ERROR|WARNING/i.test(l)).slice(-40).join('\n');
+    } catch {}
+
+    const prompt = `Jsi zkušený mentor AI asistenta Žána (správce chytrého domu). Projdi jeho týden a navrhni zlepšení. NIC neměníš sám — výstup čte Ondra (vývojář) a rozhodne.
+
+POUČENÍ Z CHYB (zan_lessons.json, ${lessons.length} ks):
+${JSON.stringify(lessons, null, 1).slice(0, 5000)}
+
+POSLEDNÍCH ~150 AKCÍ (úspěchy i faily):
+${actions.slice(0, 5000)}
+
+CHYBY Z HA LOGU:
+${errors.slice(0, 3000) || '(žádné)'}
+
+Vrať česky, stručně, ve 3 sekcích:
+1. ÚDRŽBA POUČENÍ — která sloučit/zobecnit/smazat (jsou zastaralá či duplicitní) a proč
+2. VZORY PROBLÉMŮ — co se týden opakovalo a stojí za systémové řešení
+3. NÁVRHY DO ÚSTAVY — max 3 konkrétní změny system promptu (co přidat/přeformulovat), každá s důvodem
+Když není co navrhnout, napiš to — nevymýšlej práci.`;
+
+    const response = await claudeCreate({
+      model: MODEL_SERVIS, // 1×/týden — evoluce ústavy má největší pákový efekt
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = response.content.find(b => b.type === 'text')?.text;
+    if (!text) return;
+
+    await sendSafe(CHAT_ONDRA, `🪞 *Týdenní sebereflexe Žána* (návrhy — nic jsem sám nezměnil):\n\n${text}`, { parse_mode: 'Markdown' });
+    if (!conversationHistory[CHAT_ONDRA]) conversationHistory[CHAT_ONDRA] = [];
+    conversationHistory[CHAT_ONDRA].push({ role: 'assistant', content: `[Poslal jsem týdenní sebereflexi s návrhy]\n${text}` });
+    persistConversations();
+
+    u.last_reflection = new Date().toISOString();
+    saveUdrzba(u);
+    console.log('✅ Sebereflexe odeslána');
+  } catch (e) {
+    console.error('Sebereflexe selhala:', e.message);
   }
 }
 
@@ -3547,6 +3690,14 @@ setInterval(() => {
   const now = new Date();
   if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
     analyzeHabits();
+  }
+}, 60 * 1000);
+
+// Neděle 20:30 → týdenní sebereflexe (po analýze návyků, SERVIS model)
+setInterval(() => {
+  const now = new Date();
+  if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
+    selfReflect();
   }
 }, 60 * 1000);
 
