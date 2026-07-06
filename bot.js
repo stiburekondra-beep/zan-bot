@@ -106,6 +106,35 @@ function updateRodinaSection(section, content) {
 // Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
 const MODEL             = process.env.ZAN_MODEL || 'claude-haiku-4-5';
 
+// ── MODEL ROUTING (audit 2026-07-05, sekce 5 — Ondrův návrh) ──
+// Správný model na správný typ práce:
+//   FAST   = dispečer a komorník: chat, ovládání, dotazy, zahrada, paměť
+//   SMART  = YAML inženýr: balíčky, dashboardy, onboarding, noční fronta
+//   SERVIS = údržbář a sebereflexe: běží ~12×/měsíc, rozhoduje o zásazích
+//            do živého domu a evoluci ústavy → nejvyšší model se vyplatí
+// MODEL (ZAN_MODEL) zůstává jako výchozí pro FAST kvůli zpětné kompatibilitě.
+const MODEL_FAST   = process.env.ZAN_MODEL_FAST   || MODEL;
+const MODEL_SMART  = process.env.ZAN_MODEL_SMART  || 'claude-sonnet-5';
+const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
+
+// Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
+// Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
+const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device'];
+
+function stripDiacritics(s) {
+  return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
+}
+
+function pickModelForMessage(text) {
+  // Vstupní heuristika (zdarma, stupeň 1 routingu): YAML/tvorba → rovnou
+  // SMART, jinak FAST. Case-insensitive a bez diakritiky — z mobilu se
+  // píše "balicek", "automatizace" i "Dashboard". Nemusí být dokonalá,
+  // zápis jistí eskalace v běhu (stupeň 2).
+  const t = stripDiacritics(String(text || '')).toLowerCase();
+  return /dashboard|balicek|balick|automatizac|automatik|yaml|onboarding|nastav dum|vytvor|predelej|prestav|uprav\s+\S*\s*(kart|panel)/.test(t)
+    ? MODEL_SMART : MODEL_FAST;
+}
+
 // Limity agentic smyčky — ochrana proti nekonečnému točení a obřím výsledkům
 const MAX_AGENT_ITERATIONS = 8;
 const MAX_TOOL_RESULT_CHARS = 12000;
@@ -2423,7 +2452,7 @@ REPORT (když uživatel napíše "report"): použij generate_report a napiš lid
 
 ZAHRADNÍ NÁSTROJE (používej aktivně): garden_map (zóny a mapa), garden_plant_profile (profil každé rostliny — výsadba, foto, poznámky), garden_planting_plan (historie a střídání plodin), garden_note (deník).`;
 
-async function processMessage(chatId, userMessage, imageBase64 = null) {
+async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}) {
   const user = getUser(chatId);
   const memory = loadMemory();
   logConvo('USER', chatId, user.name, imageBase64 ? `[fotka] ${userMessage}` : userMessage);
@@ -2477,19 +2506,39 @@ ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do p
   const messages = [...conversationHistory[chatId].slice(0, -1), { role: 'user', content: userContent }];
   const tools = buildTools(chatId);
 
+  // Model routing: fronta/servis si model vynutí (opts.forceModel),
+  // jinak rozhodne heuristika na zprávě. Eskalace v běhu viz níže.
+  let model = opts.forceModel || pickModelForMessage(userMessage);
+  let escalated = model !== MODEL_FAST;
+
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const response = await claudeCreate({
-      model: MODEL,
+      model,
       max_tokens: 4096,
       system: [
         // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
+        // (cache je per model — FAST a SMART si drží každý svou)
         { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: dynamicContext },
+        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` },
       ],
       tools,
       messages,
     });
+
+    // Eskalace (stupeň 2 routingu): FAST model sáhl po zapisovacím/tvořícím
+    // nástroji → JEDNOU restart smyčky na SMART. Rozpracovaný tool call se
+    // NEPROVÁDÍ a nepushuje — SMART si zápis rozmyslí znovu nad stejnou
+    // historií (dosavadní čtecí kroky v messages zůstávají a platí).
+    if (!escalated && response.stop_reason === 'tool_use') {
+      const wants = response.content.filter(b => b.type === 'tool_use' && SMART_ESCALATION_TOOLS.includes(b.name)).map(b => b.name);
+      if (wants.length > 0) {
+        escalated = true;
+        model = MODEL_SMART;
+        console.log(`⤴️ Eskalace na SMART (${model}) kvůli: ${wants.join(', ')}`);
+        continue;
+      }
+    }
 
     messages.push({ role: 'assistant', content: response.content });
 
@@ -2989,7 +3038,9 @@ Piš česky, přátelsky, jako Žán. Zpráva půjde do Telegramu.
 Formát: krátký úvod, pak 2-3 návrhy s otázkou "Mám to udělat? (ano/ne)"`;
 
     const response = await claudeCreate({
-      model: MODEL,
+      // Analýza návyků = SERVIS model (routing stupeň 3): běží 1×/týden
+      // a navrhuje automatizace do živého domu — kvalita > cena.
+      model: MODEL_SERVIS,
       max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }],
     });
@@ -3182,7 +3233,8 @@ async function processQueuedTasks() {
     : `Zpracuj úkol z fronty, noční zpracování, nikdo teď nekouká: "${task.description}"`;
 
   try {
-    const result = await processMessage(task.chat_id || CHAT_ONDRA, prompt);
+    // Noční fronta = velké/tvořící úkoly → vždy SMART model (routing stupeň 3)
+    const result = await processMessage(task.chat_id || CHAT_ONDRA, prompt, null, { forceModel: MODEL_SMART });
     const hitLimit = typeof result === 'string' && result.includes('Úloha byla moc dlouhá');
 
     const tt = loadTasks();
@@ -3453,6 +3505,7 @@ setTimeout(async () => {
 // Startup
 connectSamba();
 console.log('🏠 Žán v5 spuštěn');
+console.log(`🧭 Routing: FAST=${MODEL_FAST} | SMART=${MODEL_SMART} | SERVIS=${MODEL_SERVIS}`);
 console.log(`📱 Ondra: ${CHAT_ONDRA} | Jana: ${CHAT_JANA}`);
 console.log(`🏡 HA: ${HA_URL}`);
 console.log(`📁 Config: ${HA_CONFIG_PATH}`);
