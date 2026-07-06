@@ -66,6 +66,26 @@ function saveLessons(lessons) {
   try { fs.writeFileSync(LESSONS_FILE, JSON.stringify(lessons.slice(-50), null, 2), 'utf8'); } catch {}
 }
 
+// Lessons v2 (audit sekce 4.1): do kontextu jdou 3 nejnovější poučení
+// + všechna starší, jejichž topic se trefí do slov aktuální zprávy.
+// Dřívější "posledních 8" bylo slepé — poučení o kamerách se vytlačilo
+// dřív, než se příště hodilo.
+function relevantLessons(userMessage) {
+  const lessons = loadLessons();
+  if (lessons.length === 0) return [];
+  const t = stripDiacritics(String(userMessage || '')).toLowerCase();
+  const matchesTopic = (l) => {
+    const topic = stripDiacritics(String(l.topic || '')).toLowerCase();
+    if (!topic || topic === 'obecne') return false;
+    // "yaml-balicky" → ["yaml","balicky"]; hrubý stem = prvních 5 znaků
+    // (trefí "balicek" i "balicky", "dashboard" i "dashboardy")
+    return topic.split(/[-_\s]+/).some(w => w.length >= 3 && t.includes(w.slice(0, 5)));
+  };
+  const newest = lessons.slice(-3);
+  const matched = lessons.slice(0, -3).filter(matchesTopic).slice(-10);
+  return [...matched, ...newest];
+}
+
 // rodina.md — živý profil TÉHLE domácnosti (Žán #1: Stiburkovi).
 // Per-dům data, žijí mimo git sdíleného kódu (rozhodnuti.md 2026-07-05/06).
 // Plní se dotazníkem po jedné otázce (kickoff: /onboarding), čte se celý
@@ -177,7 +197,17 @@ function enqueueForChat(chatId, fn) {
 // ═══════════════════════════════════════════════
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+// Konverzace per chat — perzistentní na disku (fáze 1 auditu, slabina S7):
+// bez toho každý update/restart add-onu znamenal "o čem jsme to mluvili?".
+// Ukládají se jen texty (fotky se do historie stejně nedávají).
+const CONVO_STATE_FILE = path.join(DATA_DIR, 'zan_conversations.json');
 let conversationHistory = {}; // per chatId
+try {
+  if (fs.existsSync(CONVO_STATE_FILE)) conversationHistory = JSON.parse(fs.readFileSync(CONVO_STATE_FILE, 'utf8')) || {};
+} catch (e) { console.warn('Načtení konverzací selhalo (začínám s prázdnou):', e.message); }
+function persistConversations() {
+  try { fs.writeFileSync(CONVO_STATE_FILE, JSON.stringify(conversationHistory), 'utf8'); } catch (e) { console.warn('persistConversations:', e.message); }
+}
 
 // ═══════════════════════════════════════════════
 // BEZPEČNÉ ODESÍLÁNÍ DO TELEGRAMU
@@ -2462,7 +2492,7 @@ Místnosti: ${roomNames || 'žádné'}
 Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
-Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${loadLessons().slice(-8).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
+Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
 ${(() => { const r = ensureRodina(); return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)'; })()}
 ${isJana ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
@@ -2562,6 +2592,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     const finalText = textBlock ? textBlock.text : 'Hotovo.';
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
+    persistConversations(); // přežije restart/update add-onu
     logConvo('ŽÁN', chatId, user.name, finalText);
     return finalText;
   }
@@ -2760,6 +2791,7 @@ async function handleMessage(msg) {
 
   if (text === '/reset') {
     conversationHistory[chatId] = [];
+    persistConversations();
     sendSafe(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
     return;
   }
