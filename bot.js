@@ -92,8 +92,9 @@ function ensureRodina() {
 }
 function updateRodinaSection(section, content) {
   let c = ensureRodina();
-  // Nahraď blok sekce (od "## Sekce" po další "## " nebo konec souboru)
-  const re = new RegExp(`## ${section.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\n[\\s\\S]*?(?=\\n## |$)`);
+  // Nahraď blok sekce (od "## Sekce" po další "## " nebo konec souboru).
+  // Sekce jsou pevný enum (RODINA_SECTIONS) bez regex znaků — netřeba escapovat.
+  const re = new RegExp('## ' + section + '\\n[\\s\\S]*?(?=\\n## |$)');
   const block = `## ${section}\n\n${String(content).trim()}\n`;
   if (re.test(c)) c = c.replace(re, block);
   else c = c.trimEnd() + `\n\n${block}`;
@@ -2538,6 +2539,33 @@ async function handleMessage(msg) {
         { parse_mode: 'Markdown' }
       );
     }
+    return;
+  }
+
+  // Kickoff dotazníku — Žán se sám představí a položí první otázku.
+  // Jen admin (Ondra) rozhoduje, KDY se Žán ozve; Žán sám od sebe
+  // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí Jana).
+  if (text.startsWith('/onboarding') && isAdmin(chatId)) {
+    const target = (text.split(/\s+/)[1] || 'jana').toLowerCase();
+    const targetChat = target === 'jana' ? CHAT_JANA : (target === 'ondra' ? CHAT_ONDRA : null);
+    if (!targetChat) { sendSafe(chatId, '⚠️ Neznámý cíl. Použij: /onboarding jana'); return; }
+    ensureRodina();
+    const osloveni = target === 'jana' ? 'Jano' : 'Ondro';
+    const intro =
+      `👋 Ahoj ${osloveni}! Tady Žán, váš domácí sluha. 🏠\n\n` +
+      `Ondra mě požádal, abych se s tebou líp seznámil — ať se o vás můžu starat chytřeji ` +
+      `(topení podle toho, kdy jste doma, světla, zahrada… tu už spolu řešíme 🌱).\n\n` +
+      `Budu se občas na něco zeptat — vždycky jen jedna rychlá otázka, žádné formuláře. ` +
+      `A kdykoli řekneš „dost otázek", přestanu.\n\n` +
+      `Tak první: *jak vypadá váš běžný všední den?* Kdy vstáváte, kdy kdo odchází a vrací se? Stačí pár slov. 🙂`;
+    await sendSafe(targetChat, intro, { parse_mode: 'Markdown' });
+    // Zasej intro do historie cílového chatu — až člověk odpoví, model ví,
+    // na co navazuje (jinak by odpověď „vstáváme v 6" visela ve vzduchu)
+    if (!conversationHistory[targetChat]) conversationHistory[targetChat] = [];
+    conversationHistory[targetChat].push({ role: 'assistant', content: intro });
+    logConvo('ŽÁN', targetChat, getUser(targetChat).name, intro);
+    logAction(chatId, user.name, 'onboarding_kickoff', target, 'ok');
+    if (targetChat !== chatId) sendSafe(chatId, `✅ Představil jsem se ${target === 'jana' ? 'Janě' : target} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
     return;
   }
 
