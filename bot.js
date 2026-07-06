@@ -65,6 +65,41 @@ function saveLessons(lessons) {
   try { fs.writeFileSync(LESSONS_FILE, JSON.stringify(lessons.slice(-50), null, 2), 'utf8'); } catch {}
 }
 
+// rodina.md — živý profil TÉHLE domácnosti (Žán #1: Stiburkovi).
+// Per-dům data, žijí mimo git sdíleného kódu (rozhodnuti.md 2026-07-05/06).
+// Plní se dotazníkem po jedné otázce (kickoff: /onboarding), čte se celý
+// do dynamického kontextu — je to Žánův hlavní zdroj "jak tahle rodina žije".
+// Ručně editovatelný přes Sambu: /config/zan_data/rodina.md
+const RODINA_FILE = path.join(DATA_DIR, 'rodina.md');
+const RODINA_SECTIONS = ['Domácnost', 'Denní rytmus', 'Práce a návraty', 'Vytápění a teploty', 'Pravidla pro Žána', 'Poznámky'];
+function loadRodina() {
+  try { if (fs.existsSync(RODINA_FILE)) return fs.readFileSync(RODINA_FILE, 'utf8'); } catch {}
+  return null;
+}
+function saveRodina(content) {
+  try { fs.writeFileSync(RODINA_FILE, content, 'utf8'); return true; }
+  catch (e) { console.error('rodina.md save:', e.message); return false; }
+}
+function ensureRodina() {
+  let c = loadRodina();
+  if (c) return c;
+  c = '# Rodina — profil domácnosti\n\n' +
+    '> Plní Žán průběžně z rozhovorů (vždy jen jedna otázka, žádný formulář).\n' +
+    '> Ručně editovatelné přes Sambu: /config/zan_data/rodina.md\n\n' +
+    RODINA_SECTIONS.map(s => `## ${s}\n\n(zatím nevyplněno)\n`).join('\n');
+  saveRodina(c);
+  return c;
+}
+function updateRodinaSection(section, content) {
+  let c = ensureRodina();
+  // Nahraď blok sekce (od "## Sekce" po další "## " nebo konec souboru)
+  const re = new RegExp(`## ${section.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\n[\\s\\S]*?(?=\\n## |$)`);
+  const block = `## ${section}\n\n${String(content).trim()}\n`;
+  if (re.test(c)) c = c.replace(re, block);
+  else c = c.trimEnd() + `\n\n${block}`;
+  return saveRodina(c);
+}
+
 // Model: Haiku 4.5 pro běžný provoz (cca 3× levnější než Sonnet).
 // Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
 const MODEL             = process.env.ZAN_MODEL || 'claude-haiku-4-5';
@@ -742,6 +777,18 @@ function buildTools(chatId) {
           topic: { type: 'string' },
         },
         required: ['action'],
+      },
+    },
+    {
+      name: 'rodina_update',
+      description: `Zapíše/aktualizuje sekci v rodina.md — živém profilu domácnosti (dostáváš ho celý v kontextu). Sekce: ${RODINA_SECTIONS.join(', ')}. Obsah PŘEPISUJE celou sekci — piš vždy její kompletní nové znění (stávající text + doplněk). Ukládej sem odpovědi z dotazníku a trvalé poznatky o rodině hned, jak je zjistíš.`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          section: { type: 'string', enum: RODINA_SECTIONS },
+          content: { type: 'string', description: 'Kompletní nový obsah sekce (markdown, stručné odrážky)' },
+        },
+        required: ['section', 'content'],
       },
     },
   ];
@@ -1528,6 +1575,15 @@ async function executeTool(name, input, chatId) {
         return { success: true };
       }
 
+      case 'rodina_update': {
+        // Jana (user) smí — profil plní hlavně ona; hosté ne
+        if (user.role === 'guest') return { error: 'Profil domácnosti smí upravovat jen rodina.' };
+        const ok = updateRodinaSection(input.section, input.content);
+        if (!ok) return { error: 'Zápis rodina.md selhal (zkontroluj /config/zan_data).' };
+        logAction(chatId, user.name, 'rodina_update', input.section, 'ok');
+        return { success: true, note: `Sekce "${input.section}" uložena. Pokud zbývají nevyplněné sekce, můžeš se PŘÍŠTĚ zeptat na další — teď už se neptej.` };
+      }
+
       case 'list_packages': return { packages: listPackages(), categories: PACKAGE_CATEGORIES };
 
       case 'read_package': {
@@ -2192,6 +2248,12 @@ STRUKTURA KONFIGURACE (závazná konvence tohoto domu):
 
 UČENÍ Z CHYB: Když něco nefunguje (entita po zápisu neexistuje, služba selže) nebo tě uživatel opraví: 1) read_error_log (zdroj "ha", případně vlastní logy), 2) najdi skutečnou příčinu — nehádej, 3) oprav, 4) save_lesson s krátkým obecným poučením. Ponaučení dostáváš v každém kontextu — chybu, na kterou už máš poučení, NIKDY neopakuj.
 
+RODINA.MD (profil domácnosti — dostáváš ho v kontextu):
+- Je to tvůj hlavní zdroj, jak tahle rodina žije. Trvalé poznatky (rytmus dne, návraty z práce, teplotní komfort, pravidla, kdo co má rád) ukládej HNED přes rodina_update — vždy celou sekci znovu (stávající obsah + doplněk), stručné odrážky.
+- DOTAZNÍK: sekce "(zatím nevyplněno)" doplňuj postupně — MAX JEDNA krátká, konkrétní otázka, a to až NA KONCI jinak hotové odpovědi. Nikdy výslech, nikdy seznam otázek, nikdy neopakuj otázku, na kterou nechtěl uživatel odpovědět. Po odpovědi ulož (rodina_update) a v TÉHLE zprávě už se na nic dalšího neptej.
+- Když uživatel řekne "dost otázek" / je otrávený → přestaň úplně a zkus to za pár dní (checkin_schedule add_topic).
+- rodina.md je pro FAKTA o rodině a domácnosti. Paměť domu (remember) je pro zařízení/místnosti/technické věci — nemíchat.
+
 ROZLIŠENÍ REÁLNÉ vs. SIMULOVANÉ:
 - Helpery (simulace) = input_boolean, input_number, input_select, input_datetime, input_text, counter, timer
 - Reálné = sensor, binary_sensor, light, switch, climate, cover, media_player, fan
@@ -2244,6 +2306,8 @@ Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si v
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${loadLessons().slice(-8).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
+PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
+${(() => { const r = ensureRodina(); return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)'; })()}
 🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
 ${isJana ? 'Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.' : ''}`;
