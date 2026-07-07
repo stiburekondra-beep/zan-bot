@@ -31,6 +31,8 @@ const HA_SAMBA_USER     = process.env.HA_SAMBA_USER;
 const HA_SAMBA_PASS     = process.env.HA_SAMBA_PASS;
 const ANTHROPIC_KEY     = process.env.ANTHROPIC_API_KEY;
 const OPENAI_KEY        = process.env.OPENAI_API_KEY;
+const HARNESS_ENABLED   = /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ENABLED || ''));
+const HARNESS_CHAT_ID   = parseInt(process.env.ZAN_HARNESS_CHAT_ID || '', 10);
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
@@ -54,6 +56,9 @@ if (DATA_DIR !== __dirname) {
 const MEMORY_FILE       = path.join(DATA_DIR, 'home_memory.json');
 const LOG_FILE          = path.join(DATA_DIR, 'zan_actions.log');
 const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
+const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
+const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
+const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -2796,31 +2801,31 @@ bot.on('callback_query', async (q) => {
   } catch (e) { console.error('callback_query:', e.message); }
 });
 
-async function handleMessage(msg) {
+async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, action) => bot.sendChatAction(chatId, action)) {
   const chatId = msg.chat.id;
 
   // Security — neznámý chat
   if (!ALLOWED_CHATS.includes(chatId)) {
     logSecurity(chatId, 'unauthorized_access');
-    sendSafe(chatId, '⛔ Přístup odepřen.');
+    send(chatId, '⛔ Přístup odepřen.');
     return;
   }
 
   // Rate limiting
   if (!checkRateLimit(chatId)) {
-    sendSafe(chatId, '⏳ Příliš mnoho zpráv. Počkej chvíli.');
+    send(chatId, '⏳ Příliš mnoho zpráv. Počkej chvíli.');
     return;
   }
 
   // HA online check
   if (!(await isHaOnline()) && msg.text !== '/start' && msg.text !== '/pamet') {
-    sendSafe(chatId, '🔴 Home Assistant není dostupný. Akce nelze provést.');
+    send(chatId, '🔴 Home Assistant není dostupný. Akce nelze provést.');
     return;
   }
 
   // AI stop check
   if (msg.text !== '/start' && msg.text !== '/pamet' && await isAiStopped()) {
-    sendSafe(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
+    send(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
     return;
   }
 
@@ -2828,29 +2833,29 @@ async function handleMessage(msg) {
 
   // ── HLASOVÁ ZPRÁVA ──
   if (msg.voice) {
-    bot.sendChatAction(chatId, 'typing');
+    sendChatAction(chatId, 'typing');
     try {
       const fileId = msg.voice.file_id;
       const fileInfo = await bot.getFile(fileId);
       const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
       const audioResp = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
       const buffer = Buffer.from(audioResp.data);
-      sendSafe(chatId, '🎤 Přepisuji hlasovku...');
+      send(chatId, '🎤 Přepisuji hlasovku...');
       const text = await transcribeVoice(buffer, 'audio/ogg');
-      sendSafe(chatId, `📝 Rozuměl jsem: _"${text}"_`, { parse_mode: 'Markdown' });
+      send(chatId, `📝 Rozuměl jsem: _"${text}"_`, { parse_mode: 'Markdown' });
       logAction(chatId, user.name, 'voice_transcribed', '-', text.substring(0, 50));
       const response = await processMessage(chatId, text);
-      sendSafe(chatId, response, { parse_mode: 'Markdown' });
+      send(chatId, response, { parse_mode: 'Markdown' });
     } catch (e) {
       console.error('Voice error:', e.message);
-      sendSafe(chatId, '❌ Nepodařilo se zpracovat hlasovku: ' + e.message);
+      send(chatId, '❌ Nepodařilo se zpracovat hlasovku: ' + e.message);
     }
     return;
   }
 
   // ── FOTKA ──
   if (msg.photo) {
-    bot.sendChatAction(chatId, 'typing');
+    sendChatAction(chatId, 'typing');
     try {
       const photo = msg.photo[msg.photo.length - 1];
       const fileInfo = await bot.getFile(photo.file_id);
@@ -2883,24 +2888,24 @@ async function handleMessage(msg) {
         const localUrl = `/local/zan/${filename}`;
         logAction(chatId, user.name, 'image_saved', filename, 'ok');
         const saveMsg = `📸 Fotka uložena! Můžu ji použít v dashboardu jako:\n\`\`\`yaml\n- type: picture\n  image: "${localUrl}"\n\`\`\`\nURL: \`${localUrl}\``;
-        sendSafe(chatId, saveMsg, { parse_mode: 'Markdown' });
+        send(chatId, saveMsg, { parse_mode: 'Markdown' });
         const userCaption = caption || 'Fotka uložena pro dashboard.';
         const response = await processMessage(chatId, `${userCaption} (fotka uložena jako ${localUrl})`, base64);
-        sendSafe(chatId, response, { parse_mode: 'Markdown' });
+        send(chatId, response, { parse_mode: 'Markdown' });
       } else if (isGardenPhoto) {
-        sendSafe(chatId, '🌱 Koukám na fotku...');
+        send(chatId, '🌱 Koukám na fotku...');
         const garden = loadGarden();
         const memory = loadMemory();
         const analysis = await analyzeGardenPhoto(base64, caption, garden, memory);
-        sendSafe(chatId, analysis, { parse_mode: 'Markdown' });
+        send(chatId, analysis, { parse_mode: 'Markdown' });
       } else {
         const userCaption = caption || 'Co vidíš na této fotce? Jak to souvisí s domem?';
         const response = await processMessage(chatId, userCaption, base64);
-        sendSafe(chatId, response, { parse_mode: 'Markdown' });
+        send(chatId, response, { parse_mode: 'Markdown' });
       }
     } catch (e) {
       console.error('Photo error:', e.message);
-      sendSafe(chatId, '❌ Nepodařilo se zpracovat fotku: ' + e.message);
+      send(chatId, '❌ Nepodařilo se zpracovat fotku: ' + e.message);
     }
     return;
   }
@@ -2915,7 +2920,7 @@ async function handleMessage(msg) {
     const residentsKnown = Object.keys(memory.residents || {}).length > 0;
 
     if (!homeKnown || !residentsKnown) {
-      sendSafe(chatId,
+      send(chatId,
         `👋 Ahoj ${user.name}! Jsem *Žán* — váš věrný správce domu! 🏠\n\n` +
         'Jsem tu aby se o vás postaral. Ale nejdřív se musím trochu seznámit!\n\n' +
         '*Kdo jste a jak vypadá váš dům?*\n\n' +
@@ -2925,7 +2930,7 @@ async function handleMessage(msg) {
     } else {
       const residents = memory.residents || {};
       const names = Object.values(residents).map(r => r.name).join(' a ');
-      sendSafe(chatId,
+      send(chatId,
         `👋 Ahoj ${user.name}! Jsem zpět — správce domu ${memory.home_name}.\n\n` +
         `Pamatuji si ${names ? names : 'vás'}, ${Object.keys(memory.rooms).length} místností a ${Object.keys(memory.devices).length} zařízení.\n\n` +
         '*Co potřebuješ?* 😊\n\n' +
@@ -2942,7 +2947,7 @@ async function handleMessage(msg) {
   if (text.startsWith('/onboarding') && isAdmin(chatId)) {
     const target = (text.split(/\s+/)[1] || 'jana').toLowerCase();
     const targetChat = target === 'jana' ? CHAT_JANA : (target === 'ondra' ? CHAT_ONDRA : null);
-    if (!targetChat) { sendSafe(chatId, '⚠️ Neznámý cíl. Použij: /onboarding jana'); return; }
+    if (!targetChat) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding jana'); return; }
     ensureRodina();
     const osloveni = target === 'jana' ? 'Jano' : 'Ondro';
     const intro =
@@ -2952,14 +2957,14 @@ async function handleMessage(msg) {
       `Budu se občas na něco zeptat — vždycky jen jedna rychlá otázka, žádné formuláře. ` +
       `A kdykoli řekneš „dost otázek", přestanu.\n\n` +
       `Tak první: *jak vypadá váš běžný všední den?* Kdy vstáváte, kdy kdo odchází a vrací se? Stačí pár slov. 🙂`;
-    await sendSafe(targetChat, intro, { parse_mode: 'Markdown' });
+    await send(targetChat, intro, { parse_mode: 'Markdown' });
     // Zasej intro do historie cílového chatu — až člověk odpoví, model ví,
     // na co navazuje (jinak by odpověď „vstáváme v 6" visela ve vzduchu)
     if (!conversationHistory[targetChat]) conversationHistory[targetChat] = [];
     conversationHistory[targetChat].push({ role: 'assistant', content: intro });
     logConvo('ŽÁN', targetChat, getUser(targetChat).name, intro);
     logAction(chatId, user.name, 'onboarding_kickoff', target, 'ok');
-    if (targetChat !== chatId) sendSafe(chatId, `✅ Představil jsem se ${target === 'jana' ? 'Janě' : target} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
+    if (targetChat !== chatId) send(chatId, `✅ Představil jsem se ${target === 'jana' ? 'Janě' : target} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
     return;
   }
 
@@ -2972,14 +2977,14 @@ async function handleMessage(msg) {
     if (Object.keys(memory.devices).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
     if (memory.notes.length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
     if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
-    sendSafe(chatId, out, { parse_mode: 'Markdown' });
+    send(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/reset') {
     conversationHistory[chatId] = [];
     persistConversations();
-    sendSafe(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
+    send(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
     return;
   }
 
@@ -3003,7 +3008,7 @@ async function handleMessage(msg) {
         const usd = (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
         return `• ${mod.replace('claude-', '')}: ${v.calls}× ≈ ${(usd * USD_CZK).toFixed(2)} Kč`;
       }).join('\n');
-    sendSafe(chatId,
+    send(chatId,
       `💰 *Spotřeba Žána* (výchozí model: ${MODEL})\n\n` +
       `*Dnes:* ${d.calls} volání\n` +
       `• input ${d.input.toLocaleString('cs-CZ')} | output ${d.output.toLocaleString('cs-CZ')}\n` +
@@ -3023,14 +3028,14 @@ async function handleMessage(msg) {
         .filter(s => ['light', 'switch', 'climate', 'sensor'].some(d => s.entity_id.startsWith(d + '.')))
         .map(s => `${s.attributes.friendly_name || s.entity_id}: ${s.state}${s.attributes.unit_of_measurement || ''}`)
         .join('\n');
-      sendSafe(chatId, `📊 *Zařízení:*\n\n${relevant}`, { parse_mode: 'Markdown' });
-    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
+      send(chatId, `📊 *Zařízení:*\n\n${relevant}`, { parse_mode: 'Markdown' });
+    } catch (e) { send(chatId, '❌ ' + e.message); }
     return;
   }
 
   if (text === '/balicky') {
     const packages = listPackages();
-    if (Object.keys(packages).length === 0) { sendSafe(chatId, '📦 Zatím žádné balíčky.'); return; }
+    if (Object.keys(packages).length === 0) { send(chatId, '📦 Zatím žádné balíčky.'); return; }
     let out = '📦 *YAML balíčky:*\n\n';
     for (const [cat, files] of Object.entries(packages)) {
       const testFiles = files.filter(f => f.search(/[-_]test/) >= 0);
@@ -3039,32 +3044,32 @@ async function handleMessage(msg) {
       if (testFiles.length) out += `*${cat}/ (testovací)*\n${testFiles.map(f => `  🧪 ${f}`).join('\n')}\n`;
       out += '\n';
     }
-    sendSafe(chatId, out, { parse_mode: 'Markdown' });
+    send(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/dashboardy') {
     const dashDir = path.join(HA_CONFIG_PATH, 'dashboards');
     try {
-      if (!fs.existsSync(dashDir)) { sendSafe(chatId, '📊 Složka dashboards neexistuje.'); return; }
+      if (!fs.existsSync(dashDir)) { send(chatId, '📊 Složka dashboards neexistuje.'); return; }
       const files = fs.readdirSync(dashDir).filter(f => f.endsWith('.yaml'));
-      if (files.length === 0) { sendSafe(chatId, '📊 Zatím žádné dashboardy.'); return; }
+      if (files.length === 0) { send(chatId, '📊 Zatím žádné dashboardy.'); return; }
       const real = files.filter(f => !f.search(/[-_]test/) >= 0);
       const test = files.filter(f => f.search(/[-_]test/) >= 0);
       let out = '📊 *Dashboardy:*\n\n';
       if (real.length) out += `*Produkční:*\n${real.map(f => `• ${f}`).join('\n')}\n\n`;
       if (test.length) out += `*Testovací:*\n${test.map(f => `🧪 ${f}`).join('\n')}`;
-      sendSafe(chatId, out, { parse_mode: 'Markdown' });
-    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
+      send(chatId, out, { parse_mode: 'Markdown' });
+    } catch (e) { send(chatId, '❌ ' + e.message); }
     return;
   }
 
   if (text === '/zahrada') {
-    bot.sendChatAction(chatId, 'typing');
+    sendChatAction(chatId, 'typing');
     try {
       const advice = await generateGardenAdvice(chatId);
-      sendSafe(chatId, `🌱 *Zahradní brief:*\n\n${advice}`, { parse_mode: 'Markdown' });
-    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
+      send(chatId, `🌱 *Zahradní brief:*\n\n${advice}`, { parse_mode: 'Markdown' });
+    } catch (e) { send(chatId, '❌ ' + e.message); }
     return;
   }
 
@@ -3081,34 +3086,155 @@ async function handleMessage(msg) {
       out += `\n*Poslední návrhy:*\n`;
       habits.suggestions_sent.slice(-3).forEach(s => out += `• ${s.date}: ${s.suggestion.substring(0, 60)}...\n`);
     }
-    sendSafe(chatId, out, { parse_mode: 'Markdown' });
+    send(chatId, out, { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/analyza' && isAdmin(chatId)) {
-    sendSafe(chatId, '🧠 Spouštím analýzu návyků...');
+    send(chatId, '🧠 Spouštím analýzu návyků...');
     analyzeHabits();
     return;
   }
 
   if (text === '/log' && isAdmin(chatId)) {
     try {
-      if (!fs.existsSync(LOG_FILE)) { sendSafe(chatId, '📋 Log je prázdný.'); return; }
+      if (!fs.existsSync(LOG_FILE)) { send(chatId, '📋 Log je prázdný.'); return; }
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-20);
-      sendSafe(chatId, `📋 *Posledních 20 akcí:*\n\n\`\`\`\n${lines.join('\n')}\n\`\`\``, { parse_mode: 'Markdown' });
-    } catch (e) { sendSafe(chatId, '❌ ' + e.message); }
+      send(chatId, `📋 *Posledních 20 akcí:*\n\n\`\`\`\n${lines.join('\n')}\n\`\`\``, { parse_mode: 'Markdown' });
+    } catch (e) { send(chatId, '❌ ' + e.message); }
     return;
   }
 
-  bot.sendChatAction(chatId, 'typing');
+  sendChatAction(chatId, 'typing');
   try {
     const response = await processMessage(chatId, text);
-    sendSafe(chatId, response, { parse_mode: 'Markdown' });
+    send(chatId, response, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('Chyba:', error.message);
-    sendSafe(chatId, '❌ Chyba: ' + error.message);
+    send(chatId, '❌ Chyba: ' + error.message);
   }
 }
+
+// ═══════════════════════════════════════════════
+// TEST HARNESS — souborový inbox/outbox přes /config/zan_data/harness
+// Default OFF. Zapnutí vyžaduje ZAN_HARNESS_ENABLED=true a
+// ZAN_HARNESS_CHAT_ID, které je zároveň v běžném whitelistu.
+// Vstup:  /config/zan_data/harness/in/<id>.json  { "chat_id": 123, "text": "ahoj" }
+// Výstup: /config/zan_data/harness/out/<id>.out.json
+// ═══════════════════════════════════════════════
+function writeJsonAtomic(file, data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+async function processHarnessFile(inputFile) {
+  const startedAt = new Date().toISOString();
+  const base = path.basename(inputFile).replace(/\.json$/, '');
+  const processingFile = path.join(HARNESS_IN_DIR, `${base}.processing`);
+  const outFile = path.join(HARNESS_OUT_DIR, `${base}.out.json`);
+  const output = {
+    id: base,
+    status: 'error',
+    started_at: startedAt,
+    finished_at: null,
+    replies: [],
+  };
+
+  try {
+    fs.renameSync(inputFile, processingFile);
+  } catch {
+    return; // soubor mezitím vzal jiný běh nebo ho zapisovač ještě drží
+  }
+
+  try {
+    const request = JSON.parse(fs.readFileSync(processingFile, 'utf8'));
+    const chatId = Number(request.chat_id);
+    const text = typeof request.text === 'string' ? request.text : '';
+    output.chat_id = chatId;
+
+    if (chatId !== HARNESS_CHAT_ID) {
+      output.status = 'rejected';
+      output.error = `chat_id ${chatId || '(missing)'} není povolený harness chat`;
+      logSecurity(chatId || 0, 'harness_wrong_chat_id');
+      return;
+    }
+    if (!text.trim()) {
+      output.status = 'rejected';
+      output.error = 'Chybí text zprávy';
+      return;
+    }
+
+    const harnessSend = async (replyChatId, replyText, extra = {}) => {
+      output.replies.push({
+        chat_id: replyChatId,
+        text: String(replyText ?? ''),
+        extra,
+        ts: new Date().toISOString(),
+      });
+    };
+    const harnessAction = async (replyChatId, action) => {
+      output.replies.push({
+        chat_id: replyChatId,
+        action,
+        ts: new Date().toISOString(),
+      });
+    };
+
+    await enqueueForChat(chatId, () => handleMessage({
+      chat: { id: chatId },
+      from: { id: chatId, is_bot: false, first_name: 'Harness' },
+      text,
+      date: Math.floor(Date.now() / 1000),
+    }, harnessSend, harnessAction));
+
+    output.status = 'ok';
+    output.text = output.replies
+      .filter(r => r.text)
+      .map(r => r.text)
+      .join('\n\n');
+  } catch (e) {
+    output.status = 'error';
+    output.error = e.message;
+    console.error('Harness error:', e.message);
+  } finally {
+    output.finished_at = new Date().toISOString();
+    try { writeJsonAtomic(outFile, output); } catch (e) { console.error('Harness output write:', e.message); }
+    try { fs.unlinkSync(processingFile); } catch {}
+  }
+}
+
+function startHarnessInbox() {
+  if (!HARNESS_ENABLED) return;
+
+  if (!Number.isInteger(HARNESS_CHAT_ID) || !ALLOWED_CHATS.includes(HARNESS_CHAT_ID)) {
+    console.warn('Harness vypnut: ZAN_HARNESS_CHAT_ID musí být nastavený a být v ALLOWED_CHATS/EXTRA_CHAT_IDS.');
+    return;
+  }
+
+  fs.mkdirSync(HARNESS_IN_DIR, { recursive: true });
+  fs.mkdirSync(HARNESS_OUT_DIR, { recursive: true });
+  console.log(`Harness zapnut: ${HARNESS_IN_DIR} -> ${HARNESS_OUT_DIR}, chat_id=${HARNESS_CHAT_ID}`);
+
+  let running = false;
+  setInterval(async () => {
+    if (running) return;
+    running = true;
+    try {
+      const files = fs.readdirSync(HARNESS_IN_DIR)
+        .filter(f => f.endsWith('.json'))
+        .sort()
+        .map(f => path.join(HARNESS_IN_DIR, f));
+      for (const file of files) await processHarnessFile(file);
+    } catch (e) {
+      console.error('Harness poll:', e.message);
+    } finally {
+      running = false;
+    }
+  }, 1000);
+}
+
+startHarnessInbox();
 
 bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 
