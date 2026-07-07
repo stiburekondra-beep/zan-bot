@@ -474,6 +474,72 @@ function getLanSubnet() {
   return null;
 }
 
+function normalizeMac(mac) {
+  return String(mac || '').trim().toUpperCase();
+}
+
+function parseNmapScanHosts(output) {
+  const hosts = [];
+  let current = null;
+  const flush = () => {
+    if (current) hosts.push(current);
+    current = null;
+  };
+
+  for (const line of String(output || '').split('\n')) {
+    const report = line.match(/^Nmap scan report for (?:(\S+) )?\(?(\d{1,3}(?:\.\d{1,3}){3})\)?$/);
+    if (report) {
+      flush();
+      current = {
+        ip: report[2],
+        hostname: report[1] && report[1] !== report[2] ? report[1] : null,
+        mac: null,
+        vendor: null,
+        mac_source: null,
+      };
+      continue;
+    }
+
+    if (!current) continue;
+    const macLine = line.match(/MAC Address:\s+([0-9A-Fa-f:]{17})(?:\s+\(([^)]+)\))?/);
+    if (macLine) {
+      current.mac = normalizeMac(macLine[1]);
+      current.vendor = macLine[2] || null;
+      current.mac_source = 'nmap';
+    }
+  }
+
+  flush();
+  return hosts;
+}
+
+function parseIpNeighborMacs(output) {
+  const macs = new Map();
+  for (const line of String(output || '').split('\n')) {
+    const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3})\s+.*\blladdr\s+([0-9A-Fa-f:]{17})\b/);
+    if (m) macs.set(m[1], normalizeMac(m[2]));
+  }
+  return macs;
+}
+
+function readNeighborMacs() {
+  try {
+    return parseIpNeighborMacs(execSync('ip neigh show', { timeout: 5000 }).toString());
+  } catch {
+    return new Map();
+  }
+}
+
+function enrichHostsWithNeighborMacs(hosts, neighborMacs) {
+  for (const host of hosts) {
+    if (!host.mac && neighborMacs.has(host.ip)) {
+      host.mac = neighborMacs.get(host.ip);
+      host.mac_source = 'ip_neigh';
+    }
+  }
+  return hosts;
+}
+
 // ═══════════════════════════════════════════════
 // SAMBA
 // ═══════════════════════════════════════════════
@@ -2112,21 +2178,20 @@ async function executeTool(name, input, chatId) {
           if (!subnet) return { error: 'Nepodařilo se zjistit domácí síť (LAN rozhraní nenalezeno) — zkontroluj host_network v config.yaml add-onu.' };
 
           const output = execSync(`nmap -sn ${subnet}`, { timeout: 45000 }).toString();
-          const lines = output.split('\n');
-          const hosts = [];
-          for (let i = 0; i < lines.length; i++) {
-            const m = lines[i].match(/Nmap scan report for (?:(\S+) )?\(?([\d.]+)\)?/);
-            if (m) {
-              const host = { ip: m[2], hostname: m[1] && m[1] !== m[2] ? m[1] : null, mac: null, vendor: null };
-              const macLine = lines[i + 1] ? lines[i + 1].match(/MAC Address: ([0-9A-Fa-f:]+) \(([^)]+)\)/) : null;
-              if (macLine) { host.mac = macLine[1]; host.vendor = macLine[2]; }
-              hosts.push(host);
-            }
-          }
+          const hosts = enrichHostsWithNeighborMacs(parseNmapScanHosts(output), readNeighborMacs());
           const withMac = hosts.filter(h => h.mac).length;
-          console.log(`🔍 scan_network: subnet=${subnet} hosts=${hosts.length} s_MAC=${withMac} (0 = chybí NET_RAW/root, ARP fallback nefunguje)`);
+          const fromNmap = hosts.filter(h => h.mac_source === 'nmap').length;
+          const fromNeighbor = hosts.filter(h => h.mac_source === 'ip_neigh').length;
+          console.log(`🔍 scan_network: subnet=${subnet} hosts=${hosts.length} s_MAC=${withMac} (nmap=${fromNmap}, ip_neigh=${fromNeighbor})`);
           logAction(chatId, user.name, 'scan_network', subnet, `${hosts.length} zařízení, ${withMac} s MAC`);
-          return { subnet, count: hosts.length, hosts };
+          return {
+            subnet,
+            count: hosts.length,
+            mac_count: withMac,
+            mac_sources: { nmap: fromNmap, ip_neigh: fromNeighbor },
+            hosts,
+            note: withMac === 0 ? 'MAC adresy se nepodařilo zjistit ani z nmap výstupu, ani z ip neigh. V add-on sandboxu pravděpodobně chybí efektivní ARP/CAP_NET_RAW i přes config.yaml.' : undefined,
+          };
         } catch (e) {
           return { error: `Sken sítě selhal: ${e.message}` };
         }
