@@ -27,6 +27,8 @@ options:
   ANTHROPIC_API_KEY: ""
   OPENAI_API_KEY: ""
   PLANTID_API_KEY: ""
+  ZAN_HARNESS_ENABLED: false
+  ZAN_HARNESS_CHAT_ID: 0
 schema:
   TELEGRAM_TOKEN: str
   CHAT_ID_ONDRA: str
@@ -35,3 +37,5 @@ schema:
   ANTHROPIC_API_KEY: str
   OPENAI_API_KEY: str
   PLANTID_API_KEY: str?
+  ZAN_HARNESS_ENABLED: bool?
+  ZAN_HARNESS_CHAT_ID: int?
