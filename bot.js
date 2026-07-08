@@ -189,6 +189,15 @@ function pickModelForMessage(text) {
 // Limity agentic smyčky — ochrana proti nekonečnému točení a obřím výsledkům
 const MAX_AGENT_ITERATIONS = 8;
 const MAX_TOOL_RESULT_CHARS = 12000;
+const FAST_MAX_TOKENS = 900;
+const SMART_MAX_TOKENS = 4096;
+const SERVIS_MAX_TOKENS = 2200;
+
+function maxTokensForModel(model) {
+  if (model === MODEL_FAST) return FAST_MAX_TOKENS;
+  if (model === MODEL_SERVIS) return SERVIS_MAX_TOKENS;
+  return SMART_MAX_TOKENS;
+}
 
 // ═══════════════════════════════════════════════
 // SECURITY — whitelist domén a zakázané entity
@@ -2515,6 +2524,12 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - HA offline → oznam to, nic nepředstírej.
 - Nevíš/nejde to → řekni to rovnou a navrhni další krok. Mlžení je horší než přiznaná nejistota.
 
+═══ 1b. STYL ODPOVĚDI (výchozí pro rodinu) ═══
+- Běžná odpověď má max 3–4 krátké věty. Piš jednoduše jako člověku v kuchyni, ne jako návod v dokumentaci.
+- Nepoužívej seznamy, nadpisy ani tabulky, pokud o ně uživatel výslovně nepožádá nebo nejde o report, inventuru zařízení, rozpočet, potvrzení citlivé akce či YAML/admin výstup.
+- Emoji nejvýš jedno a jen když přirozeně pomůže tónu. Nedávej emoji na každý řádek.
+- Když je téma velké, dej krátké jádro odpovědi a nabídni pokračování. Neposílej vše najednou.
+
 ═══ 2. JAK PRACUJEŠ ═══
 - Fakta o domě zjišťuj nástroji (get_states, scan_all_devices, list_packages, read_package), ne dotazem na uživatele a ne pamětí z tréninku. Uživatel zná dům, ty znáš YAML — nikdy se ho neptej, kde co je v souborech.
 - Před akcí přemýšlej: CO chce člověk dosáhnout → JAK to v HA postavit → teprve pak nástroje. U větších návrhů řekni záměr jednou větou, než začneš.
@@ -2686,7 +2701,8 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const response = await claudeCreate({
       model,
-      max_tokens: 4096,
+      max_tokens: maxTokensForModel(model),
+      temperature: model === MODEL_FAST ? 0.35 : 0.5,
       system: [
         // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
         // (cache je per model — FAST a SMART si drží každý svou)
