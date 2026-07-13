@@ -1,6 +1,6 @@
 name: "Žán Bot"
 description: "AI správce domu Žán — Telegram bot pro Home Assistant"
-version: "5.7.0"
+version: "5.7.1"
 slug: "zan_bot"
 init: false
 arch:
@@ -39,3 +39,4 @@ schema:
   PLANTID_API_KEY: str?
   ZAN_HARNESS_ENABLED: bool?
   ZAN_HARNESS_CHAT_ID: int?
+
