@@ -33,11 +33,16 @@ const ANTHROPIC_KEY     = process.env.ANTHROPIC_API_KEY;
 const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 const HARNESS_ENABLED   = /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ENABLED || ''));
 const HARNESS_CHAT_ID   = parseInt(process.env.ZAN_HARNESS_CHAT_ID || '', 10);
+const HARNESS_ONLY      = HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ONLY || ''));
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
 // (config.yaml: map config:rw) → data přežijí updaty a jsou vidět přes Sambu.
 const DATA_DIR = (() => {
+  if (process.env.ZAN_DATA_DIR) {
+    fs.mkdirSync(process.env.ZAN_DATA_DIR, { recursive: true });
+    return process.env.ZAN_DATA_DIR;
+  }
   try { fs.mkdirSync('/config/zan_data', { recursive: true }); return '/config/zan_data'; }
   catch { return __dirname; } // fallback pro vývoj mimo add-on
 })();
@@ -251,7 +256,7 @@ function enqueueForChat(chatId, fn) {
 // ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: !HARNESS_ONLY });
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // Konverzace per chat — perzistentní na disku (fáze 1 auditu, slabina S7):
 // bez toho každý update/restart add-onu znamenal "o čem jsme to mluvili?".
@@ -3968,122 +3973,124 @@ async function createFamilyDashboard() {
 // ═══════════════════════════════════════════════
 // ČASOVAČE
 // ═══════════════════════════════════════════════
-// Polluj stavy každých 5 minut
-setInterval(pollStates, 5 * 60 * 1000);
+if (!HARNESS_ONLY) {
+  // Polluj stavy každých 5 minut
+  setInterval(pollStates, 5 * 60 * 1000);
 
-// Každou hodinu zkontroluj jestli je neděle 20:00 → analýza návyků
-setInterval(() => {
-  const now = new Date();
-  if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
-    analyzeHabits();
-  }
-}, 60 * 1000);
-
-// Neděle 20:30 → týdenní sebereflexe (po analýze návyků, SERVIS model)
-setInterval(() => {
-  const now = new Date();
-  if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
-    selfReflect();
-  }
-}, 60 * 1000);
-
-// Fronta velkých úkolů (queue_task) — jednou denně ve 2:30, jeden úkol
-// za noc. Mimo kolizi s měsíčním restartem (~02:05) a obchůzkou (18:00).
-setInterval(() => {
-  const now = new Date();
-  if (now.getHours() === 2 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
-    processQueuedTasks();
-  }
-}, 60 * 1000);
-
-// Servisní obchůzka — středa (3) a sobota (6) v 18:00, s ranním ohlášením
-// v 7:00 téhož dne. getDay(): 0=ne, 1=po, 2=út, 3=st, 4=čt, 5=pá, 6=so.
-setInterval(() => {
-  const now = new Date();
-  const isObchuzkaDen = now.getDay() === 3 || now.getDay() === 6;
-  if (isObchuzkaDen && now.getHours() === 7 && now.getMinutes() < 5) {
-    announceObchuzka();
-  }
-  if (isObchuzkaDen && now.getHours() === 18 && now.getMinutes() < 5) {
-    runObchuzka();
-  }
-}, 60 * 1000);
-
-// Startup — načti aktuální stavy jako baseline + vytvoř rodinný dashboard + sync kontextu
-setTimeout(async () => {
-  // 1. Načti HA stavy jako baseline pro sledování návyků
-  let states = [];
-  try {
-    states = await haGet('states');
-    for (const s of states) {
-      const domain = s.entity_id.split('.')[0];
-      if (HABIT_DOMAINS.includes(domain)) lastStates[s.entity_id] = s.state;
+  // Každou hodinu zkontroluj jestli je neděle 20:00 → analýza návyků
+  setInterval(() => {
+    const now = new Date();
+    if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() < 5) {
+      analyzeHabits();
     }
-    console.log(`📊 Baseline načten: ${Object.keys(lastStates).length} sledovaných entit`);
-  } catch (e) { console.warn('⚠️ Baseline load selhal:', e.message); }
+  }, 60 * 1000);
 
-  // 2. Sync místností z HA area registry → memory.rooms
-  try {
-    const areas = await haRegistry('area_registry');
-    console.log(`🏠 Area registry raw:`, JSON.stringify(areas)?.substring(0, 200));
-    if (Array.isArray(areas) && areas.length > 0) {
-      const memory = loadMemory();
-      let changed = false;
-      for (const area of areas) {
-        const key = area.area_id;
-        if (!memory.rooms[key]) {
-          memory.rooms[key] = { name: area.name, area_id: area.area_id };
-          changed = true;
-        } else if (memory.rooms[key].name !== area.name) {
-          memory.rooms[key].name = area.name;
-          changed = true;
+  // Neděle 20:30 → týdenní sebereflexe (po analýze návyků, SERVIS model)
+  setInterval(() => {
+    const now = new Date();
+    if (now.getDay() === 0 && now.getHours() === 20 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
+      selfReflect();
+    }
+  }, 60 * 1000);
+
+  // Fronta velkých úkolů (queue_task) — jednou denně ve 2:30, jeden úkol
+  // za noc. Mimo kolizi s měsíčním restartem (~02:05) a obchůzkou (18:00).
+  setInterval(() => {
+    const now = new Date();
+    if (now.getHours() === 2 && now.getMinutes() >= 30 && now.getMinutes() < 35) {
+      processQueuedTasks();
+    }
+  }, 60 * 1000);
+
+  // Servisní obchůzka — středa (3) a sobota (6) v 18:00, s ranním ohlášením
+  // v 7:00 téhož dne. getDay(): 0=ne, 1=po, 2=út, 3=st, 4=čt, 5=pá, 6=so.
+  setInterval(() => {
+    const now = new Date();
+    const isObchuzkaDen = now.getDay() === 3 || now.getDay() === 6;
+    if (isObchuzkaDen && now.getHours() === 7 && now.getMinutes() < 5) {
+      announceObchuzka();
+    }
+    if (isObchuzkaDen && now.getHours() === 18 && now.getMinutes() < 5) {
+      runObchuzka();
+    }
+  }, 60 * 1000);
+
+  // Startup — načti aktuální stavy jako baseline + vytvoř rodinný dashboard + sync kontextu
+  setTimeout(async () => {
+    // 1. Načti HA stavy jako baseline pro sledování návyků
+    let states = [];
+    try {
+      states = await haGet('states');
+      for (const s of states) {
+        const domain = s.entity_id.split('.')[0];
+        if (HABIT_DOMAINS.includes(domain)) lastStates[s.entity_id] = s.state;
+      }
+      console.log(`📊 Baseline načten: ${Object.keys(lastStates).length} sledovaných entit`);
+    } catch (e) { console.warn('⚠️ Baseline load selhal:', e.message); }
+
+    // 2. Sync místností z HA area registry → memory.rooms
+    try {
+      const areas = await haRegistry('area_registry');
+      console.log(`🏠 Area registry raw:`, JSON.stringify(areas)?.substring(0, 200));
+      if (Array.isArray(areas) && areas.length > 0) {
+        const memory = loadMemory();
+        let changed = false;
+        for (const area of areas) {
+          const key = area.area_id;
+          if (!memory.rooms[key]) {
+            memory.rooms[key] = { name: area.name, area_id: area.area_id };
+            changed = true;
+          } else if (memory.rooms[key].name !== area.name) {
+            memory.rooms[key].name = area.name;
+            changed = true;
+          }
+        }
+        if (changed) {
+          saveMemory(memory);
+          console.log(`🏠 Místnosti sync: ${areas.map(a => a.name).join(', ')}`);
         }
       }
-      if (changed) {
+    } catch (e) { console.warn('⚠️ Area sync selhal:', e.message); }
+
+    // 3. Sync zařízení ze stavů → memory.devices (jen pokud je devices prázdné)
+    try {
+      const memory = loadMemory();
+      if (states.length > 0 && Object.keys(memory.devices || {}).length === 0) {
+        const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather', 'automation', 'script', 'scene', 'timer', 'counter'];
+        const interestingDomains = ['light', 'switch', 'sensor', 'binary_sensor', 'climate', 'cover', 'media_player', 'fan', 'input_boolean', 'input_number'];
+        const interesting = states.filter(s => interestingDomains.some(d => s.entity_id.startsWith(d + '.')));
+        for (const s of interesting.slice(0, 100)) {
+          const name = s.attributes.friendly_name || s.entity_id;
+          memory.devices[s.entity_id] = { name, entity_id: s.entity_id, domain: s.entity_id.split('.')[0], state: s.state };
+        }
         saveMemory(memory);
-        console.log(`🏠 Místnosti sync: ${areas.map(a => a.name).join(', ')}`);
+        console.log(`🔌 Zařízení sync: ${interesting.length} entit načteno do paměti`);
       }
-    }
-  } catch (e) { console.warn('⚠️ Area sync selhal:', e.message); }
+    } catch (e) { console.warn('⚠️ Devices sync selhal:', e.message); }
 
-  // 3. Sync zařízení ze stavů → memory.devices (jen pokud je devices prázdné)
-  try {
-    const memory = loadMemory();
-    if (states.length > 0 && Object.keys(memory.devices || {}).length === 0) {
-      const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather', 'automation', 'script', 'scene', 'timer', 'counter'];
-      const interestingDomains = ['light', 'switch', 'sensor', 'binary_sensor', 'climate', 'cover', 'media_player', 'fan', 'input_boolean', 'input_number'];
-      const interesting = states.filter(s => interestingDomains.some(d => s.entity_id.startsWith(d + '.')));
-      for (const s of interesting.slice(0, 100)) {
-        const name = s.attributes.friendly_name || s.entity_id;
-        memory.devices[s.entity_id] = { name, entity_id: s.entity_id, domain: s.entity_id.split('.')[0], state: s.state };
+    // 4. Aktualizuj known_entities
+    try {
+      const memory = loadMemory();
+      const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification'];
+      const all = states.filter(s => !skipDomains.some(d => s.entity_id.startsWith(d + '.'))).map(s => s.entity_id);
+      if (all.length > 0) {
+        const prev = memory.known_entities || [];
+        const newOnes = all.filter(e => !prev.includes(e));
+        memory.known_entities = all;
+        saveMemory(memory);
+        if (newOnes.length > 0) console.log(`🔍 ${newOnes.length} nových entit od posledního startu`);
       }
-      saveMemory(memory);
-      console.log(`🔌 Zařízení sync: ${interesting.length} entit načteno do paměti`);
-    }
-  } catch (e) { console.warn('⚠️ Devices sync selhal:', e.message); }
+    } catch (e) { console.warn('⚠️ Known entities sync selhal:', e.message); }
 
-  // 4. Aktualizuj known_entities
-  try {
-    const memory = loadMemory();
-    const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification'];
-    const all = states.filter(s => !skipDomains.some(d => s.entity_id.startsWith(d + '.'))).map(s => s.entity_id);
-    if (all.length > 0) {
-      const prev = memory.known_entities || [];
-      const newOnes = all.filter(e => !prev.includes(e));
-      memory.known_entities = all;
-      saveMemory(memory);
-      if (newOnes.length > 0) console.log(`🔍 ${newOnes.length} nových entit od posledního startu`);
-    }
-  } catch (e) { console.warn('⚠️ Known entities sync selhal:', e.message); }
+    await createFamilyDashboard();
+  }, 5000);
 
-  await createFamilyDashboard();
-}, 5000);
-
-// Startup
-connectSamba();
+  // Startup
+  connectSamba();
+}
 console.log('🏠 Žán v5 spuštěn');
 console.log(`🧭 Routing: FAST=${MODEL_FAST} | SMART=${MODEL_SMART} | SERVIS=${MODEL_SERVIS}`);
 console.log(`📱 Ondra: ${CHAT_ONDRA} | Jana: ${CHAT_JANA}`);
 console.log(`🏡 HA: ${HA_URL}`);
 console.log(`📁 Config: ${HA_CONFIG_PATH}`);
-console.log('🧠 Sledování návyků aktivní — analýza každou neděli v 20:00');
+console.log(HARNESS_ONLY ? '🧪 Harness-only režim: Telegram polling a pozadí vypnuté' : '🧠 Sledování návyků aktivní — analýza každou neděli v 20:00');
