@@ -5,7 +5,8 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "test:prompt-contract": "node scripts/check-prompt-contract.js"
+    "test:prompt-contract": "node scripts/check-prompt-contract.js",
+    "test:polling-watchdog": "node scripts/check-polling-watchdog.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

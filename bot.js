@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
+const { createPollingWatchdog } = require('./polling-watchdog');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -34,6 +35,9 @@ const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 const HARNESS_ENABLED   = /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ENABLED || ''));
 const HARNESS_CHAT_ID   = parseInt(process.env.ZAN_HARNESS_CHAT_ID || '', 10);
 const HARNESS_ONLY      = HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ONLY || ''));
+const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STALE_MS || String(10 * 60 * 1000), 10);
+const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
+const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
@@ -3258,6 +3262,22 @@ function startHarnessInbox() {
 startHarnessInbox();
 
 bot.on('polling_error', (e) => console.error('Polling error:', e.message));
+
+if (!HARNESS_ONLY) {
+  createPollingWatchdog(bot, {
+    staleMs: POLLING_WATCHDOG_STALE_MS,
+    checkEveryMs: POLLING_WATCHDOG_CHECK_MS,
+    restartCooldownMs: POLLING_WATCHDOG_COOLDOWN_MS,
+    logger: console,
+    alert: async (e, state) => {
+      if (!Number.isInteger(CHAT_ONDRA)) return;
+      await sendSafe(
+        CHAT_ONDRA,
+        `⚠️ Žán neslyší Telegram a nepodařilo se mi obnovit příjem (${state.consecutiveRestartFailures}×). Poslední úspěšný příjem: ${new Date(state.lastSuccessfulGetUpdatesAt).toISOString()}. Chyba: ${e.message}`
+      );
+    }
+  }).start();
+}
 
 // ═══════════════════════════════════════════════
 // SLEDOVÁNÍ NÁVYKŮ — state poller každých 5 minut
