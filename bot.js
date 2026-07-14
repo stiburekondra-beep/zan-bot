@@ -2413,28 +2413,28 @@ function analyzeCropRotation(garden) {
 }
 
 // Identifikace rostliny nebo problému z fotky
-async function analyzeGardenPhoto(base64Image, caption, garden, memory) {
+async function analyzeGardenPhoto(base64Image, caption, garden, memory, userName = 'uživateli') {
   const month = new Date().getMonth() + 1;
   const seasonal = getSeasonalTasks(month);
   const mapSummary = Object.entries(garden.map || {}).map(([k, v]) => `${v.name}: ${(v.plants || []).join(', ')}`).join('\n') || 'mapa zatím prázdná';
 
   const prompt = `Jsi Žán, zahradní expert a správce domu "${memory.home_name}".
-Jana ti poslala fotku ze zahrady.
+${userName} ti poslal(a) fotku ze zahrady.
 
-ZAHRADA JANY:
+ZAHRADA DOMÁCNOSTI:
 Mapa zón: ${mapSummary}
 Rostliny celkem: zelenina (${garden.plants.zelenina.join(', ')}), stromy (${garden.plants.ovocne_stromy.join(', ')}), keře (${garden.plants.kere.join(', ')})
 Měsíc: ${seasonal.season}
-Komentář Jany: "${caption || 'bez komentáře'}"
+Komentář uživatele: "${caption || 'bez komentáře'}"
 
 Tvůj úkol:
 1. Identifikuj co je na fotce (rostlina, problém, škůdce, stav zahrady...)
-2. Pokud je to rostlina → napiš název, základní péči a zda ji Jana už má v zahradě
+2. Pokud je to rostlina → napiš název, základní péči a zda už je v zahradě domácnosti
 3. Pokud je to problém/choroba → diagnostikuj a navrhni konkrétní řešení
 4. Zeptej se: "Mám si tuto rostlinu zapamatovat? Kde na zahradě roste?" (pokud je to nová rostlina)
 5. Navrhni jestli to ovlivňuje nějaký sezónní úkol
 
-Piš česky, přátelsky, jako Žán. Oslovi "Jano".`;
+Piš česky, přátelsky, jako Žán. Oslov aktuálního uživatele jménem "${userName}", ne Janu automaticky.`;
 
   const response = await claudeCreate({
     model: MODEL,
@@ -2454,6 +2454,7 @@ Piš česky, přátelsky, jako Žán. Oslovi "Jano".`;
 async function generateGardenAdvice(chatId) {
   const garden = loadGarden();
   const memory = loadMemory();
+  const user = getUser(chatId);
   const month = new Date().getMonth() + 1;
   const seasonal = getSeasonalTasks(month);
   garden.last_visit = new Date().toISOString();
@@ -2484,7 +2485,7 @@ async function generateGardenAdvice(chatId) {
     .join('\n') || 'mapa zatím není nastavena';
 
   const prompt = `Jsi Žán, zahradní rádce a správce domu "${memory.home_name}".
-Jana jde na zahradu. Připrav jí konkrétní brief na dnes.
+${user.name} jde na zahradu. Připrav jí konkrétní brief na dnes.
 
 MAPA ZAHRADY:
 ${mapSummary}
@@ -2497,14 +2498,14 @@ ${rotation.warnings.length > 0 ? 'VAROVÁNÍ STŘÍDÁNÍ PLODIN: ' + rotation.w
 ${profileAlerts.length > 0 ? 'POZNÁMKY K ROSTLINÁM: ' + profileAlerts.join(' | ') : ''}
 ZAHRADNÍ POZNÁMKY: ${garden.notes.slice(-3).map(n => n.text).join(' | ') || 'žádné'}
 
-Brief pro Janu (max 12 řádků):
+Brief pro aktuálního uživatele (max 12 řádků):
 1. Pozdrav a zmínka o počasí
 2. Top 3 úkoly na dnes (konkrétní, s ohledem na mapu zahrady)
 3. Jeden zahradní tip nebo zajímavost
 4. Případné varování (mráz, sucho, střídání plodin)
 5. Povzbudivé zakončení 🌱
 
-Piš česky, přátelsky, oslovi "Jano".`;
+Piš česky, přátelsky, oslov "${user.name}". Nepředpokládej, že zahrada patří Janě.`;
 
   const response = await claudeCreate({
     model: MODEL,
@@ -2512,7 +2513,7 @@ Piš česky, přátelsky, oslovi "Jano".`;
     messages: [{ role: 'user', content: prompt }],
   });
 
-  return response.content.find(b => b.type === 'text')?.text || 'Hezké zahradničení Jano! 🌱';
+  return response.content.find(b => b.type === 'text')?.text || `Hezké zahradničení, ${user.name}! 🌱`;
 }
 
 // ═══════════════════════════════════════════════
@@ -2545,6 +2546,7 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Po každé změně popiš výsledek LIDSKY (co to dělá pro dům), technikálie jen když se někdo zeptá.
 - Víc otázek najednou = očísluj je tak, aby šlo odpovědět „3: kuchyň, 6: ano" z mobilu. Jedno zadání, jedna odpověď — netříšti je do víc zpráv s jiným číslováním.
 - Nové info o domě/lidech ukládej hned (remember, update_family_member, update_house_info, rodina_update), nečekej na potvrzení.
+- Téma neurčuje osobu. Zahrada, děti ani dům automaticky neznamenají Jana/Ondra; oslovuj jen aktuálního uživatele z kontextu. Když není jasné, komu rada patří nebo kdo něco pěstuje, zeptej se krátce „ty, nebo Jana/Ondra?".
 
 ═══ 3. STRUKTURA KONFIGURACE (závazná konvence domu) ═══
 - Všechen YAML žije v packages/<kategorie>/<tema>.yaml — jeden balíček = jedno téma (zahrada/voda.yaml). Kategorie dává write_package.
@@ -2646,6 +2648,13 @@ Když se netriviální postup POVEDE a ověřil sis výsledek → navrhni „má
 - Jednou týdně nenásilný check-in (checkin_schedule).
 - Integrace poznáš: tuya→Tuya, ewelink→Sonoff/eWeLink, zha/zigbee→Zigbee (Aqara, IKEA, Hue…), mqtt→Tasmota/ESPHome, Xiaomi/Aqara→Zigbee nebo Mi Home.`;
 
+const GARDEN_KEYWORDS = ['zahrada', 'zahrad', 'rostlina', 'kytka', 'strom', 'keř', 'ker', 'záhon', 'zahon', 'škůdce', 'skudce', 'choroba', 'list', 'květ', 'kvet', 'plod', 'semeno', 'rajč', 'rajc', 'okurk', 'paprik', 'zalév', 'zalev', 'sklízet', 'sklizet', 'pěst', 'pest'];
+
+function isGardenRelated(text) {
+  const normalized = String(text || '').toLowerCase();
+  return GARDEN_KEYWORDS.some(k => normalized.includes(k));
+}
+
 async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}) {
   const user = getUser(chatId);
   const memory = loadMemory();
@@ -2660,6 +2669,7 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   const month = new Date().getMonth() + 1;
   const seasonal = getSeasonalTasks(month);
   const isJana = chatId === CHAT_JANA;
+  const includeGardenContext = isJana || isGardenRelated(userMessage);
 
   // Dynamický kontext — proměnlivé věci patří sem (za cache breakpoint),
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
@@ -2680,9 +2690,9 @@ Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(use
 Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
 PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
 ${(() => { const r = ensureRodina(); return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)'; })()}
-${isJana ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
+${includeGardenContext ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
-Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profile (profily rostlin), garden_planting_plan (střídání plodin), garden_note (deník). Když Jana popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu.` : ''}`;
+Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profile (profily rostlin), garden_planting_plan (střídání plodin), garden_note (deník). Když aktuální uživatel popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu. Zahradní dotaz sám o sobě neznamená, že mluví Jana; drž se UŽIVATEL výše.` : ''}`;
 
   // Připrav zprávu — s obrázkem nebo bez
   let userContent;
@@ -2889,12 +2899,9 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
       const base64 = Buffer.from(imgResp.data).toString('base64');
       const caption = msg.caption || '';
 
-      // Jana posílá fotku ze zahrady?
-      const gardenKeywords = ['zahrada', 'rostlina', 'kytka', 'strom', 'keř', 'záhon', 'škůdce', 'choroba', 'list', 'květ', 'plod', 'semeno'];
-      const isGardenPhoto = chatId === CHAT_JANA && (
-        gardenKeywords.some(k => caption.toLowerCase().includes(k)) ||
-        !caption // Jana bez komentáře → pravděpodobně zahrada
-      );
+      // Fotka ze zahrady: explicitní popisek platí pro kohokoli, bez popisku
+      // je to jen Janina zkratka z původního chování.
+      const isGardenPhoto = isGardenRelated(caption) || (chatId === CHAT_JANA && !caption);
 
       logAction(chatId, user.name, 'photo_received', isGardenPhoto ? 'garden' : 'general', caption.substring(0, 50));
 
@@ -2921,7 +2928,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
         send(chatId, '🌱 Koukám na fotku...');
         const garden = loadGarden();
         const memory = loadMemory();
-        const analysis = await analyzeGardenPhoto(base64, caption, garden, memory);
+        const analysis = await analyzeGardenPhoto(base64, caption, garden, memory, user.name);
         send(chatId, analysis, { parse_mode: 'Markdown' });
       } else {
         const userCaption = caption || 'Co vidíš na této fotce? Jak to souvisí s domem?';
