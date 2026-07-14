@@ -12,7 +12,11 @@ COPY package.json ./
 RUN npm install --production
 
 # Copy bot
+# POZOR: musí se vyjmenovat KAŽDÝ modul, který bot.js vyžaduje — jinak image
+# spadne hned při startu na MODULE_NOT_FOUND (stalo se 2026-07-14 u v5.7.2:
+# polling-watchdog.js se nezkopíroval a Žán se vůbec nespustil).
 COPY bot.js ./
+COPY polling-watchdog.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
