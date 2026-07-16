@@ -2,7 +2,9 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # Install Node.js, jq, dependencies + nmap (sken domácí sítě — scan_network)
-RUN apk add --no-cache nodejs npm bash jq nmap
+RUN apk add --no-cache nodejs npm bash jq nmap tzdata
+
+ENV TZ=Europe/Prague
 
 # Set working directory
 WORKDIR /app
@@ -27,4 +29,3 @@ RUN cp /run.sh /etc/s6-overlay/s6-rc.d/zan/run
 RUN chmod a+x /etc/s6-overlay/s6-rc.d/zan/run
 RUN mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d
 RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/zan
-

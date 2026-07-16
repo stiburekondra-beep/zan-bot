@@ -1,4 +1,6 @@
 require('dotenv').config();
+const LOCAL_TIME_ZONE = process.env.ZAN_TIME_ZONE || 'Europe/Prague';
+process.env.TZ = LOCAL_TIME_ZONE;
 const TelegramBot = require('node-telegram-bot-api');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
@@ -38,6 +40,40 @@ const HARNESS_ONLY      = HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(pr
 const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STALE_MS || String(10 * 60 * 1000), 10);
 const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
+
+function localDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('cs-CZ', {
+    timeZone: LOCAL_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+}
+
+function formatLocalDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat('cs-CZ', {
+    timeZone: LOCAL_TIME_ZONE,
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    hour12: false,
+  }).format(date);
+}
+
+function localDayPeriod(date = new Date()) {
+  const hour = Number(localDateParts(date).hour);
+  if (hour >= 0 && hour < 5) return 'noc / po půlnoci';
+  if (hour < 10) return 'ráno';
+  if (hour < 12) return 'dopoledne';
+  if (hour < 18) return 'odpoledne';
+  if (hour < 22) return 'večer';
+  return 'noc';
+}
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
@@ -2677,7 +2713,7 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
   const todayCzk = (usageCostUsd(todayUsage) * USD_CZK).toFixed(1);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
-Dům: "${memory.home_name}" | Čas: ${new Date().toLocaleString('cs-CZ')}
+Dům: "${memory.home_name}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
 Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}
