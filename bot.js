@@ -9,6 +9,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
+const { usageCostUsd, formatBudgetReport } = require('./budget-report');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -318,15 +319,6 @@ const PACKAGE_CATEGORIES = {
 const USAGE_FILE = path.join(DATA_DIR, 'zan_usage.json');
 const USD_CZK = 23; // hrubý kurz pro orientační přepočet
 
-function modelPricing(model = MODEL) {
-  // [input, output, cache_read, cache_write] USD za MTok — per model,
-  // ne podle globálního MODEL (jinak /budget lže, jakmile běží víc modelů)
-  const m = String(model);
-  if (m.includes('haiku')) return [1, 5, 0.1, 1.25];
-  if (m.includes('opus'))  return [15, 75, 1.5, 18.75];
-  return [3, 15, 0.3, 3.75]; // sonnet a ostatní
-}
-
 function loadUsage() {
   try { if (fs.existsSync(USAGE_FILE)) return JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch {}
   return { days: {} };
@@ -360,19 +352,6 @@ function trackUsage(usage, model = MODEL) {
     fs.writeFileSync(USAGE_FILE, JSON.stringify(u, null, 2), 'utf8');
     console.log(`💰 tokens: in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
   } catch (e) { console.warn('trackUsage:', e.message); }
-}
-
-function usageCostUsd(d) {
-  // Dny s rozpadem po modelech se počítají přesně; starší dny (bez d.models)
-  // padají na cenu aktuálního globálního modelu jako dřív.
-  if (d.models && Object.keys(d.models).length) {
-    return Object.entries(d.models).reduce((sum, [m, v]) => {
-      const [pi, po, pcr, pcw] = modelPricing(m);
-      return sum + (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
-    }, 0);
-  }
-  const [pi, po, pcr, pcw] = modelPricing();
-  return (d.input * pi + d.output * po + d.cache_read * pcr + d.cache_write * pcw) / 1e6;
 }
 
 async function claudeCreate(params) {
@@ -2675,7 +2654,7 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
   const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
-  const todayCzk = (usageCostUsd(todayUsage) * USD_CZK).toFixed(1);
+  const todayCzk = (usageCostUsd(todayUsage, MODEL) * USD_CZK).toFixed(1);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${memory.home_name}" | Čas: ${new Date().toLocaleString('cs-CZ')}
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
@@ -3022,34 +3001,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
 
   if (text === '/budget') {
     const u = loadUsage();
-    const today = new Date().toISOString().slice(0, 10);
-    const month = today.slice(0, 7);
-    const empty = { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
-    const d = u.days[today] || empty;
-    const monthDays = Object.entries(u.days).filter(([k]) => k.startsWith(month));
-    const m = monthDays
-      .reduce((a, [, v]) => ({ calls: a.calls + v.calls, input: a.input + v.input, output: a.output + v.output, cache_read: a.cache_read + v.cache_read, cache_write: a.cache_write + v.cache_write }), { ...empty });
-    const dUsd = usageCostUsd(d);
-    // Měsíc = součet dnů (den s rozpadem po modelech se počítá přesně,
-    // starší den cenou globálního modelu) — nesčítat tokeny napříč modely!
-    const mUsd = monthDays.reduce((s, [, v]) => s + usageCostUsd(v), 0);
-    // Rozpad dneška po modelech (od zavedení model trackingu)
-    const perModel = Object.entries(d.models || {})
-      .map(([mod, v]) => {
-        const [pi, po, pcr, pcw] = modelPricing(mod);
-        const usd = (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
-        return `• ${mod.replace('claude-', '')}: ${v.calls}× ≈ ${(usd * USD_CZK).toFixed(2)} Kč`;
-      }).join('\n');
-    send(chatId,
-      `💰 *Spotřeba Žána* (výchozí model: ${MODEL})\n\n` +
-      `*Dnes:* ${d.calls} volání\n` +
-      `• input ${d.input.toLocaleString('cs-CZ')} | output ${d.output.toLocaleString('cs-CZ')}\n` +
-      `• cache: čtení ${d.cache_read.toLocaleString('cs-CZ')} | zápis ${d.cache_write.toLocaleString('cs-CZ')}\n` +
-      `• ≈ $${dUsd.toFixed(3)} (${(dUsd * USD_CZK).toFixed(2)} Kč)\n` +
-      (perModel ? `${perModel}\n` : '') +
-      `\n*Tento měsíc:* ${m.calls} volání ≈ $${mUsd.toFixed(2)} (${(mUsd * USD_CZK).toFixed(0)} Kč)\n\n` +
-      `_Sleduje se od v5.3.3 — starší spotřeba v console.anthropic.com_`,
-      { parse_mode: 'Markdown' });
+    send(chatId, formatBudgetReport(u, { defaultModel: MODEL }), { parse_mode: 'Markdown' });
     return;
   }
 
