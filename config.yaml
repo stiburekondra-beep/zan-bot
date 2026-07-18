@@ -24,6 +24,9 @@ options:
   CHAT_ID_ONDRA: ""
   CHAT_ID_JANA: ""
   EXTRA_CHAT_IDS: ""
+  ZAN_HOME_NAME: "Dům Žán"
+  CHAT_NAME_ONDRA: "Ondra"
+  CHAT_NAME_JANA: "Jana"
   ANTHROPIC_API_KEY: ""
   OPENAI_API_KEY: ""
   PLANTID_API_KEY: ""
@@ -34,9 +37,11 @@ schema:
   CHAT_ID_ONDRA: str
   CHAT_ID_JANA: str
   EXTRA_CHAT_IDS: str?
+  ZAN_HOME_NAME: str?
+  CHAT_NAME_ONDRA: str?
+  CHAT_NAME_JANA: str?
   ANTHROPIC_API_KEY: str
   OPENAI_API_KEY: str
   PLANTID_API_KEY: str?
   ZAN_HARNESS_ENABLED: bool?
   ZAN_HARNESS_CHAT_ID: int?
-

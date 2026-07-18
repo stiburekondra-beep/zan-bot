@@ -24,6 +24,9 @@ const CHAT_JANA         = parseInt(process.env.CHAT_ID_JANA);
 const EXTRA_CHAT_IDS    = (process.env.EXTRA_CHAT_IDS || '').split(',').map(x => parseInt(x)).filter(Boolean);
 const ALLOWED_CHATS     = [CHAT_ONDRA, CHAT_JANA, ...EXTRA_CHAT_IDS].filter(Boolean);
 const ADMIN_CHATS       = [CHAT_ONDRA]; // jen Ondra může YAML, restart, kritické věci
+const HOME_NAME         = String(process.env.ZAN_HOME_NAME || 'Dům Žán').trim() || 'Dům Žán';
+const CHAT_NAME_ONDRA   = String(process.env.CHAT_NAME_ONDRA || 'Ondra').trim() || 'Ondra';
+const CHAT_NAME_JANA    = String(process.env.CHAT_NAME_JANA || 'Jana').trim() || 'Jana';
 
 const HA_URL            = process.env.HA_URL;
 const HA_TOKEN          = process.env.HA_TOKEN;
@@ -431,8 +434,8 @@ function checkRateLimit(chatId) {
 // UŽIVATELÉ
 // ═══════════════════════════════════════════════
 function getUser(chatId) {
-  if (chatId === CHAT_ONDRA) return { name: 'Ondra', role: 'admin' };
-  if (chatId === CHAT_JANA) return { name: 'Jana', role: 'user' };
+  if (chatId === CHAT_ONDRA) return { name: CHAT_NAME_ONDRA, role: 'admin' };
+  if (chatId === CHAT_JANA) return { name: CHAT_NAME_JANA, role: 'user' };
   return { name: 'Host', role: 'guest' };
 }
 
@@ -445,17 +448,25 @@ function loadMemory() {
   try {
     if (fs.existsSync(MEMORY_FILE)) return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
   } catch (e) { console.error('Memory load error:', e.message); }
+  const isLegacyStiburkoviDefault =
+    HOME_NAME === 'Dům Žán' && CHAT_NAME_ONDRA === 'Ondra' && CHAT_NAME_JANA === 'Jana';
+  const residents = isLegacyStiburkoviDefault
+    ? {
+        ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
+        jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
+        stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
+        matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+        eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+      }
+    : {
+        admin: { name: CHAT_NAME_ONDRA, born: '', emoji: '', info: '', role: 'admin' },
+        ...(Number.isFinite(CHAT_JANA) ? { user: { name: CHAT_NAME_JANA, born: '', emoji: '', info: '', role: 'user' } } : {}),
+      };
   return {
-    home_name: 'Dům Žán',
-    residents: {
-      ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
-      jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
-      stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
-      matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
-      eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
-    },
+    home_name: HOME_NAME,
+    residents,
     house: {
-      name: 'Dům Žán',
+      name: HOME_NAME,
       address: '',
       type: '',
       year_built: '',
@@ -2975,16 +2986,19 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
 
   // Kickoff dotazníku — Žán se sám představí a položí první otázku.
   // Jen admin (Ondra) rozhoduje, KDY se Žán ozve; Žán sám od sebe
-  // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí Jana).
+  // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí user/Jana).
   if (text.startsWith('/onboarding') && isAdmin(chatId)) {
     const target = (text.split(/\s+/)[1] || 'jana').toLowerCase();
-    const targetChat = target === 'jana' ? CHAT_JANA : (target === 'ondra' ? CHAT_ONDRA : null);
-    if (!targetChat) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding jana'); return; }
+    const targetChat = (target === 'jana' || target === 'user')
+      ? CHAT_JANA
+      : ((target === 'ondra' || target === 'admin') ? CHAT_ONDRA : null);
+    if (!Number.isFinite(targetChat)) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding user nebo /onboarding admin'); return; }
     ensureRodina();
-    const osloveni = target === 'jana' ? 'Jano' : 'Ondro';
+    const targetUser = getUser(targetChat);
+    const osloveni = targetUser.name || 'ahoj';
     const intro =
       `👋 Ahoj ${osloveni}! Tady Žán, váš domácí sluha. 🏠\n\n` +
-      `Ondra mě požádal, abych se s tebou líp seznámil — ať se o vás můžu starat chytřeji ` +
+      `${user.name} mě požádal, abych se s tebou líp seznámil — ať se o vás můžu starat chytřeji ` +
       `(topení podle toho, kdy jste doma, světla, zahrada… tu už spolu řešíme 🌱).\n\n` +
       `Budu se občas na něco zeptat — vždycky jen jedna rychlá otázka, žádné formuláře. ` +
       `A kdykoli řekneš „dost otázek", přestanu.\n\n` +
@@ -2994,9 +3008,9 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     // na co navazuje (jinak by odpověď „vstáváme v 6" visela ve vzduchu)
     if (!conversationHistory[targetChat]) conversationHistory[targetChat] = [];
     conversationHistory[targetChat].push({ role: 'assistant', content: intro });
-    logConvo('ŽÁN', targetChat, getUser(targetChat).name, intro);
+    logConvo('ŽÁN', targetChat, targetUser.name, intro);
     logAction(chatId, user.name, 'onboarding_kickoff', target, 'ok');
-    if (targetChat !== chatId) send(chatId, `✅ Představil jsem se ${target === 'jana' ? 'Janě' : target} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
+    if (targetChat !== chatId) send(chatId, `✅ Představil jsem se ${targetUser.name} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
     return;
   }
 
