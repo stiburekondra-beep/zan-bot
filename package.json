@@ -10,6 +10,7 @@
     "test:dashboard-validator": "node scripts/check-dashboard-validator.js",
     "test:memory-devices": "node scripts/check-memory-devices.js",
     "test:reminders": "node scripts/check-reminders.js",
+    "test:tts-announcements": "node scripts/check-tts-announcements.js",
     "test:prompt-contract": "node scripts/check-prompt-contract.js",
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js",
     "test:local-time": "node scripts/check-local-time-context.js"

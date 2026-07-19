@@ -20,9 +20,11 @@ RUN npm install --production
 COPY bot.js ./
 COPY budget-report.js ./
 COPY polling-watchdog.js ./
+<<<<<<< HEAD
 COPY dashboard-validator.js ./
 COPY memory-devices.js ./
 COPY reminders.js ./
+COPY tts-announcements.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
