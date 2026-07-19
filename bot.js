@@ -9,6 +9,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
+const { announceHome } = require('./tts-announcements');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -922,6 +923,22 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'announce_home',
+      description: 'Řekne krátké oznámení doma přes Home Assistant TTS. Použij jen na výslovné přání uživatele oznámit něco do domu. Nejdřív si ověř dostupné tts/media_player entity přes get_states, netipuj je.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'Krátký text, který se má říct nahlas. Max 300 znaků.' },
+          tts_entity_id: { type: 'string', description: 'TTS entita, např. tts.piper nebo tts.google_translate_cs_com' },
+          media_player_entity_id: { type: 'string', description: 'Cílový přehrávač, např. media_player.kuchyn' },
+          cache: { type: 'boolean', description: 'Zapnout cache TTS. Výchozí true.' },
+          language: { type: 'string', description: 'Volitelný jazyk, např. cs.' },
+          options: { type: 'object', description: 'Volitelné HA TTS options.' },
+        },
+        required: ['message', 'tts_entity_id', 'media_player_entity_id'],
+      },
+    },
+    {
       name: 'remember',
       description: 'Uloží informaci do paměti.',
       input_schema: {
@@ -1567,6 +1584,14 @@ async function executeTool(name, input, chatId) {
         await haPost(`services/${input.domain}/${input.service}`, input.data);
         logAction(chatId, user.name, `${input.domain}.${input.service}`, JSON.stringify(input.data), 'ok');
         return { success: true, confirmed: true };
+      }
+
+      case 'announce_home': {
+        const result = await announceHome(haPost, input);
+        if (result.success) {
+          logAction(chatId, user.name, 'announce_home', `${result.tts_entity_id}->${result.media_player_entity_id}`, 'ok');
+        }
+        return result;
       }
 
       case 'remember': {
@@ -2629,6 +2654,8 @@ ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboa
   Přání vs. realita: rodina chce řídit teploty po místnostech a chybí senzor → řekni to + navrhni konkrétní HW s cenou. Neslibuj funkci bez senzoru. Hotovo → update_house_info onboarding_done=true.
 
 RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé poznatky o rodině (rytmus dne, návraty z práce, teplotní komfort, pravidla, kdo co má rád) ukládej HNED přes rodina_update — vždy celou sekci znovu (stávající obsah + doplněk), stručné odrážky. Nevyplněné sekce doplňuj MAX JEDNOU krátkou otázkou na konci jinak hotové odpovědi; nikdy výslech, nikdy seznam otázek, neopakuj otázku, na kterou uživatel nechtěl odpovědět. „Dost otázek" → přestaň úplně a zkus za pár dní (checkin_schedule). rodina.md = fakta o rodině a domácnosti; remember = zařízení/místnosti/technika — nemíchat.
+
+OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
 
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.
 
