@@ -17,6 +17,7 @@ RUN npm install --production
 # polling-watchdog.js se nezkopíroval a Žán se vůbec nespustil).
 COPY bot.js ./
 COPY polling-watchdog.js ./
+COPY reminders.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
@@ -27,4 +28,3 @@ RUN cp /run.sh /etc/s6-overlay/s6-rc.d/zan/run
 RUN chmod a+x /etc/s6-overlay/s6-rc.d/zan/run
 RUN mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d
 RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/zan
-

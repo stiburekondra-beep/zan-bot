@@ -5,6 +5,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
+    "test:reminders": "node scripts/check-reminders.js",
     "test:prompt-contract": "node scripts/check-prompt-contract.js",
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js"
   },
