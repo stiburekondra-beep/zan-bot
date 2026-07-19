@@ -9,6 +9,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
+const { cleanDeviceMemory, formatMemoryMap } = require('./memory-devices');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -3005,8 +3006,8 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     let out = '🧠 *Co Žán ví o domě:*\n\n';
     const residents = memory.residents || {};
     if (Object.keys(residents).length > 0) out += `*Obyvatelé:*\n${Object.entries(residents).map(([k, v]) => `• ${v.name || k}${v.role ? ': ' + v.role : ''}`).join('\n')}\n\n`;
-    if (Object.keys(memory.rooms).length > 0) out += `*Místnosti:*\n${Object.entries(memory.rooms).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
-    if (Object.keys(memory.devices).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
+    if (Object.keys(memory.rooms).length > 0) out += `*Místnosti:*\n${formatMemoryMap(memory.rooms)}\n\n`;
+    if (Object.keys(memory.devices).length > 0) out += `*Zařízení uložená rodinou:*\n${formatMemoryMap(memory.devices)}\n\n`;
     if (memory.notes.length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
     if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
     send(chatId, out, { parse_mode: 'Markdown' });
@@ -4079,21 +4080,17 @@ if (!HARNESS_ONLY) {
       }
     } catch (e) { console.warn('⚠️ Area sync selhal:', e.message); }
 
-    // 3. Sync zařízení ze stavů → memory.devices (jen pokud je devices prázdné)
+    // 3. Procisti stare automaticke sync zaznamy. Stav HA patri do get_states /
+    // scan_all_devices, ne do trvale lidske pameti.
     try {
       const memory = loadMemory();
-      if (states.length > 0 && Object.keys(memory.devices || {}).length === 0) {
-        const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather', 'automation', 'script', 'scene', 'timer', 'counter'];
-        const interestingDomains = ['light', 'switch', 'sensor', 'binary_sensor', 'climate', 'cover', 'media_player', 'fan', 'input_boolean', 'input_number'];
-        const interesting = states.filter(s => interestingDomains.some(d => s.entity_id.startsWith(d + '.')));
-        for (const s of interesting.slice(0, 100)) {
-          const name = s.attributes.friendly_name || s.entity_id;
-          memory.devices[s.entity_id] = { name, entity_id: s.entity_id, domain: s.entity_id.split('.')[0], state: s.state };
-        }
+      const cleaned = cleanDeviceMemory(memory.devices || {});
+      if (cleaned.removed.length > 0) {
+        memory.devices = cleaned.devices;
         saveMemory(memory);
-        console.log(`🔌 Zařízení sync: ${interesting.length} entit načteno do paměti`);
+        console.log(`🧹 Devices memory cleanup: ${cleaned.removed.length} auto záznamů odstraněno`);
       }
-    } catch (e) { console.warn('⚠️ Devices sync selhal:', e.message); }
+    } catch (e) { console.warn('⚠️ Devices memory cleanup selhal:', e.message); }
 
     // 4. Aktualizuj known_entities
     try {
