@@ -21,6 +21,7 @@ COPY bot.js ./
 COPY budget-report.js ./
 COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
+COPY memory-devices.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
