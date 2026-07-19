@@ -14,6 +14,14 @@ const { createPollingWatchdog } = require('./polling-watchdog');
 const { usageCostUsd, formatBudgetReport } = require('./budget-report');
 const { extractDashboardEntitiesFromYaml } = require('./dashboard-validator');
 const { cleanDeviceMemory, formatMemoryMap } = require('./memory-devices');
+const {
+  addReminder,
+  cancelReminder,
+  dueReminders,
+  listReminders,
+  markReminderDelivered,
+  markReminderPending,
+} = require('./reminders');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -111,6 +119,7 @@ const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
 const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
 const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
+const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -1152,6 +1161,20 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'reminder',
+      description: 'Správa osobních připomínek v Telegramu. Použij pro věci typu "připomeň mi zítra v 7:30". Čas vždy předej jako konkrétní ISO datum s časovou zónou; když čas není jasný, nejdřív se krátce doptej.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['add', 'list', 'cancel'] },
+          due_at: { type: 'string', description: 'ISO čas s časovou zónou, např. 2026-07-20T07:30:00+02:00 (add)' },
+          text: { type: 'string', description: 'Co připomenout (add)' },
+          reminder_id: { type: 'string', description: 'ID připomínky pro cancel' },
+        },
+        required: ['action'],
+      },
+    },
+    {
       name: 'rodina_update',
       description: `Zapíše/aktualizuje sekci v rodina.md — živém profilu domácnosti (dostáváš ho celý v kontextu). Sekce: ${RODINA_SECTIONS.join(', ')}. Obsah PŘEPISUJE celou sekci — piš vždy její kompletní nové znění (stávající text + doplněk). Ukládej sem odpovědi z dotazníku a trvalé poznatky o rodině hned, jak je zjistíš.`,
       input_schema: {
@@ -1982,6 +2005,32 @@ async function executeTool(name, input, chatId) {
         return { success: true };
       }
 
+      case 'reminder': {
+        if (input.action === 'add') {
+          const result = addReminder(REMINDERS_FILE, {
+            due_at: input.due_at,
+            text: input.text,
+            chat_id: chatId,
+            created_by: user.name,
+          });
+          if (result.success) {
+            logAction(chatId, user.name, 'reminder_add', result.reminder.id, result.reminder.text);
+          }
+          return result;
+        }
+        if (input.action === 'list') {
+          return { reminders: listReminders(REMINDERS_FILE).filter(r => r.chat_id === chatId) };
+        }
+        if (input.action === 'cancel') {
+          const owned = listReminders(REMINDERS_FILE).find(r => r.id === input.reminder_id && r.chat_id === chatId);
+          if (!owned) return { error: 'Připomínka nenalezena nebo nepatří do tohoto chatu.' };
+          const result = cancelReminder(REMINDERS_FILE, input.reminder_id);
+          if (result.success) logAction(chatId, user.name, 'reminder_cancel', result.reminder.id, result.reminder.text);
+          return result;
+        }
+        return { error: 'Neznámá action' };
+      }
+
       case 'rodina_update': {
         // Jana (user) smí — profil plní hlavně ona; hosté ne
         if (user.role === 'guest') return { error: 'Profil domácnosti smí upravovat jen rodina.' };
@@ -2709,6 +2758,8 @@ ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboa
 
 RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé poznatky o rodině (rytmus dne, návraty z práce, teplotní komfort, pravidla, kdo co má rád) ukládej HNED přes rodina_update — vždy celou sekci znovu (stávající obsah + doplněk), stručné odrážky. Nevyplněné sekce doplňuj MAX JEDNOU krátkou otázkou na konci jinak hotové odpovědi; nikdy výslech, nikdy seznam otázek, neopakuj otázku, na kterou uživatel nechtěl odpovědět. „Dost otázek" → přestaň úplně a zkus za pár dní (checkin_schedule). rodina.md = fakta o rodině a domácnosti; remember = zařízení/místnosti/technika — nemíchat.
 
+PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
+
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.
 
 TESTOVACÍ VĚCI: soubory s příponou _test, nadpis "🧪 TEST:", helpery (input_*, timer, counter) místo chybějícího HW, v kartách označ "(sim)". Reálné domény: sensor, binary_sensor, light, switch, climate, cover, media_player, fan. Po vytvoření vysvětli, co je reálné a co simulace a co přikoupit (s cenou).
@@ -2755,6 +2806,11 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
   const todayCzk = (usageCostUsd(todayUsage, MODEL) * USD_CZK).toFixed(1);
+  const activeReminders = listReminders(REMINDERS_FILE)
+    .filter(r => r.chat_id === chatId)
+    .slice(0, 8)
+    .map(r => `${r.id}: ${r.text} @ ${r.due_at_input || r.due_at}`)
+    .join(' | ');
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${memory.home_name}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
@@ -2765,6 +2821,7 @@ Místnosti: ${roomNames || 'žádné'}
 Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
+Aktivní připomínky v tomhle chatu: ${activeReminders || 'žádné'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
 PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
@@ -4018,12 +4075,29 @@ async function createFamilyDashboard() {
   }
 }
 
+async function deliverDueReminders() {
+  const reminders = dueReminders(REMINDERS_FILE);
+  for (const reminder of reminders) {
+    try {
+      await sendSafe(reminder.chat_id, `⏰ Připomínám: ${reminder.text}`);
+      markReminderDelivered(REMINDERS_FILE, reminder.id);
+      logAction(reminder.chat_id, reminder.created_by || 'Žán', 'reminder_delivered', reminder.id, reminder.text);
+    } catch (e) {
+      markReminderPending(REMINDERS_FILE, reminder.id, e.message);
+      console.error('Připomínka se nepodařila doručit:', reminder.id, e.message);
+    }
+  }
+}
+
 // ═══════════════════════════════════════════════
 // ČASOVAČE
 // ═══════════════════════════════════════════════
 if (!HARNESS_ONLY) {
   // Polluj stavy každých 5 minut
   setInterval(pollStates, 5 * 60 * 1000);
+
+  // Osobní připomínky — čistě Telegram, bez zásahu do HA nebo domu.
+  setInterval(deliverDueReminders, 30 * 1000);
 
   // Každou hodinu zkontroluj jestli je neděle 20:00 → analýza návyků
   setInterval(() => {

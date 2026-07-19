@@ -9,6 +9,7 @@
     "test:pilot-clean-preflight": "node scripts/check-pilot-clean-preflight.js",
     "test:dashboard-validator": "node scripts/check-dashboard-validator.js",
     "test:memory-devices": "node scripts/check-memory-devices.js",
+    "test:reminders": "node scripts/check-reminders.js",
     "test:prompt-contract": "node scripts/check-prompt-contract.js",
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js",
     "test:local-time": "node scripts/check-local-time-context.js"
