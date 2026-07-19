@@ -5,6 +5,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
+    "test:config-git-backup": "node scripts/check-config-git-backup.js",
     "test:prompt-contract": "node scripts/check-prompt-contract.js",
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js"
   },

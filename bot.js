@@ -9,6 +9,12 @@ const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
+const {
+  ensureConfigGitRepo,
+  snapshotConfigGit,
+  configGitStatus,
+  rollbackConfigGit,
+} = require('./config-git-backup');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -38,6 +44,7 @@ const HARNESS_ONLY      = HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(pr
 const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STALE_MS || String(10 * 60 * 1000), 10);
 const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
+const CONFIG_GIT_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.ZAN_CONFIG_GIT_ENABLED || 'true'));
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
@@ -760,14 +767,30 @@ function recordChange(fp, backupPath, wasNew) {
   lastChange = { file: fp, backup: backupPath, wasNew, when: new Date().toISOString() };
 }
 
+function snapshotConfig(label, fp) {
+  if (!CONFIG_GIT_ENABLED) return { ok: true, disabled: true };
+  const res = snapshotConfigGit(HA_CONFIG_PATH, label, fp);
+  if (!res.ok) console.warn('config git snapshot:', res.error || res.reason);
+  return res;
+}
+
+function configGitNote(res) {
+  if (!res || res.disabled) return 'config git vypnutý';
+  if (!res.ok) return `config git selhal: ${res.error || res.reason}`;
+  if (!res.changed) return 'config git: beze změny';
+  return `config git: snapshot ${res.commit}`;
+}
+
 function restoreLastChange() {
   // Vrátí poslední zápis: nový soubor smaže, přepsaný obnoví ze zálohy.
   if (!lastChange) return { error: 'Není co vracet — od startu add-onu žádný zaznamenaný zápis.' };
   try {
     const { file, backup, wasNew, when } = lastChange;
+    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `before Zan undo ${path.basename(file)}`);
     if (wasNew) { if (fs.existsSync(file)) fs.unlinkSync(file); }
     else if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, file);
     else return { error: 'Záloha se nenašla — obnov ručně z /config/zan_data/backups/.' };
+    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `after Zan undo ${path.basename(file)}`, file);
     lastChange = null;
     return { success: true, restored: path.basename(file), was_new_file_deleted: wasNew, change_from: when };
   } catch (e) { return { error: e.message }; }
@@ -1126,6 +1149,19 @@ Po zápisu vždy popsat změny LIDSKY.`,
         name: 'undo_last_change',
         description: 'Vrátí POSLEDNÍ zápis do configu (balíček, dashboard i smazání dashboardu): nový soubor smaže, přepsaný obnoví ze zálohy. Použij, když se změna nepovedla nebo si to uživatel rozmyslel. Po vrácení balíčku zavolej příslušný reload_ha. Starší zálohy: /config/zan_data/backups/.',
         input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'config_history',
+        description: 'Spravuje lokální git historii /config: status ukáže stav, snapshot uloží ruční bod obnovy, rollback vrátí trackované config soubory na zadaný git ref (výchozí HEAD~1). Používej jen jako admin záchranu po špatné větší změně configu; po rollbacku ověř check_config a reloadni dotčené části HA.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'snapshot', 'rollback'] },
+            message: { type: 'string', description: 'Popis snapshotu lidsky, pro action=snapshot' },
+            ref: { type: 'string', description: 'Git ref pro rollback, výchozí HEAD~1' },
+          },
+          required: ['action'],
+        },
       },
       {
         name: 'read_error_log',
@@ -1958,6 +1994,7 @@ async function executeTool(name, input, chatId) {
         const fp = getPackagePath(input.category, input.filename);
         const oldContent = readYamlFile(fp);
         const backup = backupFile(fp);
+        const beforeSnapshot = snapshotConfig(`before Zan write_package ${input.category}/${input.filename}`);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: `Zápis selhal. Zkontroluj Samba připojení.` };
         recordChange(fp, backup, !oldContent);
@@ -1984,6 +2021,7 @@ async function executeTool(name, input, chatId) {
         memory.notes.push({ text: `Balíček ${input.category}/${input.filename}: ${input.description}`, date: new Date().toLocaleDateString('cs-CZ') });
         saveMemory(memory);
         logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'ok');
+        const afterSnapshot = snapshotConfig(`after Zan write_package ${input.category}/${input.filename}`, fp);
         const isTest = input.filename.search(/[-_]test/) >= 0;
         return {
           success: true,
@@ -1991,6 +2029,7 @@ async function executeTool(name, input, chatId) {
           was_new: !oldContent,
           is_test: isTest,
           check_config: checkNote,
+          config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`,
           undo_hint: 'Kdyby výsledek nebyl žádoucí, umíš ho vrátit nástrojem undo_last_change.',
           human_diff_hint: oldContent
             ? 'Soubor existoval — popiš uživateli CO KONKRÉTNĚ se změnilo, ne technické detaily'
@@ -2009,12 +2048,14 @@ async function executeTool(name, input, chatId) {
         const fp = getDashboardPath(input.filename);
         const existed = fs.existsSync(fp);
         const backup = backupFile(fp);
+        const beforeSnapshot = snapshotConfig(`before Zan write_dashboard ${input.filename}`);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: 'Zápis dashboardu selhal.' };
         recordChange(fp, backup, !existed);
         logAction(chatId, user.name, 'write_dashboard', input.filename, 'ok');
+        const afterSnapshot = snapshotConfig(`after Zan write_dashboard ${input.filename}`, fp);
         const isTest = input.filename.search(/[-_]test/) >= 0;
-        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
+        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest, config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
       }
 
       case 'list_dashboards': {
@@ -2077,10 +2118,12 @@ async function executeTool(name, input, chatId) {
           if (!fs.existsSync(fp)) return { error: `Dashboard ${input.filename} neexistuje` };
           // Fáze 0: i smazání se zálohuje a jde vrátit přes undo_last_change
           const backup = backupFile(fp);
+          const beforeSnapshot = snapshotConfig(`before Zan delete_dashboard ${input.filename}`);
           fs.unlinkSync(fp);
           if (backup) lastChange = { file: fp, backup, wasNew: false, when: new Date().toISOString() };
+          const afterSnapshot = snapshotConfig(`after Zan delete_dashboard ${input.filename}`, fp);
           logAction(chatId, user.name, 'delete_dashboard', input.filename, 'ok');
-          return { success: true, message: `Dashboard ${input.filename} smazán`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
+          return { success: true, message: `Dashboard ${input.filename} smazán`, config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
         } catch (e) { return { error: e.message }; }
       }
 
@@ -2090,6 +2133,23 @@ async function executeTool(name, input, chatId) {
         logAction(chatId, user.name, 'undo_last_change', res.restored || '-', res.error ? 'fail' : 'ok');
         if (res.success) res.note = 'Po vrácení balíčku nezapomeň na příslušný reload_ha, ať se HA vrátí ke starému stavu i za běhu.';
         return res;
+      }
+
+      case 'config_history': {
+        if (!isAdmin(chatId)) return { error: 'Historie configu vyžaduje admin přístup.' };
+        if (!CONFIG_GIT_ENABLED) return { error: 'Config git historie je vypnutá přes ZAN_CONFIG_GIT_ENABLED.' };
+        if (input.action === 'status') {
+          return configGitStatus(HA_CONFIG_PATH);
+        }
+        if (input.action === 'snapshot') {
+          return snapshotConfigGit(HA_CONFIG_PATH, input.message || 'Manual Zan config snapshot');
+        }
+        if (input.action === 'rollback') {
+          const res = rollbackConfigGit(HA_CONFIG_PATH, input.ref || 'HEAD~1');
+          if (res.ok) res.note = 'Rollback vrátil trackované soubory v /config. Teď ověř check_config a reloadni dotčené části HA.';
+          return res;
+        }
+        return { error: `Neznámá akce: ${input.action}` };
       }
 
       case 'read_dashboard': {
