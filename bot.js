@@ -12,6 +12,7 @@ const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
 const { usageCostUsd, formatBudgetReport } = require('./budget-report');
+const { extractDashboardEntitiesFromYaml } = require('./dashboard-validator');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -2116,22 +2117,13 @@ async function executeTool(name, input, chatId) {
         const content = readYamlFile(fp);
         if (!content) return { error: `Dashboard ${input.filename} neexistuje` };
 
-        // Vytáhni všechny entity_id z YAML textu
-        const entityMatches = content.match(/entity:\s*([^\s\n#]+)/g) || [];
-        const entitiesMatches = content.match(/entities:\s*\n([\s\S]*?)(?=\n\s*\w+:|$)/g) || [];
-        const foundEntities = new Set();
-
-        for (const m of entityMatches) {
-          const e = m.replace(/entity:\s*/, '').trim();
-          if (e.includes('.')) foundEntities.add(e);
-        }
-        // Také hledej entity v seznamech (- entity_id nebo - light.xxx)
-        const listMatches = content.match(/- ([\w]+\.[\w]+)/g) || [];
-        for (const m of listMatches) {
-          foundEntities.add(m.replace('- ', '').trim());
+        let allEntities;
+        try {
+          allEntities = extractDashboardEntitiesFromYaml(content);
+        } catch (e) {
+          return { error: `Dashboard YAML není validní, nejde ověřit entity:\n${e.message}` };
         }
 
-        const allEntities = [...foundEntities];
         if (allEntities.length === 0) return { content, entities_found: 0, note: 'Žádné entity nenalezeny v YAML' };
 
         // Zkontroluj které existují v HA
