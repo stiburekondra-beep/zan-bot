@@ -1492,14 +1492,14 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'onboard_device',
-        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Pro plug předávej candidate metadata ze scan_network/get_new_entities; vrátí doporučení Shelly/TP-Link/Matter podle výrobce/modelu a bezpečnostní brzdu pro rizikové spotřebiče. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
+        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Pro plug předávej candidate metadata ze scan_network/get_new_entities; vrátí doporučení Shelly/TP-Link/Matter podle výrobce/modelu a bezpečnostní brzdu pro rizikové spotřebiče. Pro TV vrací doporučení Samsung/LG webOS/Android TV/Bravia/Philips/Cast/DLNA a upozorní na potvrzení na obrazovce; hotovo říkej až po ověření nové media_player entity. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
         input_schema: {
           type: 'object',
           properties: {
             category: { type: 'string', enum: ['camera', 'plug', 'tv', 'climate', 'generic'] },
-            handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, daikin. Netipuj naslepo.' },
+            handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, androidtv_remote, braviatv, daikin. Netipuj naslepo.' },
             flow_input: { type: 'object', description: 'Data pro první krok flow, jen pokud je uživatel potvrdil a víš přesně, co HA integrace čeká.' },
-            candidate: { type: 'object', description: 'Metadata kandidáta ze scan_network/get_new_entities: hostname, vendor/manufacturer, model, name, entity_id. Pro plug pomáhá vybrat Shelly/TP-Link/Matter bez tipování.' },
+            candidate: { type: 'object', description: 'Metadata kandidáta ze scan_network/get_new_entities: hostname, vendor/manufacturer, model, name, entity_id, případně ssdp/mdns/dhcp signály. Pro plug/TV pomáhá vybrat integraci bez tipování.' },
             vendor: { type: 'string', description: 'Výrobce, pokud ho znáš ze scan_network nebo uživatelova potvrzení.' },
             manufacturer: { type: 'string' },
             model: { type: 'string' },
@@ -2904,6 +2904,8 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, zeptej se na místnost a přiřaď ji přes ha_setup_assign_device. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
+
+TV: pro chytrou televizi použij onboard_device(category="tv", candidate=...). Samsung → handler samsungtv, LG webOS → webostv, Android/Google TV → androidtv_remote, Sony Bravia → braviatv, Philips → philips_js; Google Cast/DLNA ber jen jako omezený media fallback. TV často vyžaduje potvrzení kódu nebo žádosti přímo na obrazovce — řekni uživateli, ať TV zapne a potvrzení udělá, čekej na jeho odpověď a potom ověř novou media_player entitu přes get_new_entities/get_states. Teprve pak přiřaď místnost přes ha_setup_assign_device a řekni hotovo. Neslibuj univerzální zapnutí/zdroj/hlasitost; řekni, co konkrétní integrace umí.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.
