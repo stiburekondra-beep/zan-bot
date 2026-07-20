@@ -1,5 +1,10 @@
 const assert = require('assert');
-const { inferCandidateCategory, inferPlugOnboarding, buildOnboardDeviceRequest } = require('../onboard-device');
+const {
+  inferCandidateCategory,
+  inferPlugOnboarding,
+  inferTvOnboarding,
+  buildOnboardDeviceRequest,
+} = require('../onboard-device');
 
 const plug = inferCandidateCategory({
   hostname: 'tapo-p110-kuchyn',
@@ -28,6 +33,40 @@ const tv = inferCandidateCategory({
 });
 assert.strictEqual(tv.category_guess, 'tv');
 assert.strictEqual(tv.confidence, 'medium');
+assert.strictEqual(tv.tv_onboarding.recommended_handlers[0].handler, 'webostv');
+assert.strictEqual(tv.tv_onboarding.pairing.requires_screen_confirmation, true);
+
+const samsungTv = inferTvOnboarding({
+  hostname: 'samsung-qled-living',
+  vendor: 'Samsung',
+  ssdp_st: 'urn:samsung.com:device:RemoteControlReceiver:1',
+});
+assert.strictEqual(samsungTv.recommended_handlers[0].handler, 'samsungtv');
+assert(samsungTv.after_pairing.some(step => step.includes('media_player')));
+
+const androidTv = buildOnboardDeviceRequest({
+  category: 'tv',
+  candidate: { name: 'Sony Google TV', manufacturer: 'Sony', model: 'Bravia Android TV' },
+});
+assert.strictEqual(androidTv.needs_handler, true);
+assert.strictEqual(androidTv.suggested_handlers[0].handler, 'androidtv_remote');
+assert.strictEqual(androidTv.tv_pairing.requires_screen_confirmation, true);
+assert(androidTv.message.includes('media_player'));
+
+const unknownTv = buildOnboardDeviceRequest({ category: 'tv' });
+assert.strictEqual(unknownTv.needs_handler, true);
+assert.strictEqual(unknownTv.suggested_handlers[0].handler, null);
+assert(unknownTv.message.includes('nesmí tipovat'));
+
+const webosTv = buildOnboardDeviceRequest({
+  category: 'tv',
+  handler: 'webostv',
+  candidate: { name: 'LG webOS TV obyvak' },
+  flow_input: { host: '192.168.0.44' },
+});
+assert.strictEqual(webosTv.handler, 'webostv');
+assert.deepStrictEqual(webosTv.userInput, { host: '192.168.0.44' });
+assert(webosTv.after_pairing.some(step => step.includes('ha_setup_assign_device')));
 
 const unknownPlug = buildOnboardDeviceRequest({ category: 'plug' });
 assert.strictEqual(unknownPlug.needs_handler, true);
