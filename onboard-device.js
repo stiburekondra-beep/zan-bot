@@ -46,6 +46,51 @@ const PLUG_HANDLER_GUIDES = [
   },
 ];
 
+const TV_HANDLER_GUIDES = [
+  {
+    handler: 'samsungtv',
+    match: ['samsung', 'tizen'],
+    confidence: 'medium',
+    reason: 'Samsung Smart TV má oficiální HA integraci a Home Assistant ji umí často autodetekovat.',
+  },
+  {
+    handler: 'webostv',
+    match: ['lg', 'webos', 'web os'],
+    confidence: 'medium',
+    reason: 'LG webOS TV má oficiální HA integraci; pro ruční flow obvykle stačí host/IP a potvrzení na TV.',
+  },
+  {
+    handler: 'androidtv_remote',
+    match: ['android tv', 'google tv', 'chromecast', 'sony android', 'philips android', 'tcl android', 'xiaomi'],
+    confidence: 'medium',
+    reason: 'Android/Google TV preferuje oficiální HA integraci Android TV Remote; párování vyžaduje potvrzení zobrazené na TV.',
+  },
+  {
+    handler: 'braviatv',
+    match: ['bravia', 'sony'],
+    confidence: 'medium',
+    reason: 'Sony Bravia TV má oficiální HA integraci; u Android/Google TV může být vhodnější Android TV Remote nebo Google Cast podle modelu.',
+  },
+  {
+    handler: 'philips_js',
+    match: ['philips'],
+    confidence: 'medium',
+    reason: 'Philips TV má oficiální HA integraci pro podporované modely.',
+  },
+  {
+    handler: 'cast',
+    match: ['cast', 'chromecast', 'google cast'],
+    confidence: 'low',
+    reason: 'Google Cast je bezpečný fallback pro cast/media funkce, ale nemusí pokrýt plné ovládání TV.',
+  },
+  {
+    handler: 'dlna_dmr',
+    match: ['dlna', 'dmr', 'upnp', 'ssdp'],
+    confidence: 'low',
+    reason: 'DLNA/SSDP zařízení může být jen renderer; začít read-only ověřením media_player entity, neslibovat plné ovládání.',
+  },
+];
+
 const PLUG_RISK_KEYWORDS = [
   'cerpadlo',
   'čerpadlo',
@@ -93,6 +138,11 @@ function candidateText(candidate = {}) {
     candidate.integration,
     candidate.entity_id,
     candidate.handler,
+    candidate.ssdp_st,
+    candidate.ssdp_usn,
+    candidate.ssdp_server,
+    candidate.mdns_name,
+    candidate.dhcp_hostname,
   ].join(' ');
 }
 
@@ -107,6 +157,11 @@ function mergeCandidate(input = {}) {
     integration: input.integration || (input.candidate && input.candidate.integration),
     entity_id: input.entity_id || (input.candidate && input.candidate.entity_id),
     domain: input.domain || (input.candidate && input.candidate.domain),
+    ssdp_st: input.ssdp_st || (input.candidate && input.candidate.ssdp_st),
+    ssdp_usn: input.ssdp_usn || (input.candidate && input.candidate.ssdp_usn),
+    ssdp_server: input.ssdp_server || (input.candidate && input.candidate.ssdp_server),
+    mdns_name: input.mdns_name || (input.candidate && input.candidate.mdns_name),
+    dhcp_hostname: input.dhcp_hostname || (input.candidate && input.candidate.dhcp_hostname),
   };
 }
 
@@ -151,6 +206,44 @@ function inferPlugOnboarding(candidate = {}) {
   };
 }
 
+function inferTvOnboarding(candidate = {}) {
+  const haystack = normalizeText(candidateText(candidate));
+  const recommendedHandlers = [];
+
+  for (const guide of TV_HANDLER_GUIDES) {
+    const matched = guide.match.filter(token => haystack.includes(normalizeText(token)));
+    if (matched.length) {
+      recommendedHandlers.push({
+        handler: guide.handler,
+        confidence: guide.confidence,
+        reason: guide.reason,
+        matched,
+      });
+    }
+  }
+
+  return {
+    recommended_handlers: recommendedHandlers.length
+      ? recommendedHandlers
+      : [{
+          handler: null,
+          confidence: 'none',
+          reason: 'Z dostupných metadat nejde bezpečně vybrat Samsung/LG/Android TV/Bravia/Philips/Cast/DLNA integraci. Žán si má říct o výrobce/model TV nebo nechat uživatele vybrat ručně v HA.',
+          matched: [],
+        }],
+    pairing: {
+      requires_screen_confirmation: true,
+      rule: 'TV párování ber jako běžný krok flow: uživateli řekni, ať zapne TV a potvrdí kód/žádost na obrazovce. Dokud get_states/get_new_entities nepotvrdí novou media_player entitu, neříkej hotovo.',
+    },
+    after_pairing: [
+      'ověřit novou media_player entitu přes get_new_entities nebo get_states',
+      'pokud flow vrátí form/pairing krok, předej uživateli instrukci k potvrzení na obrazovce TV a čekej na jeho potvrzení',
+      'zeptat se na místnost a přiřadit zařízení přes ha_setup_assign_device až po potvrzení',
+      'ovládání omezit na schopnosti konkrétní integrace; neslibovat zdroj/hlasitost/power univerzálně',
+    ],
+  };
+}
+
 function inferCandidateCategory(candidate = {}) {
   const haystack = normalizeText(candidateText(candidate));
   const domain = String(candidate.domain || candidate.entity_id || '').split('.')[0];
@@ -185,6 +278,7 @@ function inferCandidateCategory(candidate = {}) {
     confidence: scored[0] ? scored[0].confidence : 'none',
     candidates: scored,
     plug_onboarding: scored.some(item => item.category === 'plug') ? inferPlugOnboarding(candidate) : undefined,
+    tv_onboarding: scored.some(item => item.category === 'tv') ? inferTvOnboarding(candidate) : undefined,
     note: scored.length
       ? 'Jen návrh kategorie podle názvu/výrobce/domény. Finální typ a dokončení párování musí potvrdit uživatel.'
       : 'Kategorie nejde spolehlivě odhadnout z dostupných metadat.',
@@ -221,6 +315,7 @@ function buildOnboardDeviceRequest(input = {}) {
 
   const candidate = mergeCandidate(input);
   const plugOnboarding = category === 'plug' ? inferPlugOnboarding(candidate) : null;
+  const tvOnboarding = category === 'tv' ? inferTvOnboarding(candidate) : null;
   const handler = String(input.handler || '').trim();
   if (!handler) {
     return {
@@ -228,11 +323,16 @@ function buildOnboardDeviceRequest(input = {}) {
       needs_handler: true,
       suggested_handlers: plugOnboarding
         ? plugOnboarding.recommended_handlers
-        : (CATEGORY_HINTS[category] ? CATEGORY_HINTS[category].handlers : []),
+        : tvOnboarding
+          ? tvOnboarding.recommended_handlers
+          : (CATEGORY_HINTS[category] ? CATEGORY_HINTS[category].handlers : []),
       automation_safety: plugOnboarding ? plugOnboarding.automation_safety : undefined,
-      after_pairing: plugOnboarding ? plugOnboarding.after_pairing : undefined,
+      tv_pairing: tvOnboarding ? tvOnboarding.pairing : undefined,
+      after_pairing: plugOnboarding ? plugOnboarding.after_pairing : tvOnboarding ? tvOnboarding.after_pairing : undefined,
       message: plugOnboarding && plugOnboarding.recommended_handlers[0].handler
         ? 'Vyber konkrétní HA integraci podle doporučení a potvrzení uživatele. Žán nesmí dokončit párování ani automatizaci naslepo.'
+        : tvOnboarding && tvOnboarding.recommended_handlers[0].handler
+          ? 'Vyber konkrétní HA integraci podle doporučení a potvrzení uživatele. U TV počítej s potvrzením na obrazovce a hotovo říkej až po ověření media_player entity.'
         : 'Nejdřív vyber konkrétní HA integraci podle výrobce/modelu. Žán nesmí tipovat handler.',
     };
   }
@@ -242,14 +342,17 @@ function buildOnboardDeviceRequest(input = {}) {
     handler,
     userInput: input.flow_input && typeof input.flow_input === 'object' ? input.flow_input : null,
     automation_safety: plugOnboarding ? plugOnboarding.automation_safety : undefined,
-    after_pairing: plugOnboarding ? plugOnboarding.after_pairing : undefined,
+    tv_pairing: tvOnboarding ? tvOnboarding.pairing : undefined,
+    after_pairing: plugOnboarding ? plugOnboarding.after_pairing : tvOnboarding ? tvOnboarding.after_pairing : undefined,
   };
 }
 
 module.exports = {
   CATEGORY_HINTS,
   PLUG_HANDLER_GUIDES,
+  TV_HANDLER_GUIDES,
   inferPlugOnboarding,
+  inferTvOnboarding,
   inferCandidateCategory,
   buildOnboardDeviceRequest,
 };
