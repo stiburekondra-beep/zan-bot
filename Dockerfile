@@ -2,7 +2,9 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # Install Node.js, jq, dependencies + nmap (sken domácí sítě — scan_network)
-RUN apk add --no-cache nodejs npm bash jq nmap
+RUN apk add --no-cache nodejs npm bash jq nmap tzdata
+
+ENV TZ=Europe/Prague
 
 # Set working directory
 WORKDIR /app
@@ -16,6 +18,7 @@ RUN npm install --production
 # spadne hned při startu na MODULE_NOT_FOUND (stalo se 2026-07-14 u v5.7.2:
 # polling-watchdog.js se nezkopíroval a Žán se vůbec nespustil).
 COPY bot.js ./
+COPY budget-report.js ./
 COPY polling-watchdog.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
@@ -27,4 +30,3 @@ RUN cp /run.sh /etc/s6-overlay/s6-rc.d/zan/run
 RUN chmod a+x /etc/s6-overlay/s6-rc.d/zan/run
 RUN mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d
 RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/zan
-

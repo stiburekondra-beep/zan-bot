@@ -1,4 +1,6 @@
 require('dotenv').config();
+const LOCAL_TIME_ZONE = process.env.ZAN_TIME_ZONE || 'Europe/Prague';
+process.env.TZ = LOCAL_TIME_ZONE;
 const TelegramBot = require('node-telegram-bot-api');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
@@ -9,6 +11,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
+const { usageCostUsd, formatBudgetReport } = require('./budget-report');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -24,6 +27,9 @@ const CHAT_JANA         = parseInt(process.env.CHAT_ID_JANA);
 const EXTRA_CHAT_IDS    = (process.env.EXTRA_CHAT_IDS || '').split(',').map(x => parseInt(x)).filter(Boolean);
 const ALLOWED_CHATS     = [CHAT_ONDRA, CHAT_JANA, ...EXTRA_CHAT_IDS].filter(Boolean);
 const ADMIN_CHATS       = [CHAT_ONDRA]; // jen Ondra může YAML, restart, kritické věci
+const HOME_NAME         = String(process.env.ZAN_HOME_NAME || 'Dům Žán').trim() || 'Dům Žán';
+const CHAT_NAME_ONDRA   = String(process.env.CHAT_NAME_ONDRA || 'Ondra').trim() || 'Ondra';
+const CHAT_NAME_JANA    = String(process.env.CHAT_NAME_JANA || 'Jana').trim() || 'Jana';
 
 const HA_URL            = process.env.HA_URL;
 const HA_TOKEN          = process.env.HA_TOKEN;
@@ -34,10 +40,45 @@ const ANTHROPIC_KEY     = process.env.ANTHROPIC_API_KEY;
 const OPENAI_KEY        = process.env.OPENAI_API_KEY;
 const HARNESS_ENABLED   = /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ENABLED || ''));
 const HARNESS_CHAT_ID   = parseInt(process.env.ZAN_HARNESS_CHAT_ID || '', 10);
-const HARNESS_ONLY      = HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ONLY || ''));
+const TEST_EXPORTS      = /^(1|true|yes|on)$/i.test(String(process.env.ZAN_TEST_EXPORTS || ''));
+const HARNESS_ONLY      = TEST_EXPORTS || (HARNESS_ENABLED && /^(1|true|yes|on)$/i.test(String(process.env.ZAN_HARNESS_ONLY || '')));
 const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STALE_MS || String(10 * 60 * 1000), 10);
 const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
+
+function localDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('cs-CZ', {
+    timeZone: LOCAL_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+}
+
+function formatLocalDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat('cs-CZ', {
+    timeZone: LOCAL_TIME_ZONE,
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    hour12: false,
+  }).format(date);
+}
+
+function localDayPeriod(date = new Date()) {
+  const hour = Number(localDateParts(date).hour);
+  if (hour >= 0 && hour < 5) return 'noc / po půlnoci';
+  if (hour < 10) return 'ráno';
+  if (hour < 12) return 'dopoledne';
+  if (hour < 18) return 'odpoledne';
+  if (hour < 22) return 'večer';
+  return 'noc';
+}
 
 // Perzistentní data PATŘÍ MIMO /app — kontejner se při každém updatu
 // add-onu staví znovu a /app (=__dirname) se zahazuje. /config je mapované
@@ -318,15 +359,6 @@ const PACKAGE_CATEGORIES = {
 const USAGE_FILE = path.join(DATA_DIR, 'zan_usage.json');
 const USD_CZK = 23; // hrubý kurz pro orientační přepočet
 
-function modelPricing(model = MODEL) {
-  // [input, output, cache_read, cache_write] USD za MTok — per model,
-  // ne podle globálního MODEL (jinak /budget lže, jakmile běží víc modelů)
-  const m = String(model);
-  if (m.includes('haiku')) return [1, 5, 0.1, 1.25];
-  if (m.includes('opus'))  return [15, 75, 1.5, 18.75];
-  return [3, 15, 0.3, 3.75]; // sonnet a ostatní
-}
-
 function loadUsage() {
   try { if (fs.existsSync(USAGE_FILE)) return JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch {}
   return { days: {} };
@@ -360,19 +392,6 @@ function trackUsage(usage, model = MODEL) {
     fs.writeFileSync(USAGE_FILE, JSON.stringify(u, null, 2), 'utf8');
     console.log(`💰 tokens: in=${usage.input_tokens} out=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens || 0} cache_write=${usage.cache_creation_input_tokens || 0}`);
   } catch (e) { console.warn('trackUsage:', e.message); }
-}
-
-function usageCostUsd(d) {
-  // Dny s rozpadem po modelech se počítají přesně; starší dny (bez d.models)
-  // padají na cenu aktuálního globálního modelu jako dřív.
-  if (d.models && Object.keys(d.models).length) {
-    return Object.entries(d.models).reduce((sum, [m, v]) => {
-      const [pi, po, pcr, pcw] = modelPricing(m);
-      return sum + (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
-    }, 0);
-  }
-  const [pi, po, pcr, pcw] = modelPricing();
-  return (d.input * pi + d.output * po + d.cache_read * pcr + d.cache_write * pcw) / 1e6;
 }
 
 async function claudeCreate(params) {
@@ -431,12 +450,71 @@ function checkRateLimit(chatId) {
 // UŽIVATELÉ
 // ═══════════════════════════════════════════════
 function getUser(chatId) {
-  if (chatId === CHAT_ONDRA) return { name: 'Ondra', role: 'admin' };
-  if (chatId === CHAT_JANA) return { name: 'Jana', role: 'user' };
+  if (chatId === CHAT_ONDRA) return { name: CHAT_NAME_ONDRA, role: 'admin' };
+  if (chatId === CHAT_JANA) return { name: CHAT_NAME_JANA, role: 'user' };
   return { name: 'Host', role: 'guest' };
 }
 
 function isAdmin(chatId) { return ADMIN_CHATS.includes(chatId); }
+
+function renderStartMessage(memory, user) {
+  const homeKnown = Object.keys(memory.rooms || {}).length > 0;
+  const residentsKnown = Object.keys(memory.residents || {}).length > 0;
+
+  if (!homeKnown || !residentsKnown) {
+    return {
+      text:
+        `👋 Ahoj ${user.name}! Jsem *Žán* — váš věrný správce domu! 🏠\n\n` +
+        'Jsem tu, abych se o vás postaral. Ale nejdřív se musím trochu seznámit!\n\n' +
+        '*Kdo jste a jak vypadá váš dům?*\n\n' +
+        `_Například: "Jsem ${CHAT_NAME_ONDRA}, bydlíme v rodinném domě. Máme obývák, kuchyň, ložnici, koupelnu a technickou místnost."_`,
+      extra: { parse_mode: 'Markdown' },
+    };
+  }
+
+  const residents = memory.residents || {};
+  const names = Object.values(residents).map(r => r.name).join(' a ');
+  return {
+    text:
+      `👋 Ahoj ${user.name}! Jsem zpět — správce domu ${memory.home_name}.\n\n` +
+      `Pamatuji si ${names ? names : 'vás'}, ${Object.keys(memory.rooms || {}).length} místností a ${Object.keys(memory.devices || {}).length} zařízení.\n\n` +
+      '*Co potřebuješ?* 😊\n\n' +
+      '/balicky · /dashboardy · /pamet · /stav · /log',
+    extra: { parse_mode: 'Markdown' },
+  };
+}
+
+function renderPametMessage(memory) {
+  let out = '🧠 *Co Žán ví o domě:*\n\n';
+  const residents = memory.residents || {};
+  if (Object.keys(residents).length > 0) out += `*Obyvatelé:*\n${Object.entries(residents).map(([k, v]) => `• ${v.name || k}${v.role ? ': ' + v.role : ''}`).join('\n')}\n\n`;
+  if (Object.keys(memory.rooms || {}).length > 0) out += `*Místnosti:*\n${Object.entries(memory.rooms).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
+  if (Object.keys(memory.devices || {}).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
+  if ((memory.notes || []).length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
+  if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
+  return { text: out, extra: { parse_mode: 'Markdown' } };
+}
+
+function resolveOnboardingTarget(target) {
+  const normalized = String(target || 'jana').toLowerCase();
+  const targetChat = (normalized === 'jana' || normalized === 'user')
+    ? CHAT_JANA
+    : ((normalized === 'ondra' || normalized === 'admin') ? CHAT_ONDRA : null);
+  if (!Number.isFinite(targetChat)) return null;
+  return { key: normalized, chatId: targetChat, user: getUser(targetChat) };
+}
+
+function renderOnboardingIntro(requestingUser, targetUser) {
+  const osloveni = targetUser.name || 'ahoj';
+  return (
+    `👋 Ahoj ${osloveni}! Tady Žán, váš domácí sluha. 🏠\n\n` +
+    `${requestingUser.name} mě požádal, abych se s tebou líp seznámil — ať se o vás můžu starat chytřeji ` +
+    `(topení podle toho, kdy jste doma, světla, bezpečí dětí, zahrada…).\n\n` +
+    `Budu se občas na něco zeptat — vždycky jen jedna rychlá otázka, žádné formuláře. ` +
+    `A kdykoli řekneš „dost otázek", přestanu.\n\n` +
+    `Tak první: *jak vypadá váš běžný všední den?* Kdy vstáváte, kdy kdo odchází a vrací se? Stačí pár slov. 🙂`
+  );
+}
 
 // ═══════════════════════════════════════════════
 // PAMĚŤ
@@ -445,17 +523,25 @@ function loadMemory() {
   try {
     if (fs.existsSync(MEMORY_FILE)) return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
   } catch (e) { console.error('Memory load error:', e.message); }
+  const isLegacyStiburkoviDefault =
+    HOME_NAME === 'Dům Žán' && CHAT_NAME_ONDRA === 'Ondra' && CHAT_NAME_JANA === 'Jana';
+  const residents = isLegacyStiburkoviDefault
+    ? {
+        ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
+        jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
+        stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
+        matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+        eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
+      }
+    : {
+        admin: { name: CHAT_NAME_ONDRA, born: '', emoji: '', info: '', role: 'admin' },
+        ...(Number.isFinite(CHAT_JANA) ? { user: { name: CHAT_NAME_JANA, born: '', emoji: '', info: '', role: 'user' } } : {}),
+      };
   return {
-    home_name: 'Dům Žán',
-    residents: {
-      ondra:  { name: 'Ondra',   born: '1991-11-30', emoji: '👨', info: '', role: 'admin' },
-      jana:   { name: 'Jana',    born: '1991-09-22', emoji: '👩', info: '', role: 'user' },
-      stepan: { name: 'Štěpán', born: '2019-07-20', emoji: '👦', info: '', role: 'kid' },
-      matej:  { name: 'Matěj',  born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
-      eliska: { name: 'Eliška', born: '2023-02-20', emoji: '👶', info: '', role: 'kid' },
-    },
+    home_name: HOME_NAME,
+    residents,
     house: {
-      name: 'Dům Žán',
+      name: HOME_NAME,
       address: '',
       type: '',
       year_built: '',
@@ -2675,9 +2761,9 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
   const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
-  const todayCzk = (usageCostUsd(todayUsage) * USD_CZK).toFixed(1);
+  const todayCzk = (usageCostUsd(todayUsage, MODEL) * USD_CZK).toFixed(1);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
-Dům: "${memory.home_name}" | Čas: ${new Date().toLocaleString('cs-CZ')}
+Dům: "${memory.home_name}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
 Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}
@@ -2948,68 +3034,37 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
   // ── PŘÍKAZY ──
   if (text === '/start') {
     const memory = loadMemory();
-    const homeKnown = Object.keys(memory.rooms).length > 0;
-    const residentsKnown = Object.keys(memory.residents || {}).length > 0;
-
-    if (!homeKnown || !residentsKnown) {
-      send(chatId,
-        `👋 Ahoj ${user.name}! Jsem *Žán* — váš věrný správce domu! 🏠\n\n` +
-        'Jsem tu aby se o vás postaral. Ale nejdřív se musím trochu seznámit!\n\n' +
-        '*Kdo jste a jak vypadá váš dům?*\n\n' +
-        '_Například: "Jsem Ondra, s přítelkyní Janou. Máme obývák, kuchyň, ložnici, koupelnu, záchod a technickou místnost."_',
-        { parse_mode: 'Markdown' }
-      );
-    } else {
-      const residents = memory.residents || {};
-      const names = Object.values(residents).map(r => r.name).join(' a ');
-      send(chatId,
-        `👋 Ahoj ${user.name}! Jsem zpět — správce domu ${memory.home_name}.\n\n` +
-        `Pamatuji si ${names ? names : 'vás'}, ${Object.keys(memory.rooms).length} místností a ${Object.keys(memory.devices).length} zařízení.\n\n` +
-        '*Co potřebuješ?* 😊\n\n' +
-        '/balicky · /dashboardy · /pamet · /stav · /log',
-        { parse_mode: 'Markdown' }
-      );
-    }
+    const rendered = renderStartMessage(memory, user);
+    send(chatId, rendered.text, rendered.extra);
     return;
   }
 
   // Kickoff dotazníku — Žán se sám představí a položí první otázku.
   // Jen admin (Ondra) rozhoduje, KDY se Žán ozve; Žán sám od sebe
-  // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí Jana).
+  // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí user/Jana).
   if (text.startsWith('/onboarding') && isAdmin(chatId)) {
     const target = (text.split(/\s+/)[1] || 'jana').toLowerCase();
-    const targetChat = target === 'jana' ? CHAT_JANA : (target === 'ondra' ? CHAT_ONDRA : null);
-    if (!targetChat) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding jana'); return; }
+    const resolved = resolveOnboardingTarget(target);
+    if (!resolved) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding user nebo /onboarding admin'); return; }
     ensureRodina();
-    const osloveni = target === 'jana' ? 'Jano' : 'Ondro';
-    const intro =
-      `👋 Ahoj ${osloveni}! Tady Žán, váš domácí sluha. 🏠\n\n` +
-      `Ondra mě požádal, abych se s tebou líp seznámil — ať se o vás můžu starat chytřeji ` +
-      `(topení podle toho, kdy jste doma, světla, zahrada… tu už spolu řešíme 🌱).\n\n` +
-      `Budu se občas na něco zeptat — vždycky jen jedna rychlá otázka, žádné formuláře. ` +
-      `A kdykoli řekneš „dost otázek", přestanu.\n\n` +
-      `Tak první: *jak vypadá váš běžný všední den?* Kdy vstáváte, kdy kdo odchází a vrací se? Stačí pár slov. 🙂`;
+    const targetChat = resolved.chatId;
+    const targetUser = resolved.user;
+    const intro = renderOnboardingIntro(user, targetUser);
     await send(targetChat, intro, { parse_mode: 'Markdown' });
     // Zasej intro do historie cílového chatu — až člověk odpoví, model ví,
     // na co navazuje (jinak by odpověď „vstáváme v 6" visela ve vzduchu)
     if (!conversationHistory[targetChat]) conversationHistory[targetChat] = [];
     conversationHistory[targetChat].push({ role: 'assistant', content: intro });
-    logConvo('ŽÁN', targetChat, getUser(targetChat).name, intro);
+    logConvo('ŽÁN', targetChat, targetUser.name, intro);
     logAction(chatId, user.name, 'onboarding_kickoff', target, 'ok');
-    if (targetChat !== chatId) send(chatId, `✅ Představil jsem se ${target === 'jana' ? 'Janě' : target} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
+    if (targetChat !== chatId) send(chatId, `✅ Představil jsem se ${targetUser.name} a položil první otázku dotazníku. Odpovědi se ukládají do rodina.md (/config/zan_data/).`);
     return;
   }
 
   if (text === '/pamet') {
     const memory = loadMemory();
-    let out = '🧠 *Co Žán ví o domě:*\n\n';
-    const residents = memory.residents || {};
-    if (Object.keys(residents).length > 0) out += `*Obyvatelé:*\n${Object.entries(residents).map(([k, v]) => `• ${v.name || k}${v.role ? ': ' + v.role : ''}`).join('\n')}\n\n`;
-    if (Object.keys(memory.rooms).length > 0) out += `*Místnosti:*\n${Object.entries(memory.rooms).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
-    if (Object.keys(memory.devices).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
-    if (memory.notes.length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
-    if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
-    send(chatId, out, { parse_mode: 'Markdown' });
+    const rendered = renderPametMessage(memory);
+    send(chatId, rendered.text, rendered.extra);
     return;
   }
 
@@ -3022,34 +3077,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
 
   if (text === '/budget') {
     const u = loadUsage();
-    const today = new Date().toISOString().slice(0, 10);
-    const month = today.slice(0, 7);
-    const empty = { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
-    const d = u.days[today] || empty;
-    const monthDays = Object.entries(u.days).filter(([k]) => k.startsWith(month));
-    const m = monthDays
-      .reduce((a, [, v]) => ({ calls: a.calls + v.calls, input: a.input + v.input, output: a.output + v.output, cache_read: a.cache_read + v.cache_read, cache_write: a.cache_write + v.cache_write }), { ...empty });
-    const dUsd = usageCostUsd(d);
-    // Měsíc = součet dnů (den s rozpadem po modelech se počítá přesně,
-    // starší den cenou globálního modelu) — nesčítat tokeny napříč modely!
-    const mUsd = monthDays.reduce((s, [, v]) => s + usageCostUsd(v), 0);
-    // Rozpad dneška po modelech (od zavedení model trackingu)
-    const perModel = Object.entries(d.models || {})
-      .map(([mod, v]) => {
-        const [pi, po, pcr, pcw] = modelPricing(mod);
-        const usd = (v.input * pi + v.output * po + v.cache_read * pcr + v.cache_write * pcw) / 1e6;
-        return `• ${mod.replace('claude-', '')}: ${v.calls}× ≈ ${(usd * USD_CZK).toFixed(2)} Kč`;
-      }).join('\n');
-    send(chatId,
-      `💰 *Spotřeba Žána* (výchozí model: ${MODEL})\n\n` +
-      `*Dnes:* ${d.calls} volání\n` +
-      `• input ${d.input.toLocaleString('cs-CZ')} | output ${d.output.toLocaleString('cs-CZ')}\n` +
-      `• cache: čtení ${d.cache_read.toLocaleString('cs-CZ')} | zápis ${d.cache_write.toLocaleString('cs-CZ')}\n` +
-      `• ≈ $${dUsd.toFixed(3)} (${(dUsd * USD_CZK).toFixed(2)} Kč)\n` +
-      (perModel ? `${perModel}\n` : '') +
-      `\n*Tento měsíc:* ${m.calls} volání ≈ $${mUsd.toFixed(2)} (${(mUsd * USD_CZK).toFixed(0)} Kč)\n\n` +
-      `_Sleduje se od v5.3.3 — starší spotřeba v console.anthropic.com_`,
-      { parse_mode: 'Markdown' });
+    send(chatId, formatBudgetReport(u, { defaultModel: MODEL }), { parse_mode: 'Markdown' });
     return;
   }
 
@@ -4121,3 +4149,24 @@ console.log(`📱 Ondra: ${CHAT_ONDRA} | Jana: ${CHAT_JANA}`);
 console.log(`🏡 HA: ${HA_URL}`);
 console.log(`📁 Config: ${HA_CONFIG_PATH}`);
 console.log(HARNESS_ONLY ? '🧪 Harness-only režim: Telegram polling a pozadí vypnuté' : '🧠 Sledování návyků aktivní — analýza každou neděli v 20:00');
+
+if (TEST_EXPORTS) {
+  module.exports = {
+    DATA_DIR,
+    MEMORY_FILE,
+    RODINA_FILE,
+    CHAT_ONDRA,
+    CHAT_JANA,
+    HOME_NAME,
+    CHAT_NAME_ONDRA,
+    CHAT_NAME_JANA,
+    getUser,
+    loadMemory,
+    saveMemory,
+    ensureRodina,
+    renderStartMessage,
+    renderPametMessage,
+    resolveOnboardingTarget,
+    renderOnboardingIntro,
+  };
+}
