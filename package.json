@@ -14,7 +14,8 @@
     "test:config-git-backup": "node scripts/check-config-git-backup.js",
     "test:prompt-contract": "node scripts/check-prompt-contract.js",
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js",
-    "test:local-time": "node scripts/check-local-time-context.js"
+    "test:local-time": "node scripts/check-local-time-context.js",
+    "test:onboard-device": "node scripts/check-onboard-device.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

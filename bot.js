@@ -29,6 +29,7 @@ const {
   configGitStatus,
   rollbackConfigGit,
 } = require('./config-git-backup');
+const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -239,7 +240,7 @@ const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
 
 // Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
 // Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
-const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device'];
+const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device'];
 
 function stripDiacritics(s) {
   return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
@@ -668,6 +669,65 @@ function enrichHostsWithNeighborMacs(hosts, neighborMacs) {
   return hosts;
 }
 
+async function runOnboardDeviceFlow(input) {
+  const request = buildOnboardDeviceRequest(input);
+  if (request.error) return { error: request.error };
+  if (request.needs_handler) {
+    return {
+      success: false,
+      category: request.category,
+      needs_handler: true,
+      suggested_handlers: request.suggested_handlers,
+      message: request.message,
+    };
+  }
+
+  let flow = await haPost('config/config_entries/flow', {
+    handler: request.handler,
+    show_advanced_options: false,
+  });
+  console.log(`🧩 onboard_device ${request.category}/${request.handler} krok 0: ${JSON.stringify(flow).slice(0, 400)}`);
+
+  if (!request.userInput) {
+    return {
+      success: true,
+      category: request.category,
+      handler: request.handler,
+      next_step: flow && flow.type === 'form' ? flow.step_id : null,
+      needs_user_input: flow && flow.type === 'form',
+      message: flow && flow.type === 'form'
+        ? 'Config flow je založený. Dál potřebuje údaje uživatele nebo potvrzení podle formuláře; nedokončuji ho naslepo.'
+        : 'Config flow založený.',
+      raw: flow,
+    };
+  }
+
+  let step = 0;
+  while (flow && flow.type === 'form' && step < 4) {
+    const stepId = flow.step_id;
+    const userInput = step === 0 ? request.userInput : {};
+    flow = await haPost(`config/config_entries/flow/${flow.flow_id}`, userInput);
+    step++;
+    console.log(`🧩 onboard_device ${request.category}/${request.handler} krok ${step} (step_id=${stepId}): ${JSON.stringify(flow).slice(0, 500)}`);
+  }
+
+  if (flow && flow.type === 'create_entry') {
+    return {
+      success: true,
+      category: request.category,
+      handler: request.handler,
+      message: `Zařízení kategorie ${request.category} bylo přidané přes HA integraci ${request.handler}.`,
+      raw: flow,
+    };
+  }
+
+  const stepErrors = flow && flow.errors ? flow.errors : null;
+  return {
+    error: stepErrors ? `HA odmítlo: ${JSON.stringify(stepErrors)}` : 'Přidání zařízení neskončilo úspěchem (create_entry).',
+    raw: flow,
+  };
+}
+
 // ═══════════════════════════════════════════════
 // SAMBA
 // ═══════════════════════════════════════════════
@@ -1082,7 +1142,7 @@ function buildTools(chatId) {
     },
     {
       name: 'get_new_entities',
-      description: 'Najde entity které Žán ještě nezná — nově přidaná zařízení.',
+      description: 'Najde entity které Žán ještě nezná — nově přidaná zařízení. U každé vrátí i konzervativní návrh kategorie pro onboarding (plug/tv/climate/camera), ale finální typ vždy potvrzuje uživatel.',
       input_schema: { type: 'object', properties: {}, required: [] },
     },
     {
@@ -1115,7 +1175,7 @@ function buildTools(chatId) {
     },
     {
       name: 'create_area',
-      description: 'Vytvoří novou místnost (oblast) v HA.',
+      description: 'Kompatibilní alias pro ha_setup_create_area bez patra. Pro nový onboarding používej raději ha_setup_create_area po ha_setup_list, ať nevznikají duplicity.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1138,7 +1198,7 @@ function buildTools(chatId) {
     },
     {
       name: 'assign_device_to_area',
-      description: 'Přiřadí celé zařízení (device_id) do místnosti. Použij po scan_all_devices když znáš device_id.',
+      description: 'Kompatibilní alias pro ha_setup_assign_device. Pro nový onboarding používej ha_setup_assign_device s device_id a area_id z ha_setup_list.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1427,12 +1487,30 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'scan_network',
-        description: 'Prohledá domácí síť (LAN) a najde připojená zařízení — IP adresu, MAC a výrobce, pokud jde zjistit. Použij, když potřebuješ najít IP nové kamery/zařízení, které uživatel nezná (např. při přidávání kamery). Trvá cca 15–30 sekund. Zařízení od TP-Link (Tapo kamery) pozná podle výrobce v MAC adrese.',
+        description: 'Prohledá domácí síť (LAN) a najde připojená zařízení — IP adresu, MAC a výrobce, pokud jde zjistit. Vrátí i konzervativní návrh kategorie kandidáta (camera/plug/tv/climate), ale finální typ a dokončení párování potvrzuje uživatel. Trvá cca 15–30 sekund.',
         input_schema: { type: 'object', properties: {}, required: [] },
       },
       {
+        name: 'onboard_device',
+        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
+        input_schema: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', enum: ['camera', 'plug', 'tv', 'climate', 'generic'] },
+            handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, daikin. Netipuj naslepo.' },
+            flow_input: { type: 'object', description: 'Data pro první krok flow, jen pokud je uživatel potvrdil a víš přesně, co HA integrace čeká.' },
+            host: { type: 'string', description: 'Pro category=camera: lokální IP kamery' },
+            username: { type: 'string', description: 'Pro category=camera: lokální Camera Account uživatel' },
+            password: { type: 'string', description: 'Pro category=camera: heslo lokálního Camera Accountu' },
+            stream_path: { type: 'string', description: 'Pro category=camera: výchozí /stream1' },
+            name: { type: 'string', description: 'Lidský název zařízení/místnosti pro konverzaci' },
+          },
+          required: ['category'],
+        },
+      },
+      {
         name: 'setup_camera',
-        description: `Přidá kameru do Home Assistant (Generic Camera / RTSP — funguje na Tapo a většinu IP kamer). NEČEKEJ, že budou všechny údaje hned k dispozici — doptej se na ně sám, po jedné otázce: 1) lokální IP kamery na síti, 2) u Tapo: má uživatel v appce Tapo vytvořený "Camera Account" (Advanced Settings → Camera Account — JINÝ účet než cloudové přihlášení, bez něj RTSP nejde)? Pokud ne, vysvětli mu krok za krokem jak ho vytvořit. 3) přihlašovací jméno/heslo z toho Camera Account. 4) jak se má kamera/místnost jmenovat. Teprve pak zavolej tenhle nástroj.`,
+        description: `Kompatibilní alias pro onboard_device(category="camera", handler="generic"). Přidá kameru do Home Assistant (Generic Camera / RTSP — funguje na Tapo a většinu IP kamer). NEČEKEJ, že budou všechny údaje hned k dispozici — doptej se na ně sám, po jedné otázce: 1) lokální IP kamery na síti, 2) u Tapo: má uživatel v appce Tapo vytvořený "Camera Account" (Advanced Settings → Camera Account — JINÝ účet než cloudové přihlášení, bez něj RTSP nejde)? Pokud ne, vysvětli mu krok za krokem jak ho vytvořit. 3) přihlašovací jméno/heslo z toho Camera Account. 4) jak se má kamera/místnost jmenovat. Teprve pak zavolej tenhle nástroj.`,
         input_schema: {
           type: 'object',
           properties: {
@@ -1780,7 +1858,8 @@ async function executeTool(name, input, chatId) {
         const details = await Promise.all(newEntities.slice(0, 20).map(async e => {
           try {
             const s = await haGet(`states/${e}`);
-            return { entity_id: e, name: s.attributes.friendly_name || e, state: s.state, domain: e.split('.')[0] };
+            const detail = { entity_id: e, name: s.attributes.friendly_name || e, state: s.state, domain: e.split('.')[0] };
+            return { ...detail, onboarding_candidate: inferCandidateCategory(detail) };
           } catch { return { entity_id: e }; }
         }));
         return { new_entities: details, count: newEntities.length };
@@ -1921,8 +2000,8 @@ async function executeTool(name, input, chatId) {
         try {
           // Oprava 2026-07-05: REST config/area_registry/create vrací 404,
           // stejný problém jako u ha_setup_create_area — přepnuto na WS.
-          // (Pozn.: ha_setup_create_area dělá totéž + rovnou i patro —
-          // pro rychlé vytvoření místnosti bez patra zůstává i tenhle.)
+          // 2026-07-20: starý název zůstává jen jako kompatibilní alias;
+          // nová onboarding cesta má používat ha_setup_create_area po ha_setup_list.
           const result = await haWsCommand('config/area_registry/create', { name: input.name });
           logAction(chatId, user.name, 'create_area', input.name, 'ok');
           return { success: true, area_id: result.area_id, name: result.name, raw: result };
@@ -1963,7 +2042,7 @@ async function executeTool(name, input, chatId) {
             area_id = found.area_id;
           }
           // Oprava 2026-07-05: REST config/device_registry/update vrací 404 — WS.
-          // (ha_setup_assign_device dělá totéž — tenhle navíc umí i název místo ID.)
+          // 2026-07-20: kompatibilní alias ke ha_setup_assign_device.
           await haWsCommand('config/device_registry/update', { device_id: input.device_id, area_id });
           logAction(chatId, user.name, 'assign_device_area', input.device_id, area_id);
           return { success: true, message: `Zařízení ${input.device_id} přiřazeno do oblasti ${area_id}` };
@@ -2414,7 +2493,8 @@ async function executeTool(name, input, chatId) {
           if (!subnet) return { error: 'Nepodařilo se zjistit domácí síť (LAN rozhraní nenalezeno) — zkontroluj host_network v config.yaml add-onu.' };
 
           const output = execSync(`nmap -sn ${subnet}`, { timeout: 45000 }).toString();
-          const hosts = enrichHostsWithNeighborMacs(parseNmapScanHosts(output), readNeighborMacs());
+          const hosts = enrichHostsWithNeighborMacs(parseNmapScanHosts(output), readNeighborMacs())
+            .map(h => ({ ...h, onboarding_candidate: inferCandidateCategory(h) }));
           const withMac = hosts.filter(h => h.mac).length;
           const fromNmap = hosts.filter(h => h.mac_source === 'nmap').length;
           const fromNeighbor = hosts.filter(h => h.mac_source === 'ip_neigh').length;
@@ -2433,49 +2513,33 @@ async function executeTool(name, input, chatId) {
         }
       }
 
+      case 'onboard_device': {
+        if (!isAdmin(chatId)) return { error: 'Přidání zařízení vyžaduje admin přístup.' };
+        try {
+          const result = await runOnboardDeviceFlow(input);
+          if (result.success) logAction(chatId, user.name, 'onboard_device', `${input.category}/${input.handler || result.handler || ''}`, result.message || 'ok');
+          return result;
+        } catch (e) {
+          console.error(`🔴 onboard_device vyjimka: ${e.message}`);
+          return {
+            error: `Přidání zařízení selhalo: ${e.message}`,
+            tip: 'Zkus přidat ručně v HA: Nastavení → Zařízení a služby → Přidat integraci. Neříkej uživateli, že je hotovo, dokud HA nevrátí create_entry nebo neuvidíš novou entitu.',
+          };
+        }
+      }
+
       case 'setup_camera': {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
-          const streamPath = input.stream_path || '/stream1';
-          // Bez přihlašovacích údajů v URL — Generic Camera integrace má
-          // username/password jako samostatná pole (ověřeno živě 2026-07-05).
-          const streamUrl = `rtsp://${input.host}:554${streamPath}`;
-
-          // Oprava 2026-07-05: config_entries/flow je REST, ne WebSocket
-          // (opak area/floor/device registry, které jsou WS-only) — ověřeno
-          // přímým testem, "Unknown command" byla chyba ve špatném kanálu.
-          let flow = await haPost('config/config_entries/flow', {
-            handler: 'generic', show_advanced_options: false,
-          });
-          console.log(`📷 setup_camera krok 0 (create): ${JSON.stringify(flow).slice(0, 400)}`);
-
-          let step = 0;
-          while (flow && flow.type === 'form' && step < 3) {
-            const stepId = flow.step_id;
-            let userInput;
-            if (stepId === 'user') {
-              userInput = {
-                stream_source: streamUrl,
-                username: input.username,
-                password: input.password,
-                advanced: { framerate: 2, verify_ssl: false, rtsp_transport: 'tcp', authentication: 'basic' },
-              };
-            } else {
-              userInput = {}; // potvrzovací/confirm krok — prázdný submit
-            }
-            flow = await haPost(`config/config_entries/flow/${flow.flow_id}`, userInput);
-            step++;
-            console.log(`📷 setup_camera krok ${step} (step_id=${stepId}): ${JSON.stringify(flow).slice(0, 500)}`);
-          }
-
-          if (flow && flow.type === 'create_entry') {
+          const result = await runOnboardDeviceFlow({ ...input, category: 'camera', handler: 'generic' });
+          if (result.success && result.raw && result.raw.type === 'create_entry') {
             logAction(chatId, user.name, 'setup_camera', input.name, 'ok');
-            return { success: true, message: `Kamera "${input.name}" přidána do HA.`, raw: flow };
+            return { ...result, message: `Kamera "${input.name}" přidána do HA.` };
           }
-          console.error(`🔴 setup_camera neskončilo create_entry, finální stav: ${JSON.stringify(flow).slice(0, 600)}`);
-          const stepErrors = flow && flow.errors ? flow.errors : null;
+          console.error(`🔴 setup_camera neskončilo create_entry, finální stav: ${JSON.stringify(result.raw || result).slice(0, 600)}`);
+          const stepErrors = result.raw && result.raw.errors ? result.raw.errors : null;
           return {
-            error: stepErrors ? `HA odmítlo: ${JSON.stringify(stepErrors)}` : 'Přidání kamery neskončilo úspěchem (create_entry).',
+            error: stepErrors ? `HA odmítlo: ${JSON.stringify(stepErrors)}` : (result.error || 'Přidání kamery neskončilo úspěchem (create_entry).'),
             tip: stepErrors && stepErrors.stream_source === 'timeout'
               ? 'HA se nedokázalo připojit ke kameře (timeout) — zkontroluj, jestli kamera na téhle IP skutečně běží a jestli má RTSP/Camera Account opravdu povolený.'
               : undefined,
@@ -2833,7 +2897,7 @@ Entity_id do karet VŽDY z get_states (mívají sériová čísla uvnitř, např
 Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity oprav hned — nikdy „hotovo" s nefunkční kartou.
 
 ═══ 5. WORKFLOWY ═══
-NOVÉ ZAŘÍZENÍ: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové → navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → create_area (chybí-li) → assign_device_to_area → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
+NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.
@@ -2850,7 +2914,7 @@ OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, po
 
 TESTOVACÍ VĚCI: soubory s příponou _test, nadpis "🧪 TEST:", helpery (input_*, timer, counter) místo chybějícího HW, v kartách označ "(sim)". Reálné domény: sensor, binary_sensor, light, switch, climate, cover, media_player, fan. Po vytvoření vysvětli, co je reálné a co simulace a co přikoupit (s cenou).
 
-KAMERA: camera_snapshot jen na výslovnou žádost („co se děje na terase"), nikdy sám od sebe — nejsi špión. Po snímku popiš věcně, co vidíš. Přidání kamery: doptej se po jedné otázce; IP nezná → scan_network (výrobce TP-Link = Tapo) a nabídni k výběru; Tapo potřebuje Camera Account (ne cloudový účet) — vysvětli založení; pak setup_camera; doporuč DHCP rezervaci. Když nástroj selže, řekni to na rovinu a dej návod na ruční přidání (Nastavení → Zařízení a služby → Generic Camera).
+KAMERA: camera_snapshot jen na výslovnou žádost („co se děje na terase"), nikdy sám od sebe — nejsi špión. Po snímku popiš věcně, co vidíš. Přidání kamery: doptej se po jedné otázce; IP nezná → scan_network (výrobce TP-Link/Tapo je jen kandidát) a nabídni k výběru; Tapo potřebuje Camera Account (ne cloudový účet) — vysvětli založení; pak onboard_device(category="camera", handler="generic", ...) nebo kompatibilní setup_camera; doporuč DHCP rezervaci. Když nástroj selže, řekni to na rovinu a dej návod na ruční přidání (Nastavení → Zařízení a služby → Generic Camera).
 
 VELKÉ ÚKOLY: neodmítej a neříkej „to nezvládnu". Zhodnoť rozsah, řekni na rovinu („je toho hodně, zvládnu přes noc"), queue_task(add) s konkrétním popisem a potvrď kdy. Malé věci dělej hned. Rozhoduj podle rozsahu a dnešní útraty v kontextu, ne podle strachu.
 
