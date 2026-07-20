@@ -1492,13 +1492,17 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'onboard_device',
-        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
+        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Pro plug předávej candidate metadata ze scan_network/get_new_entities; vrátí doporučení Shelly/TP-Link/Matter podle výrobce/modelu a bezpečnostní brzdu pro rizikové spotřebiče. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
         input_schema: {
           type: 'object',
           properties: {
             category: { type: 'string', enum: ['camera', 'plug', 'tv', 'climate', 'generic'] },
             handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, daikin. Netipuj naslepo.' },
             flow_input: { type: 'object', description: 'Data pro první krok flow, jen pokud je uživatel potvrdil a víš přesně, co HA integrace čeká.' },
+            candidate: { type: 'object', description: 'Metadata kandidáta ze scan_network/get_new_entities: hostname, vendor/manufacturer, model, name, entity_id. Pro plug pomáhá vybrat Shelly/TP-Link/Matter bez tipování.' },
+            vendor: { type: 'string', description: 'Výrobce, pokud ho znáš ze scan_network nebo uživatelova potvrzení.' },
+            manufacturer: { type: 'string' },
+            model: { type: 'string' },
             host: { type: 'string', description: 'Pro category=camera: lokální IP kamery' },
             username: { type: 'string', description: 'Pro category=camera: lokální Camera Account uživatel' },
             password: { type: 'string', description: 'Pro category=camera: heslo lokálního Camera Accountu' },
@@ -2898,6 +2902,8 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 
 ═══ 5. WORKFLOWY ═══
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
+
+ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, zeptej se na místnost a přiřaď ji přes ha_setup_assign_device. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.
