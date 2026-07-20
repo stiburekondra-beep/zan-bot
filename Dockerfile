@@ -2,7 +2,8 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # Install Node.js, jq, dependencies + nmap (sken domácí sítě — scan_network)
-RUN apk add --no-cache nodejs npm bash jq nmap tzdata
+# + git pro lokální historii /config před zápisy Žána.
+RUN apk add --no-cache nodejs npm bash jq nmap tzdata git
 
 ENV TZ=Europe/Prague
 
@@ -20,6 +21,11 @@ RUN npm install --production
 COPY bot.js ./
 COPY budget-report.js ./
 COPY polling-watchdog.js ./
+COPY dashboard-validator.js ./
+COPY memory-devices.js ./
+COPY reminders.js ./
+COPY tts-announcements.js ./
+COPY config-git-backup.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

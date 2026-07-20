@@ -12,6 +12,23 @@ const { execSync } = require('child_process');
 const FormData = require('form-data');
 const { createPollingWatchdog } = require('./polling-watchdog');
 const { usageCostUsd, formatBudgetReport } = require('./budget-report');
+const { extractDashboardEntitiesFromYaml } = require('./dashboard-validator');
+const { cleanDeviceMemory, formatMemoryMap } = require('./memory-devices');
+const {
+  addReminder,
+  cancelReminder,
+  dueReminders,
+  listReminders,
+  markReminderDelivered,
+  markReminderPending,
+} = require('./reminders');
+const { announceHome } = require('./tts-announcements');
+const {
+  ensureConfigGitRepo,
+  snapshotConfigGit,
+  configGitStatus,
+  rollbackConfigGit,
+} = require('./config-git-backup');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -45,6 +62,7 @@ const HARNESS_ONLY      = TEST_EXPORTS || (HARNESS_ENABLED && /^(1|true|yes|on)$
 const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STALE_MS || String(10 * 60 * 1000), 10);
 const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
+const CONFIG_GIT_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.ZAN_CONFIG_GIT_ENABLED || 'true'));
 
 function localDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('cs-CZ', {
@@ -109,6 +127,7 @@ const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
 const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
 const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
+const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -488,8 +507,8 @@ function renderPametMessage(memory) {
   let out = '🧠 *Co Žán ví o domě:*\n\n';
   const residents = memory.residents || {};
   if (Object.keys(residents).length > 0) out += `*Obyvatelé:*\n${Object.entries(residents).map(([k, v]) => `• ${v.name || k}${v.role ? ': ' + v.role : ''}`).join('\n')}\n\n`;
-  if (Object.keys(memory.rooms || {}).length > 0) out += `*Místnosti:*\n${Object.entries(memory.rooms).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
-  if (Object.keys(memory.devices || {}).length > 0) out += `*Zařízení:*\n${Object.entries(memory.devices).map(([k, v]) => `• ${k}: ${v}`).join('\n')}\n\n`;
+  if (Object.keys(memory.rooms || {}).length > 0) out += `*Místnosti:*\n${formatMemoryMap(memory.rooms)}\n\n`;
+  if (Object.keys(memory.devices || {}).length > 0) out += `*Zařízení uložená rodinou:*\n${formatMemoryMap(memory.devices)}\n\n`;
   if ((memory.notes || []).length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
   if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
   return { text: out, extra: { parse_mode: 'Markdown' } };
@@ -846,14 +865,30 @@ function recordChange(fp, backupPath, wasNew) {
   lastChange = { file: fp, backup: backupPath, wasNew, when: new Date().toISOString() };
 }
 
+function snapshotConfig(label, fp) {
+  if (!CONFIG_GIT_ENABLED) return { ok: true, disabled: true };
+  const res = snapshotConfigGit(HA_CONFIG_PATH, label, fp);
+  if (!res.ok) console.warn('config git snapshot:', res.error || res.reason);
+  return res;
+}
+
+function configGitNote(res) {
+  if (!res || res.disabled) return 'config git vypnutý';
+  if (!res.ok) return `config git selhal: ${res.error || res.reason}`;
+  if (!res.changed) return 'config git: beze změny';
+  return `config git: snapshot ${res.commit}`;
+}
+
 function restoreLastChange() {
   // Vrátí poslední zápis: nový soubor smaže, přepsaný obnoví ze zálohy.
   if (!lastChange) return { error: 'Není co vracet — od startu add-onu žádný zaznamenaný zápis.' };
   try {
     const { file, backup, wasNew, when } = lastChange;
+    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `before Zan undo ${path.basename(file)}`);
     if (wasNew) { if (fs.existsSync(file)) fs.unlinkSync(file); }
     else if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, file);
     else return { error: 'Záloha se nenašla — obnov ručně z /config/zan_data/backups/.' };
+    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `after Zan undo ${path.basename(file)}`, file);
     lastChange = null;
     return { success: true, restored: path.basename(file), was_new_file_deleted: wasNew, change_from: when };
   } catch (e) { return { error: e.message }; }
@@ -1008,6 +1043,22 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'announce_home',
+      description: 'Řekne krátké oznámení doma přes Home Assistant TTS. Použij jen na výslovné přání uživatele oznámit něco do domu. Nejdřív si ověř dostupné tts/media_player entity přes get_states, netipuj je.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'Krátký text, který se má říct nahlas. Max 300 znaků.' },
+          tts_entity_id: { type: 'string', description: 'TTS entita, např. tts.piper nebo tts.google_translate_cs_com' },
+          media_player_entity_id: { type: 'string', description: 'Cílový přehrávač, např. media_player.kuchyn' },
+          cache: { type: 'boolean', description: 'Zapnout cache TTS. Výchozí true.' },
+          language: { type: 'string', description: 'Volitelný jazyk, např. cs.' },
+          options: { type: 'object', description: 'Volitelné HA TTS options.' },
+        },
+        required: ['message', 'tts_entity_id', 'media_player_entity_id'],
+      },
+    },
+    {
       name: 'remember',
       description: 'Uloží informaci do paměti.',
       input_schema: {
@@ -1150,6 +1201,20 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'reminder',
+      description: 'Správa osobních připomínek v Telegramu. Použij pro věci typu "připomeň mi zítra v 7:30". Čas vždy předej jako konkrétní ISO datum s časovou zónou; když čas není jasný, nejdřív se krátce doptej.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['add', 'list', 'cancel'] },
+          due_at: { type: 'string', description: 'ISO čas s časovou zónou, např. 2026-07-20T07:30:00+02:00 (add)' },
+          text: { type: 'string', description: 'Co připomenout (add)' },
+          reminder_id: { type: 'string', description: 'ID připomínky pro cancel' },
+        },
+        required: ['action'],
+      },
+    },
+    {
       name: 'rodina_update',
       description: `Zapíše/aktualizuje sekci v rodina.md — živém profilu domácnosti (dostáváš ho celý v kontextu). Sekce: ${RODINA_SECTIONS.join(', ')}. Obsah PŘEPISUJE celou sekci — piš vždy její kompletní nové znění (stávající text + doplněk). Ukládej sem odpovědi z dotazníku a trvalé poznatky o rodině hned, jak je zjistíš.`,
       input_schema: {
@@ -1212,6 +1277,19 @@ Po zápisu vždy popsat změny LIDSKY.`,
         name: 'undo_last_change',
         description: 'Vrátí POSLEDNÍ zápis do configu (balíček, dashboard i smazání dashboardu): nový soubor smaže, přepsaný obnoví ze zálohy. Použij, když se změna nepovedla nebo si to uživatel rozmyslel. Po vrácení balíčku zavolej příslušný reload_ha. Starší zálohy: /config/zan_data/backups/.',
         input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'config_history',
+        description: 'Spravuje lokální git historii /config: status ukáže stav, snapshot uloží ruční bod obnovy, rollback vrátí trackované config soubory na zadaný git ref (výchozí HEAD~1). Používej jen jako admin záchranu po špatné větší změně configu; po rollbacku ověř check_config a reloadni dotčené části HA.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['status', 'snapshot', 'rollback'] },
+            message: { type: 'string', description: 'Popis snapshotu lidsky, pro action=snapshot' },
+            ref: { type: 'string', description: 'Git ref pro rollback, výchozí HEAD~1' },
+          },
+          required: ['action'],
+        },
       },
       {
         name: 'read_error_log',
@@ -1655,6 +1733,14 @@ async function executeTool(name, input, chatId) {
         return { success: true, confirmed: true };
       }
 
+      case 'announce_home': {
+        const result = await announceHome(haPost, input);
+        if (result.success) {
+          logAction(chatId, user.name, 'announce_home', `${result.tts_entity_id}->${result.media_player_entity_id}`, 'ok');
+        }
+        return result;
+      }
+
       case 'remember': {
         if (input.category === 'room') memory.rooms[input.key] = input.value;
         else if (input.category === 'device') memory.devices[input.key] = input.value;
@@ -1980,6 +2066,32 @@ async function executeTool(name, input, chatId) {
         return { success: true };
       }
 
+      case 'reminder': {
+        if (input.action === 'add') {
+          const result = addReminder(REMINDERS_FILE, {
+            due_at: input.due_at,
+            text: input.text,
+            chat_id: chatId,
+            created_by: user.name,
+          });
+          if (result.success) {
+            logAction(chatId, user.name, 'reminder_add', result.reminder.id, result.reminder.text);
+          }
+          return result;
+        }
+        if (input.action === 'list') {
+          return { reminders: listReminders(REMINDERS_FILE).filter(r => r.chat_id === chatId) };
+        }
+        if (input.action === 'cancel') {
+          const owned = listReminders(REMINDERS_FILE).find(r => r.id === input.reminder_id && r.chat_id === chatId);
+          if (!owned) return { error: 'Připomínka nenalezena nebo nepatří do tohoto chatu.' };
+          const result = cancelReminder(REMINDERS_FILE, input.reminder_id);
+          if (result.success) logAction(chatId, user.name, 'reminder_cancel', result.reminder.id, result.reminder.text);
+          return result;
+        }
+        return { error: 'Neznámá action' };
+      }
+
       case 'rodina_update': {
         // Jana (user) smí — profil plní hlavně ona; hosté ne
         if (user.role === 'guest') return { error: 'Profil domácnosti smí upravovat jen rodina.' };
@@ -2044,6 +2156,7 @@ async function executeTool(name, input, chatId) {
         const fp = getPackagePath(input.category, input.filename);
         const oldContent = readYamlFile(fp);
         const backup = backupFile(fp);
+        const beforeSnapshot = snapshotConfig(`before Zan write_package ${input.category}/${input.filename}`);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: `Zápis selhal. Zkontroluj Samba připojení.` };
         recordChange(fp, backup, !oldContent);
@@ -2070,6 +2183,7 @@ async function executeTool(name, input, chatId) {
         memory.notes.push({ text: `Balíček ${input.category}/${input.filename}: ${input.description}`, date: new Date().toLocaleDateString('cs-CZ') });
         saveMemory(memory);
         logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'ok');
+        const afterSnapshot = snapshotConfig(`after Zan write_package ${input.category}/${input.filename}`, fp);
         const isTest = input.filename.search(/[-_]test/) >= 0;
         return {
           success: true,
@@ -2077,6 +2191,7 @@ async function executeTool(name, input, chatId) {
           was_new: !oldContent,
           is_test: isTest,
           check_config: checkNote,
+          config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`,
           undo_hint: 'Kdyby výsledek nebyl žádoucí, umíš ho vrátit nástrojem undo_last_change.',
           human_diff_hint: oldContent
             ? 'Soubor existoval — popiš uživateli CO KONKRÉTNĚ se změnilo, ne technické detaily'
@@ -2095,12 +2210,14 @@ async function executeTool(name, input, chatId) {
         const fp = getDashboardPath(input.filename);
         const existed = fs.existsSync(fp);
         const backup = backupFile(fp);
+        const beforeSnapshot = snapshotConfig(`before Zan write_dashboard ${input.filename}`);
         const ok = writeYamlFile(fp, input.content);
         if (!ok) return { error: 'Zápis dashboardu selhal.' };
         recordChange(fp, backup, !existed);
         logAction(chatId, user.name, 'write_dashboard', input.filename, 'ok');
+        const afterSnapshot = snapshotConfig(`after Zan write_dashboard ${input.filename}`, fp);
         const isTest = input.filename.search(/[-_]test/) >= 0;
-        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
+        return { success: true, path: `dashboards/${input.filename}`, is_test: isTest, config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
       }
 
       case 'list_dashboards': {
@@ -2116,22 +2233,13 @@ async function executeTool(name, input, chatId) {
         const content = readYamlFile(fp);
         if (!content) return { error: `Dashboard ${input.filename} neexistuje` };
 
-        // Vytáhni všechny entity_id z YAML textu
-        const entityMatches = content.match(/entity:\s*([^\s\n#]+)/g) || [];
-        const entitiesMatches = content.match(/entities:\s*\n([\s\S]*?)(?=\n\s*\w+:|$)/g) || [];
-        const foundEntities = new Set();
-
-        for (const m of entityMatches) {
-          const e = m.replace(/entity:\s*/, '').trim();
-          if (e.includes('.')) foundEntities.add(e);
-        }
-        // Také hledej entity v seznamech (- entity_id nebo - light.xxx)
-        const listMatches = content.match(/- ([\w]+\.[\w]+)/g) || [];
-        for (const m of listMatches) {
-          foundEntities.add(m.replace('- ', '').trim());
+        let allEntities;
+        try {
+          allEntities = extractDashboardEntitiesFromYaml(content);
+        } catch (e) {
+          return { error: `Dashboard YAML není validní, nejde ověřit entity:\n${e.message}` };
         }
 
-        const allEntities = [...foundEntities];
         if (allEntities.length === 0) return { content, entities_found: 0, note: 'Žádné entity nenalezeny v YAML' };
 
         // Zkontroluj které existují v HA
@@ -2163,10 +2271,12 @@ async function executeTool(name, input, chatId) {
           if (!fs.existsSync(fp)) return { error: `Dashboard ${input.filename} neexistuje` };
           // Fáze 0: i smazání se zálohuje a jde vrátit přes undo_last_change
           const backup = backupFile(fp);
+          const beforeSnapshot = snapshotConfig(`before Zan delete_dashboard ${input.filename}`);
           fs.unlinkSync(fp);
           if (backup) lastChange = { file: fp, backup, wasNew: false, when: new Date().toISOString() };
+          const afterSnapshot = snapshotConfig(`after Zan delete_dashboard ${input.filename}`, fp);
           logAction(chatId, user.name, 'delete_dashboard', input.filename, 'ok');
-          return { success: true, message: `Dashboard ${input.filename} smazán`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
+          return { success: true, message: `Dashboard ${input.filename} smazán`, config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`, undo_hint: 'Vrátit jde nástrojem undo_last_change.' };
         } catch (e) { return { error: e.message }; }
       }
 
@@ -2176,6 +2286,23 @@ async function executeTool(name, input, chatId) {
         logAction(chatId, user.name, 'undo_last_change', res.restored || '-', res.error ? 'fail' : 'ok');
         if (res.success) res.note = 'Po vrácení balíčku nezapomeň na příslušný reload_ha, ať se HA vrátí ke starému stavu i za běhu.';
         return res;
+      }
+
+      case 'config_history': {
+        if (!isAdmin(chatId)) return { error: 'Historie configu vyžaduje admin přístup.' };
+        if (!CONFIG_GIT_ENABLED) return { error: 'Config git historie je vypnutá přes ZAN_CONFIG_GIT_ENABLED.' };
+        if (input.action === 'status') {
+          return configGitStatus(HA_CONFIG_PATH);
+        }
+        if (input.action === 'snapshot') {
+          return snapshotConfigGit(HA_CONFIG_PATH, input.message || 'Manual Zan config snapshot');
+        }
+        if (input.action === 'rollback') {
+          const res = rollbackConfigGit(HA_CONFIG_PATH, input.ref || 'HEAD~1');
+          if (res.ok) res.note = 'Rollback vrátil trackované soubory v /config. Teď ověř check_config a reloadni dotčené části HA.';
+          return res;
+        }
+        return { error: `Neznámá akce: ${input.action}` };
       }
 
       case 'read_dashboard': {
@@ -2716,6 +2843,9 @@ ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboa
 
 RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé poznatky o rodině (rytmus dne, návraty z práce, teplotní komfort, pravidla, kdo co má rád) ukládej HNED přes rodina_update — vždy celou sekci znovu (stávající obsah + doplněk), stručné odrážky. Nevyplněné sekce doplňuj MAX JEDNOU krátkou otázkou na konci jinak hotové odpovědi; nikdy výslech, nikdy seznam otázek, neopakuj otázku, na kterou uživatel nechtěl odpovědět. „Dost otázek" → přestaň úplně a zkus za pár dní (checkin_schedule). rodina.md = fakta o rodině a domácnosti; remember = zařízení/místnosti/technika — nemíchat.
 
+PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
+OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
+
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.
 
 TESTOVACÍ VĚCI: soubory s příponou _test, nadpis "🧪 TEST:", helpery (input_*, timer, counter) místo chybějícího HW, v kartách označ "(sim)". Reálné domény: sensor, binary_sensor, light, switch, climate, cover, media_player, fan. Po vytvoření vysvětli, co je reálné a co simulace a co přikoupit (s cenou).
@@ -2762,6 +2892,11 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
   const todayCzk = (usageCostUsd(todayUsage, MODEL) * USD_CZK).toFixed(1);
+  const activeReminders = listReminders(REMINDERS_FILE)
+    .filter(r => r.chat_id === chatId)
+    .slice(0, 8)
+    .map(r => `${r.id}: ${r.text} @ ${r.due_at_input || r.due_at}`)
+    .join(' | ');
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${memory.home_name}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
@@ -2772,6 +2907,7 @@ Místnosti: ${roomNames || 'žádné'}
 Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
 Preference: ${JSON.stringify(memory.preferences)}
 Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
+Aktivní připomínky v tomhle chatu: ${activeReminders || 'žádné'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
 PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
@@ -4025,12 +4161,29 @@ async function createFamilyDashboard() {
   }
 }
 
+async function deliverDueReminders() {
+  const reminders = dueReminders(REMINDERS_FILE);
+  for (const reminder of reminders) {
+    try {
+      await sendSafe(reminder.chat_id, `⏰ Připomínám: ${reminder.text}`);
+      markReminderDelivered(REMINDERS_FILE, reminder.id);
+      logAction(reminder.chat_id, reminder.created_by || 'Žán', 'reminder_delivered', reminder.id, reminder.text);
+    } catch (e) {
+      markReminderPending(REMINDERS_FILE, reminder.id, e.message);
+      console.error('Připomínka se nepodařila doručit:', reminder.id, e.message);
+    }
+  }
+}
+
 // ═══════════════════════════════════════════════
 // ČASOVAČE
 // ═══════════════════════════════════════════════
 if (!HARNESS_ONLY) {
   // Polluj stavy každých 5 minut
   setInterval(pollStates, 5 * 60 * 1000);
+
+  // Osobní připomínky — čistě Telegram, bez zásahu do HA nebo domu.
+  setInterval(deliverDueReminders, 30 * 1000);
 
   // Každou hodinu zkontroluj jestli je neděle 20:00 → analýza návyků
   setInterval(() => {
@@ -4107,21 +4260,17 @@ if (!HARNESS_ONLY) {
       }
     } catch (e) { console.warn('⚠️ Area sync selhal:', e.message); }
 
-    // 3. Sync zařízení ze stavů → memory.devices (jen pokud je devices prázdné)
+    // 3. Procisti stare automaticke sync zaznamy. Stav HA patri do get_states /
+    // scan_all_devices, ne do trvale lidske pameti.
     try {
       const memory = loadMemory();
-      if (states.length > 0 && Object.keys(memory.devices || {}).length === 0) {
-        const skipDomains = ['zone', 'sun', 'device_tracker', 'update', 'person', 'persistent_notification', 'weather', 'automation', 'script', 'scene', 'timer', 'counter'];
-        const interestingDomains = ['light', 'switch', 'sensor', 'binary_sensor', 'climate', 'cover', 'media_player', 'fan', 'input_boolean', 'input_number'];
-        const interesting = states.filter(s => interestingDomains.some(d => s.entity_id.startsWith(d + '.')));
-        for (const s of interesting.slice(0, 100)) {
-          const name = s.attributes.friendly_name || s.entity_id;
-          memory.devices[s.entity_id] = { name, entity_id: s.entity_id, domain: s.entity_id.split('.')[0], state: s.state };
-        }
+      const cleaned = cleanDeviceMemory(memory.devices || {});
+      if (cleaned.removed.length > 0) {
+        memory.devices = cleaned.devices;
         saveMemory(memory);
-        console.log(`🔌 Zařízení sync: ${interesting.length} entit načteno do paměti`);
+        console.log(`🧹 Devices memory cleanup: ${cleaned.removed.length} auto záznamů odstraněno`);
       }
-    } catch (e) { console.warn('⚠️ Devices sync selhal:', e.message); }
+    } catch (e) { console.warn('⚠️ Devices memory cleanup selhal:', e.message); }
 
     // 4. Aktualizuj known_entities
     try {
