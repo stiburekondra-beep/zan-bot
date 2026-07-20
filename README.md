@@ -18,9 +18,16 @@ AI správce domu pro Home Assistant ovládaný přes Telegram.
 | TELEGRAM_TOKEN | Token od @BotFather |
 | CHAT_ID_ONDRA | Telegram Chat ID Ondry |
 | CHAT_ID_JANA | Telegram Chat ID Jany |
+| ZAN_HOME_NAME | Název této instalace/domácnosti |
+| CHAT_NAME_ONDRA | Jméno hlavního admina této instalace |
+| CHAT_NAME_JANA | Jméno druhého člena domácnosti |
 | ANTHROPIC_API_KEY | Klíč z console.anthropic.com |
 | OPENAI_API_KEY | Klíč z platform.openai.com |
 | PLANTID_API_KEY | Klíč z plant.id (volitelné) |
+
+Pro cizí dům nepřenášej `/config/zan_data/` z jiné instalace. Prázdná
+instalace si vytvoří vlastní `rodina.md` a `home_memory.json` podle hodnot
+`ZAN_HOME_NAME`, `CHAT_NAME_ONDRA` a `CHAT_NAME_JANA`.
 
 ## Aktualizace
 
