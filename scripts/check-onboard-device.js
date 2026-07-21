@@ -80,6 +80,20 @@ const tapoPlug = buildOnboardDeviceRequest({
 assert.strictEqual(tapoPlug.needs_handler, true);
 assert.strictEqual(tapoPlug.suggested_handlers[0].handler, 'tplink');
 assert(tapoPlug.after_pairing.some(step => step.includes('ha_setup_assign_device')));
+assert(tapoPlug.after_pairing.some(step => step.includes('nikdy nedomýšlet alias')));
+
+const shellyPlugPracovna = buildOnboardDeviceRequest({
+  category: 'plug',
+  handler: 'shelly',
+  candidate: {
+    name: 'Shelly Plug S',
+    vendor: 'Shelly',
+    host: '192.168.1.88',
+    user_requested_area: 'pracovna',
+  },
+});
+assert.strictEqual(shellyPlugPracovna.handler, 'shelly');
+assert(shellyPlugPracovna.after_pairing.some(step => step.includes('pracovna = Dílna')));
 
 const shellyPlug = buildOnboardDeviceRequest({
   category: 'plug',
