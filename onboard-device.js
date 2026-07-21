@@ -19,9 +19,9 @@ const CATEGORY_HINTS = {
   },
   climate: {
     domains: ['climate'],
-    keywords: ['climate', 'klima', 'klimatizace', 'ac ', 'air conditioner', 'daikin', 'midea', 'mitsubishi', 'toshiba'],
-    vendors: ['daikin', 'midea', 'mitsubishi', 'toshiba', 'panasonic', 'gree', 'sinclair'],
-    handlers: ['daikin', 'midea_ac', 'tuya'],
+    keywords: ['climate', 'klima', 'klimatizace', 'ac ', 'air conditioner', 'heat pump', 'tepelne cerpadlo', 'tepelné čerpadlo', 'hvac', 'daikin', 'midea', 'mitsubishi', 'toshiba'],
+    vendors: ['daikin', 'midea', 'mitsubishi', 'toshiba', 'panasonic', 'gree', 'sinclair', 'tuya', 'sensibo', 'broadlink'],
+    handlers: ['daikin', 'melcloud', 'melcloud_home', 'gree', 'ccm15', 'tuya', 'smartthings', 'sensibo'],
   },
 };
 
@@ -88,6 +88,63 @@ const TV_HANDLER_GUIDES = [
     match: ['dlna', 'dmr', 'upnp', 'ssdp'],
     confidence: 'low',
     reason: 'DLNA/SSDP zařízení může být jen renderer; začít read-only ověřením media_player entity, neslibovat plné ovládání.',
+  },
+];
+
+const CLIMATE_HANDLER_GUIDES = [
+  {
+    handler: 'daikin',
+    match: ['daikin'],
+    confidence: 'medium',
+    reason: 'Daikin AC má oficiální HA integraci Daikin. Začni přidáním integrace a po párování jen ověř climate/sensor entity.',
+  },
+  {
+    handler: 'melcloud',
+    match: ['mitsubishi', 'melcloud', 'mel cloud', 'kirigamine'],
+    confidence: 'medium',
+    reason: 'Mitsubishi klimatizace používající MELCloud patří pod oficiální HA integraci MELCloud; vyžaduje účet výrobce.',
+  },
+  {
+    handler: 'melcloud_home',
+    match: ['melcloud home', 'mel cloud home'],
+    confidence: 'medium',
+    reason: 'MELCloud Home má samostatnou oficiální HA integraci; použij ji jen když uživatel potvrdí právě MELCloud Home hub.',
+  },
+  {
+    handler: 'gree',
+    match: ['gree', 'sinclair', 'inventor', 'tosot', 'cooper&hunter', 'cooper hunter', 'heiwa'],
+    confidence: 'medium',
+    reason: 'Gree a část rebrandů používá oficiální HA integraci Gree Climate; před ovládáním ověř konkrétní model a vznik climate entity.',
+  },
+  {
+    handler: 'ccm15',
+    match: ['midea ccm15', 'ccm15'],
+    confidence: 'medium',
+    reason: 'Midea CCM15 controller má oficiální HA integraci ccm15. Běžná Midea Wi-Fi jednotka bez CCM15 není tímto automaticky pokrytá.',
+  },
+  {
+    handler: 'tuya',
+    match: ['tuya', 'smart life', 'smartlife'],
+    confidence: 'low',
+    reason: 'Tuya/Smart Life AC může jít přes oficiální HA integraci Tuya, ale zařízení musí být nejdřív v účtu/appce a po reloadu ověřené jako climate entita.',
+  },
+  {
+    handler: 'smartthings',
+    match: ['smartthings', 'samsung air conditioner', 'samsung ac'],
+    confidence: 'low',
+    reason: 'SmartThings umí některé air conditioner/thermostat capability jako climate entity, ale je to cloudová cesta přes účet výrobce.',
+  },
+  {
+    handler: 'sensibo',
+    match: ['sensibo'],
+    confidence: 'low',
+    reason: 'Sensibo je podporovaná HA integrace pro IR klimatizace přes existující Sensibo bridge; bez bridge nejde IR-only jednotku přidat softwarem.',
+  },
+  {
+    handler: 'broadlink',
+    match: ['broadlink', 'ir blaster', 'infrared', 'ir-only', 'ir only', 'infra'],
+    confidence: 'low',
+    reason: 'IR-only klimatizace potřebuje podporovaný IR bridge/proxy. Bez fyzického IR HW Žán nesmí slibovat přidání klimatizace.',
   },
 ];
 
@@ -244,6 +301,50 @@ function inferTvOnboarding(candidate = {}) {
   };
 }
 
+function inferClimateOnboarding(candidate = {}) {
+  const haystack = normalizeText(candidateText(candidate));
+  const recommendedHandlers = [];
+
+  for (const guide of CLIMATE_HANDLER_GUIDES) {
+    const matched = guide.match.filter(token => haystack.includes(normalizeText(token)));
+    if (matched.length) {
+      recommendedHandlers.push({
+        handler: guide.handler,
+        confidence: guide.confidence,
+        reason: guide.reason,
+        matched,
+      });
+    }
+  }
+
+  const irOnly = ['ir-only', 'ir only', 'infrared', 'ir blaster', 'broadlink'].some(token => haystack.includes(normalizeText(token)));
+
+  return {
+    recommended_handlers: recommendedHandlers.length
+      ? recommendedHandlers
+      : [{
+          handler: null,
+          confidence: 'none',
+          reason: 'Z dostupných metadat nejde bezpečně vybrat Daikin/MELCloud/Gree/CCM15/Tuya/SmartThings/Sensibo integraci. Žán si má říct o výrobce, model a způsob připojení (Wi-Fi/cloud vs. IR-only).',
+          matched: [],
+        }],
+    control_safety: {
+      read_only_default: true,
+      ir_only_requires_hardware: irOnly,
+      rule: irOnly
+        ? 'IR-only klimatizaci nelze přidat bez podporovaného IR bridge/proxy. Zapiš potřebuju_dokoupit, neříkej hotovo.'
+        : 'Po onboardingu jen ověř stav climate/sensor entity. Změnu teploty, režimu, zapnutí/vypnutí nebo automatizaci proveď až po výslovném potvrzení uživatele.',
+    },
+    after_pairing: [
+      'ověřit novou climate entitu přes get_new_entities nebo get_states',
+      'pokud vzniknou jen sensor entity, říct uživateli, že jde zatím o read-only stav',
+      'zeptat se na místnost a přiřadit zařízení přes ha_setup_assign_device až po potvrzení',
+      'nesahat na packages/topeni_* ani na domovní regulaci; karta řeší jen doplňkovou Wi-Fi/cloud AC jednotku',
+      'změnu teploty/režimu/zapnutí nebo write_package automatizaci dělat až po jasném OK',
+    ],
+  };
+}
+
 function inferCandidateCategory(candidate = {}) {
   const haystack = normalizeText(candidateText(candidate));
   const domain = String(candidate.domain || candidate.entity_id || '').split('.')[0];
@@ -279,6 +380,7 @@ function inferCandidateCategory(candidate = {}) {
     candidates: scored,
     plug_onboarding: scored.some(item => item.category === 'plug') ? inferPlugOnboarding(candidate) : undefined,
     tv_onboarding: scored.some(item => item.category === 'tv') ? inferTvOnboarding(candidate) : undefined,
+    climate_onboarding: scored.some(item => item.category === 'climate') ? inferClimateOnboarding(candidate) : undefined,
     note: scored.length
       ? 'Jen návrh kategorie podle názvu/výrobce/domény. Finální typ a dokončení párování musí potvrdit uživatel.'
       : 'Kategorie nejde spolehlivě odhadnout z dostupných metadat.',
@@ -316,6 +418,7 @@ function buildOnboardDeviceRequest(input = {}) {
   const candidate = mergeCandidate(input);
   const plugOnboarding = category === 'plug' ? inferPlugOnboarding(candidate) : null;
   const tvOnboarding = category === 'tv' ? inferTvOnboarding(candidate) : null;
+  const climateOnboarding = category === 'climate' ? inferClimateOnboarding(candidate) : null;
   const handler = String(input.handler || '').trim();
   if (!handler) {
     return {
@@ -325,15 +428,26 @@ function buildOnboardDeviceRequest(input = {}) {
         ? plugOnboarding.recommended_handlers
         : tvOnboarding
           ? tvOnboarding.recommended_handlers
-          : (CATEGORY_HINTS[category] ? CATEGORY_HINTS[category].handlers : []),
+          : climateOnboarding
+            ? climateOnboarding.recommended_handlers
+            : (CATEGORY_HINTS[category] ? CATEGORY_HINTS[category].handlers : []),
       automation_safety: plugOnboarding ? plugOnboarding.automation_safety : undefined,
       tv_pairing: tvOnboarding ? tvOnboarding.pairing : undefined,
-      after_pairing: plugOnboarding ? plugOnboarding.after_pairing : tvOnboarding ? tvOnboarding.after_pairing : undefined,
+      climate_safety: climateOnboarding ? climateOnboarding.control_safety : undefined,
+      after_pairing: plugOnboarding
+        ? plugOnboarding.after_pairing
+        : tvOnboarding
+          ? tvOnboarding.after_pairing
+          : climateOnboarding
+            ? climateOnboarding.after_pairing
+            : undefined,
       message: plugOnboarding && plugOnboarding.recommended_handlers[0].handler
         ? 'Vyber konkrétní HA integraci podle doporučení a potvrzení uživatele. Žán nesmí dokončit párování ani automatizaci naslepo.'
         : tvOnboarding && tvOnboarding.recommended_handlers[0].handler
           ? 'Vyber konkrétní HA integraci podle doporučení a potvrzení uživatele. U TV počítej s potvrzením na obrazovce a hotovo říkej až po ověření media_player entity.'
-        : 'Nejdřív vyber konkrétní HA integraci podle výrobce/modelu. Žán nesmí tipovat handler.',
+          : climateOnboarding && climateOnboarding.recommended_handlers[0].handler
+            ? 'Vyber konkrétní HA integraci podle výrobce/modelu a potvrzení uživatele. U klimatizace je výchozí režim read-only: hotovo říkej až po ověření climate entity, ovládání až po jasném OK.'
+            : 'Nejdřív vyber konkrétní HA integraci podle výrobce/modelu. Žán nesmí tipovat handler.',
     };
   }
 
@@ -343,7 +457,14 @@ function buildOnboardDeviceRequest(input = {}) {
     userInput: input.flow_input && typeof input.flow_input === 'object' ? input.flow_input : null,
     automation_safety: plugOnboarding ? plugOnboarding.automation_safety : undefined,
     tv_pairing: tvOnboarding ? tvOnboarding.pairing : undefined,
-    after_pairing: plugOnboarding ? plugOnboarding.after_pairing : tvOnboarding ? tvOnboarding.after_pairing : undefined,
+    climate_safety: climateOnboarding ? climateOnboarding.control_safety : undefined,
+    after_pairing: plugOnboarding
+      ? plugOnboarding.after_pairing
+      : tvOnboarding
+        ? tvOnboarding.after_pairing
+        : climateOnboarding
+          ? climateOnboarding.after_pairing
+          : undefined,
   };
 }
 
@@ -351,8 +472,10 @@ module.exports = {
   CATEGORY_HINTS,
   PLUG_HANDLER_GUIDES,
   TV_HANDLER_GUIDES,
+  CLIMATE_HANDLER_GUIDES,
   inferPlugOnboarding,
   inferTvOnboarding,
+  inferClimateOnboarding,
   inferCandidateCategory,
   buildOnboardDeviceRequest,
 };
