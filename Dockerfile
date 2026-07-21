@@ -20,6 +20,7 @@ RUN npm install --production
 # polling-watchdog.js se nezkopíroval a Žán se vůbec nespustil).
 COPY bot.js ./
 COPY budget-report.js ./
+COPY onboard-device.js ./
 COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
 COPY memory-devices.js ./
