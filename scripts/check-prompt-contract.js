@@ -46,5 +46,12 @@ assertIncludes('pouzivej presny nazev, ktery rekl', 'use user supplied area name
 assertIncludes('Nesmis si ho potichu prelozit na jinou existujici mistnost', 'forbid silent area aliasing');
 assertIncludes('pracovna = Dilna', 'regression example for area aliasing');
 assertIncludes('zeptej se, jestli ji mas vytvorit', 'ask before creating or selecting a different area');
+assertIncludes('REKUPERACE + CO2', 'ventilation section exists');
+assertIncludes('prvni verze je vzdy read-only', 'ventilation read-only default');
+assertIncludes('registry nikdy nevymyslej podle podobne jednotky', 'forbid invented Modbus registers');
+assertIncludes('Pouzij get_states/scan_all_devices', 'ventilation requires verified entities');
+assertIncludes('ventilation_report', 'ventilation report tool usage');
+assertIncludes('pokud mas jedno CO2 cidlo, rikej jen trend/odhad', 'single CO2 sensor is only trend');
+assertIncludes('Nesmis menit vykon/rezim vetrani', 'forbid ventilation control');
 
 console.log('Prompt contract OK');

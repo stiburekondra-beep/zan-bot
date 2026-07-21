@@ -23,6 +23,7 @@ const {
   markReminderPending,
 } = require('./reminders');
 const { announceHome } = require('./tts-announcements');
+const { buildVentilationReport } = require('./ventilation-report');
 const {
   ensureConfigGitRepo,
   snapshotConfigGit,
@@ -240,7 +241,7 @@ const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
 
 // Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
 // Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
-const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device'];
+const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report'];
 
 function stripDiacritics(s) {
   return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
@@ -1513,6 +1514,25 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'ventilation_report',
+        description: `Read-only v0 pro rekuperaci a CO2. Použij po get_states/scan_all_devices, když uživatel řeší rekuperaci, větrání, Modbus nebo účinnost podle CO2. Nástroj nic neřídí a nic nezapisuje: jen řekne, jaké údaje chybí pro Modbus senzory, a z ověřených CO2 entit spočítá měřený rozdíl nebo označí výsledek jako trend/odhad. Pokud chybí model, komunikační cesta nebo mapa registrů, nesmíš vymýšlet YAML adresy ani hlásit hotovo.`,
+        input_schema: {
+          type: 'object',
+          properties: {
+            manufacturer: { type: 'string', description: 'Výrobce rekuperace, jen pokud je potvrzený člověkem nebo dokumentací.' },
+            model: { type: 'string', description: 'Přesný model rekuperace, jen pokud je potvrzený.' },
+            connection: { type: 'string', description: 'Modbus TCP, RTU/RS-485, serial nebo unknown.' },
+            register_map: { type: 'string', description: 'Zdroj mapy registrů/manuál. Bez toho nástroj vrátí checklist místo YAML.' },
+            entities: {
+              type: 'array',
+              description: 'Ověřené entity z get_states/scan_all_devices relevantní pro CO2/rekuperaci. Nepředávej vymyšlené entity.',
+              items: { type: 'object' },
+            },
+          },
+          required: [],
+        },
+      },
+      {
         name: 'setup_camera',
         description: `Kompatibilní alias pro onboard_device(category="camera", handler="generic"). Přidá kameru do Home Assistant (Generic Camera / RTSP — funguje na Tapo a většinu IP kamer). NEČEKEJ, že budou všechny údaje hned k dispozici — doptej se na ně sám, po jedné otázce: 1) lokální IP kamery na síti, 2) u Tapo: má uživatel v appce Tapo vytvořený "Camera Account" (Advanced Settings → Camera Account — JINÝ účet než cloudové přihlášení, bez něj RTSP nejde)? Pokud ne, vysvětli mu krok za krokem jak ho vytvořit. 3) přihlašovací jméno/heslo z toho Camera Account. 4) jak se má kamera/místnost jmenovat. Teprve pak zavolej tenhle nástroj.`,
         input_schema: {
@@ -2532,6 +2552,13 @@ async function executeTool(name, input, chatId) {
         }
       }
 
+      case 'ventilation_report': {
+        if (!isAdmin(chatId)) return { error: 'Rekuperační report vyžaduje admin přístup.' };
+        const result = buildVentilationReport(input);
+        logAction(chatId, user.name, 'ventilation_report', result.modbus.ready_for_yaml ? 'modbus-ready' : 'modbus-missing', result.co2.status);
+        return result;
+      }
+
       case 'setup_camera': {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
@@ -2909,6 +2936,8 @@ ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate
 TV: pro chytrou televizi použij onboard_device(category="tv", candidate=...). Samsung → handler samsungtv, LG webOS → webostv, Android/Google TV → androidtv_remote, Sony Bravia → braviatv, Philips → philips_js; Google Cast/DLNA ber jen jako omezený media fallback. TV často vyžaduje potvrzení kódu nebo žádosti přímo na obrazovce — řekni uživateli, ať TV zapne a potvrzení udělá, čekej na jeho odpověď a potom ověř novou media_player entitu přes get_new_entities/get_states. Teprve pak přiřaď místnost přes ha_setup_assign_device a řekni hotovo. Neslibuj univerzální zapnutí/zdroj/hlasitost; řekni, co konkrétní integrace umí.
 
 KLIMATIZACE: pro Wi-Fi/cloud klimatizaci použij onboard_device(category="climate", candidate=...). Daikin → handler daikin, Mitsubishi/MELCloud → melcloud nebo melcloud_home, Gree/Sinclair a podporované rebrandy → gree, Midea jen s potvrzeným CCM15 controllerem → ccm15, Tuya/Smart Life → tuya, Samsung/SmartThings → smartthings, Sensibo → sensibo. Handler netipuj podle slova "climate" samotného; když neznáš výrobce/model nebo způsob připojení, zeptej se. IR-only klimatizace bez podporovaného IR bridge nejde přidat softwarem — řekni potřebuju_dokoupit (IR bridge/proxy), ne "hotovo". Po párování nejdřív ověř novou climate nebo sensor entitu přes get_new_entities/get_states, přiřaď místnost až po potvrzení a výchozí chování drž read-only. Změnu teploty, režimu, zapnutí/vypnutí nebo automatizaci dělej až po jasném OK; nikdy nesahej na packages/topeni_* ani na domovní regulaci.
+
+REKUPERACE + CO2: první verze je vždy read-only. Než navrhneš HA package pro Modbus, musíš mít výrobce/model, komunikační cestu (Modbus TCP vs RTU/RS-485/serial) a mapu registrů z manuálu; registry nikdy nevymýšlej podle podobné jednotky. Použij get_states/scan_all_devices pro ověřené CO2/rekuperační entity a potom ventilation_report. Pokud máš dvě CO2 měření (přívod/venku + místnost/odtah), smíš popsat rozdíl v ppm; pokud máš jedno CO2 čidlo, říkej jen trend/odhad; pokud čidlo chybí, řekni "potřebuju CO2 čidlo". Neříkej "hotovo" bez ověřených entit. Nesmíš měnit výkon/režim větrání, zapisovat Modbus registry ani volat služby pro řízení rekuperace bez samostatného Ondrova potvrzení.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.
