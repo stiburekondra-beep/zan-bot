@@ -116,6 +116,9 @@ const PLUG_RISK_KEYWORDS = [
   'lednice',
 ];
 
+const AREA_CONFIRMATION_RULE =
+  'místnost použít přesně podle uživatele; pokud v HA není stejný název, zeptat se na vytvoření nebo výběr existující místnosti; nikdy nedomýšlet alias typu "pracovna = Dílna" bez explicitního potvrzení';
+
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
@@ -200,7 +203,8 @@ function inferPlugOnboarding(candidate = {}) {
     },
     after_pairing: [
       'ověřit novou switch entitu přes get_new_entities nebo ha_setup_list',
-      'zeptat se na místnost a přiřadit zařízení přes ha_setup_assign_device až po potvrzení',
+      AREA_CONFIRMATION_RULE,
+      'přiřadit zařízení přes ha_setup_assign_device až po výslovném potvrzení konkrétní area_id',
       'automatizaci pouze nabídnout; write_package volat až po jasném OK',
     ],
   };
@@ -238,7 +242,8 @@ function inferTvOnboarding(candidate = {}) {
     after_pairing: [
       'ověřit novou media_player entitu přes get_new_entities nebo get_states',
       'pokud flow vrátí form/pairing krok, předej uživateli instrukci k potvrzení na obrazovce TV a čekej na jeho potvrzení',
-      'zeptat se na místnost a přiřadit zařízení přes ha_setup_assign_device až po potvrzení',
+      AREA_CONFIRMATION_RULE,
+      'přiřadit zařízení přes ha_setup_assign_device až po výslovném potvrzení konkrétní area_id',
       'ovládání omezit na schopnosti konkrétní integrace; neslibovat zdroj/hlasitost/power univerzálně',
     ],
   };
