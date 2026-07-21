@@ -41,4 +41,12 @@ assertRegex(/const\s+fast_max_tokens\s*=\s*900\s*;/, 'FAST max token limit');
 assertRegex(/temperature:\s*model\s*===\s*model_fast\s*\?\s*0\.35\s*:\s*0\.5/, 'FAST lower temperature');
 assertRegex(/model\s*===\s*model_servis[\s\S]*servis/, 'service/admin route still exists');
 
+assertIncludes('REKUPERACE + CO2', 'ventilation section exists');
+assertIncludes('prvni verze je vzdy read-only', 'ventilation read-only default');
+assertIncludes('registry nikdy nevymyslej podle podobne jednotky', 'forbid invented Modbus registers');
+assertIncludes('Pouzij get_states/scan_all_devices', 'ventilation requires verified entities');
+assertIncludes('ventilation_report', 'ventilation report tool usage');
+assertIncludes('pokud mas jedno CO2 cidlo, rikej jen trend/odhad', 'single CO2 sensor is only trend');
+assertIncludes('Nesmis menit vykon/rezim vetrani', 'forbid ventilation control');
+
 console.log('Prompt contract OK');
