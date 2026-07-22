@@ -28,6 +28,7 @@ COPY memory-devices.js ./
 COPY reminders.js ./
 COPY tts-announcements.js ./
 COPY config-git-backup.js ./
+COPY command-text.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
