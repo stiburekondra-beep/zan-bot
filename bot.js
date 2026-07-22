@@ -23,6 +23,7 @@ const {
   markReminderPending,
 } = require('./reminders');
 const { announceHome } = require('./tts-announcements');
+const { buildVentilationReport } = require('./ventilation-report');
 const {
   ensureConfigGitRepo,
   snapshotConfigGit,
@@ -240,7 +241,7 @@ const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
 
 // Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
 // Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
-const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device'];
+const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report'];
 
 function stripDiacritics(s) {
   return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
@@ -1492,12 +1493,12 @@ Po zápisu vždy popsat změny LIDSKY.`,
       },
       {
         name: 'onboard_device',
-        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Pro plug předávej candidate metadata ze scan_network/get_new_entities; vrátí doporučení Shelly/TP-Link/Matter podle výrobce/modelu a bezpečnostní brzdu pro rizikové spotřebiče. Pro TV vrací doporučení Samsung/LG webOS/Android TV/Bravia/Philips/Cast/DLNA a upozorní na potvrzení na obrazovce; hotovo říkej až po ověření nové media_player entity. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
+        description: `Společný mechanismus pro přidání zařízení do HA přes REST config_entries/flow. Použij pro camera/plug/tv/climate místo psaní samostatné cesty pro každou kategorii. Nejdřív scan_network/get_new_entities + potvrzení uživatele. Pokud neznáš konkrétní HA integraci (handler), tool ji nebude tipovat a vrátí suggested_handlers. Pro plug předávej candidate metadata ze scan_network/get_new_entities; vrátí doporučení Shelly/TP-Link/Matter podle výrobce/modelu a bezpečnostní brzdu pro rizikové spotřebiče. Pro TV vrací doporučení Samsung/LG webOS/Android TV/Bravia/Philips/Cast/DLNA a upozorní na potvrzení na obrazovce; hotovo říkej až po ověření nové media_player entity. Pro climate vrací doporučení Daikin/MELCloud/Gree/CCM15/Tuya/SmartThings/Sensibo podle výrobce/modelu a bezpečnostní pravidlo: výchozí je jen stav/čtení; změna teploty/režimu/zapnutí až po jasném OK. IR-only AC bez IR bridge = potřebuju_dokoupit, ne hotovo. Bez flow_input flow jen založí a vrátí další krok; dokončení s dopadem dělej jen po potvrzení uživatele.`,
         input_schema: {
           type: 'object',
           properties: {
             category: { type: 'string', enum: ['camera', 'plug', 'tv', 'climate', 'generic'] },
-            handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, androidtv_remote, braviatv, daikin. Netipuj naslepo.' },
+            handler: { type: 'string', description: 'HA config flow handler, např. generic, shelly, tplink, samsungtv, webostv, androidtv_remote, braviatv, daikin, melcloud, gree, ccm15, tuya. Netipuj naslepo.' },
             flow_input: { type: 'object', description: 'Data pro první krok flow, jen pokud je uživatel potvrdil a víš přesně, co HA integrace čeká.' },
             candidate: { type: 'object', description: 'Metadata kandidáta ze scan_network/get_new_entities: hostname, vendor/manufacturer, model, name, entity_id, případně ssdp/mdns/dhcp signály. Pro plug/TV pomáhá vybrat integraci bez tipování.' },
             vendor: { type: 'string', description: 'Výrobce, pokud ho znáš ze scan_network nebo uživatelova potvrzení.' },
@@ -1510,6 +1511,25 @@ Po zápisu vždy popsat změny LIDSKY.`,
             name: { type: 'string', description: 'Lidský název zařízení/místnosti pro konverzaci' },
           },
           required: ['category'],
+        },
+      },
+      {
+        name: 'ventilation_report',
+        description: `Read-only v0 pro rekuperaci a CO2. Použij po get_states/scan_all_devices, když uživatel řeší rekuperaci, větrání, Modbus nebo účinnost podle CO2. Nástroj nic neřídí a nic nezapisuje: jen řekne, jaké údaje chybí pro Modbus senzory, a z ověřených CO2 entit spočítá měřený rozdíl nebo označí výsledek jako trend/odhad. Pokud chybí model, komunikační cesta nebo mapa registrů, nesmíš vymýšlet YAML adresy ani hlásit hotovo.`,
+        input_schema: {
+          type: 'object',
+          properties: {
+            manufacturer: { type: 'string', description: 'Výrobce rekuperace, jen pokud je potvrzený člověkem nebo dokumentací.' },
+            model: { type: 'string', description: 'Přesný model rekuperace, jen pokud je potvrzený.' },
+            connection: { type: 'string', description: 'Modbus TCP, RTU/RS-485, serial nebo unknown.' },
+            register_map: { type: 'string', description: 'Zdroj mapy registrů/manuál. Bez toho nástroj vrátí checklist místo YAML.' },
+            entities: {
+              type: 'array',
+              description: 'Ověřené entity z get_states/scan_all_devices relevantní pro CO2/rekuperaci. Nepředávej vymyšlené entity.',
+              items: { type: 'object' },
+            },
+          },
+          required: [],
         },
       },
       {
@@ -2532,6 +2552,13 @@ async function executeTool(name, input, chatId) {
         }
       }
 
+      case 'ventilation_report': {
+        if (!isAdmin(chatId)) return { error: 'Rekuperační report vyžaduje admin přístup.' };
+        const result = buildVentilationReport(input);
+        logAction(chatId, user.name, 'ventilation_report', result.modbus.ready_for_yaml ? 'modbus-ready' : 'modbus-missing', result.co2.status);
+        return result;
+      }
+
       case 'setup_camera': {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
@@ -2902,10 +2929,15 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 
 ═══ 5. WORKFLOWY ═══
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
+MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 
-ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, zeptej se na místnost a přiřaď ji přes ha_setup_assign_device. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
+ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
 TV: pro chytrou televizi použij onboard_device(category="tv", candidate=...). Samsung → handler samsungtv, LG webOS → webostv, Android/Google TV → androidtv_remote, Sony Bravia → braviatv, Philips → philips_js; Google Cast/DLNA ber jen jako omezený media fallback. TV často vyžaduje potvrzení kódu nebo žádosti přímo na obrazovce — řekni uživateli, ať TV zapne a potvrzení udělá, čekej na jeho odpověď a potom ověř novou media_player entitu přes get_new_entities/get_states. Teprve pak přiřaď místnost přes ha_setup_assign_device a řekni hotovo. Neslibuj univerzální zapnutí/zdroj/hlasitost; řekni, co konkrétní integrace umí.
+
+KLIMATIZACE: pro Wi-Fi/cloud klimatizaci použij onboard_device(category="climate", candidate=...). Daikin → handler daikin, Mitsubishi/MELCloud → melcloud nebo melcloud_home, Gree/Sinclair a podporované rebrandy → gree, Midea jen s potvrzeným CCM15 controllerem → ccm15, Tuya/Smart Life → tuya, Samsung/SmartThings → smartthings, Sensibo → sensibo. Handler netipuj podle slova "climate" samotného; když neznáš výrobce/model nebo způsob připojení, zeptej se. IR-only klimatizace bez podporovaného IR bridge nejde přidat softwarem — řekni potřebuju_dokoupit (IR bridge/proxy), ne "hotovo". Po párování nejdřív ověř novou climate nebo sensor entitu přes get_new_entities/get_states, přiřaď místnost až po potvrzení a výchozí chování drž read-only. Změnu teploty, režimu, zapnutí/vypnutí nebo automatizaci dělej až po jasném OK; nikdy nesahej na packages/topeni_* ani na domovní regulaci.
+
+REKUPERACE + CO2: první verze je vždy read-only. Než navrhneš HA package pro Modbus, musíš mít výrobce/model, komunikační cestu (Modbus TCP vs RTU/RS-485/serial) a mapu registrů z manuálu; registry nikdy nevymýšlej podle podobné jednotky. Použij get_states/scan_all_devices pro ověřené CO2/rekuperační entity a potom ventilation_report. Pokud máš dvě CO2 měření (přívod/venku + místnost/odtah), smíš popsat rozdíl v ppm; pokud máš jedno CO2 čidlo, říkej jen trend/odhad; pokud čidlo chybí, řekni "potřebuju CO2 čidlo". Neříkej "hotovo" bez ověřených entit. Nesmíš měnit výkon/režim větrání, zapisovat Modbus registry ani volat služby pro řízení rekuperace bez samostatného Ondrova potvrzení.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.

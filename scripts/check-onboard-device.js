@@ -3,6 +3,7 @@ const {
   inferCandidateCategory,
   inferPlugOnboarding,
   inferTvOnboarding,
+  inferClimateOnboarding,
   buildOnboardDeviceRequest,
 } = require('../onboard-device');
 
@@ -80,6 +81,20 @@ const tapoPlug = buildOnboardDeviceRequest({
 assert.strictEqual(tapoPlug.needs_handler, true);
 assert.strictEqual(tapoPlug.suggested_handlers[0].handler, 'tplink');
 assert(tapoPlug.after_pairing.some(step => step.includes('ha_setup_assign_device')));
+assert(tapoPlug.after_pairing.some(step => step.includes('nikdy nedomýšlet alias')));
+
+const shellyPlugPracovna = buildOnboardDeviceRequest({
+  category: 'plug',
+  handler: 'shelly',
+  candidate: {
+    name: 'Shelly Plug S',
+    vendor: 'Shelly',
+    host: '192.168.1.88',
+    user_requested_area: 'pracovna',
+  },
+});
+assert.strictEqual(shellyPlugPracovna.handler, 'shelly');
+assert(shellyPlugPracovna.after_pairing.some(step => step.includes('pracovna = Dílna')));
 
 const shellyPlug = buildOnboardDeviceRequest({
   category: 'plug',
@@ -104,9 +119,49 @@ assert.strictEqual(camera.userInput.password, 'secret');
 const climate = buildOnboardDeviceRequest({
   category: 'climate',
   handler: 'daikin',
+  candidate: { vendor: 'Daikin', model: 'Perfera WiFi' },
   flow_input: { host: '192.168.0.80' },
 });
 assert.strictEqual(climate.handler, 'daikin');
 assert.deepStrictEqual(climate.userInput, { host: '192.168.0.80' });
+assert.strictEqual(climate.climate_safety.read_only_default, true);
+assert(climate.after_pairing.some(step => step.includes('climate entitu')));
+
+const daikinClimate = buildOnboardDeviceRequest({
+  category: 'climate',
+  candidate: { hostname: 'daikin-ac-loznice', vendor: 'Daikin' },
+});
+assert.strictEqual(daikinClimate.needs_handler, true);
+assert.strictEqual(daikinClimate.suggested_handlers[0].handler, 'daikin');
+assert.strictEqual(daikinClimate.climate_safety.read_only_default, true);
+assert(daikinClimate.message.includes('read-only'));
+
+const mitsubishiClimate = inferClimateOnboarding({
+  manufacturer: 'Mitsubishi Electric',
+  integration: 'MELCloud',
+});
+assert.strictEqual(mitsubishiClimate.recommended_handlers[0].handler, 'melcloud');
+assert(mitsubishiClimate.after_pairing.some(step => step.includes('packages/topeni_*')));
+
+const greeClimate = inferCandidateCategory({
+  entity_id: 'climate.gree_obyvak',
+  domain: 'climate',
+  vendor: 'Gree',
+});
+assert.strictEqual(greeClimate.category_guess, 'climate');
+assert.strictEqual(greeClimate.confidence, 'medium');
+assert.strictEqual(greeClimate.climate_onboarding.recommended_handlers[0].handler, 'gree');
+
+const mideaCcm15 = inferClimateOnboarding({ name: 'Midea CCM15 controller' });
+assert.strictEqual(mideaCcm15.recommended_handlers[0].handler, 'ccm15');
+
+const irOnlyClimate = inferClimateOnboarding({ name: 'IR-only klimatizace pres Broadlink' });
+assert.strictEqual(irOnlyClimate.control_safety.ir_only_requires_hardware, true);
+assert(irOnlyClimate.control_safety.rule.includes('potřebuju_dokoupit'));
+
+const unknownClimate = buildOnboardDeviceRequest({ category: 'climate' });
+assert.strictEqual(unknownClimate.needs_handler, true);
+assert.strictEqual(unknownClimate.suggested_handlers[0].handler, null);
+assert(unknownClimate.message.includes('nesmí tipovat'));
 
 console.log('onboard-device checks OK');
