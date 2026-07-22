@@ -31,6 +31,7 @@ const {
   rollbackConfigGit,
 } = require('./config-git-backup');
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
+const { normalizeCommandText } = require('./command-text');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -323,6 +324,15 @@ function enqueueForChat(chatId, fn) {
 // INIT
 // ═══════════════════════════════════════════════
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: !HARNESS_ONLY });
+// Vlastní username bota — kvůli strip @mention u příkazů ve skupinovém chatu.
+// Preferuje se explicitní ZAN_BOT_USERNAME; jinak se doplní z getMe() při startu.
+// Do té doby (a když getMe selže) běží normalizace v bezpečném fallbacku.
+let BOT_USERNAME = String(process.env.ZAN_BOT_USERNAME || '').replace(/^@/, '').trim();
+if (!HARNESS_ONLY && !BOT_USERNAME) {
+  bot.getMe()
+    .then((me) => { if (me && me.username) BOT_USERNAME = String(me.username).trim(); })
+    .catch((e) => console.error('getMe (bot username) selhalo:', e.message));
+}
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // Konverzace per chat — perzistentní na disku (fáze 1 auditu, slabina S7):
 // bez toho každý update/restart add-onu znamenal "o čem jsme to mluvili?".
@@ -3178,14 +3188,21 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
+  // Normalizovaný text PRO ROUTING PŘÍKAZŮ (strip @mention ve skupině) — viz
+  // normalizeCommandText. Počítá se už tady, protože i výjimky guardů níže
+  // (/start a /pamet projdou i při HA offline / AI STOP) musí platit ve skupině,
+  // kde příkaz přijde jako "@Dum_Zan_bot /start". Původní msg.text/`text`
+  // zůstává pro NLP nedotčený.
+  const cmdText = normalizeCommandText(msg.text, BOT_USERNAME);
+
   // HA online check
-  if (!(await isHaOnline()) && msg.text !== '/start' && msg.text !== '/pamet') {
+  if (!(await isHaOnline()) && cmdText !== '/start' && cmdText !== '/pamet') {
     send(chatId, '🔴 Home Assistant není dostupný. Akce nelze provést.');
     return;
   }
 
   // AI stop check
-  if (msg.text !== '/start' && msg.text !== '/pamet' && await isAiStopped()) {
+  if (cmdText !== '/start' && cmdText !== '/pamet' && await isAiStopped()) {
     send(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
     return;
   }
@@ -3270,9 +3287,12 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
 
   const text = msg.text;
   if (!text) return;
+  // cmdText (normalizovaná kopie pro routing příkazů) je spočítaný výše;
+  // ve skupině sjednotí "@Dum_Zan_bot /budget" i "/budget@Dum_Zan_bot" na
+  // holé "/budget". Původní `text` slouží pro NLP cestu (processMessage).
 
   // ── PŘÍKAZY ──
-  if (text === '/start') {
+  if (cmdText === '/start') {
     const memory = loadMemory();
     const rendered = renderStartMessage(memory, user);
     send(chatId, rendered.text, rendered.extra);
@@ -3282,8 +3302,8 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
   // Kickoff dotazníku — Žán se sám představí a položí první otázku.
   // Jen admin (Ondra) rozhoduje, KDY se Žán ozve; Žán sám od sebe
   // konverzaci nikdy nezačíná. Použití: /onboarding (výchozí user/Jana).
-  if (text.startsWith('/onboarding') && isAdmin(chatId)) {
-    const target = (text.split(/\s+/)[1] || 'jana').toLowerCase();
+  if (cmdText.startsWith('/onboarding') && isAdmin(chatId)) {
+    const target = (cmdText.split(/\s+/)[1] || 'jana').toLowerCase();
     const resolved = resolveOnboardingTarget(target);
     if (!resolved) { send(chatId, '⚠️ Neznámý cíl. Použij: /onboarding user nebo /onboarding admin'); return; }
     ensureRodina();
@@ -3301,27 +3321,27 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/pamet') {
+  if (cmdText === '/pamet') {
     const memory = loadMemory();
     const rendered = renderPametMessage(memory);
     send(chatId, rendered.text, rendered.extra);
     return;
   }
 
-  if (text === '/reset') {
+  if (cmdText === '/reset') {
     conversationHistory[chatId] = [];
     persistConversations();
     send(chatId, '🔄 Konverzace vymazána. Paměť domu zůstala.');
     return;
   }
 
-  if (text === '/budget') {
+  if (cmdText === '/budget') {
     const u = loadUsage();
     send(chatId, formatBudgetReport(u, { defaultModel: MODEL }), { parse_mode: 'Markdown' });
     return;
   }
 
-  if (text === '/stav') {
+  if (cmdText === '/stav') {
     try {
       const states = await haGet('states');
       const relevant = states
@@ -3333,7 +3353,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/balicky') {
+  if (cmdText === '/balicky') {
     const packages = listPackages();
     if (Object.keys(packages).length === 0) { send(chatId, '📦 Zatím žádné balíčky.'); return; }
     let out = '📦 *YAML balíčky:*\n\n';
@@ -3348,7 +3368,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/dashboardy') {
+  if (cmdText === '/dashboardy') {
     const dashDir = path.join(HA_CONFIG_PATH, 'dashboards');
     try {
       if (!fs.existsSync(dashDir)) { send(chatId, '📊 Složka dashboards neexistuje.'); return; }
@@ -3364,7 +3384,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/zahrada') {
+  if (cmdText === '/zahrada') {
     sendChatAction(chatId, 'typing');
     try {
       const advice = await generateGardenAdvice(chatId);
@@ -3373,7 +3393,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/navyky' && isAdmin(chatId)) {
+  if (cmdText === '/navyky' && isAdmin(chatId)) {
     const events = loadEvents();
     const habits = loadHabits();
     let out = '🧠 *Sledování návyků:*\n\n';
@@ -3390,13 +3410,13 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  if (text === '/analyza' && isAdmin(chatId)) {
+  if (cmdText === '/analyza' && isAdmin(chatId)) {
     send(chatId, '🧠 Spouštím analýzu návyků...');
     analyzeHabits();
     return;
   }
 
-  if (text === '/log' && isAdmin(chatId)) {
+  if (cmdText === '/log' && isAdmin(chatId)) {
     try {
       if (!fs.existsSync(LOG_FILE)) { send(chatId, '📋 Log je prázdný.'); return; }
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-20);
