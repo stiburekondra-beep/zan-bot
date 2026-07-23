@@ -16,6 +16,7 @@
     "test:polling-watchdog": "node scripts/check-polling-watchdog.js",
     "test:local-time": "node scripts/check-local-time-context.js",
     "test:onboard-device": "node scripts/check-onboard-device.js",
+    "test:area-alias-guard": "node scripts/check-area-alias-guard.js",
     "test:ventilation-report": "node scripts/check-ventilation-report.js"
   },
   "dependencies": {

@@ -31,6 +31,7 @@ const {
   rollbackConfigGit,
 } = require('./config-git-backup');
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
+const { guardAreaAlias } = require('./area-alias-guard');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -3114,7 +3115,15 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
 
     // end_turn, max_tokens i cokoliv jiného → vrať text, který máme
     const textBlock = response.content.find(b => b.type === 'text');
-    const finalText = textBlock ? textBlock.text : 'Hotovo.';
+    let finalText = textBlock ? textBlock.text : 'Hotovo.';
+    // Tvrdá pojistka: Žán nesmí tiše přeložit uživatelovu místnost na jinou
+    // existující HA area (bug 2026-07-21-01, „pracovna = Dílna"). Prompt to
+    // sám nezajistí — deterministicky to opravíme až na hotové odpovědi.
+    const aliasGuard = guardAreaAlias(finalText, Object.values(memory.rooms || {}));
+    if (aliasGuard.changed) {
+      finalText = aliasGuard.text;
+      console.warn(`area-alias-guard: neutralizován odhad místnosti ${JSON.stringify(aliasGuard.guesses)} (chat ${chatId})`);
+    }
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
     persistConversations(); // přežije restart/update add-onu
