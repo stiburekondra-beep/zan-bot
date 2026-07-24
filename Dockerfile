@@ -21,6 +21,7 @@ RUN npm install --production
 COPY bot.js ./
 COPY budget-report.js ./
 COPY onboard-device.js ./
+COPY area-alias-guard.js ./
 COPY ventilation-report.js ./
 COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
@@ -28,6 +29,7 @@ COPY memory-devices.js ./
 COPY reminders.js ./
 COPY tts-announcements.js ./
 COPY config-git-backup.js ./
+COPY command-text.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
