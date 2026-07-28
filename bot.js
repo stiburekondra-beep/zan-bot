@@ -24,6 +24,7 @@ const {
 } = require('./reminders');
 const { announceHome } = require('./tts-announcements');
 const { buildVentilationReport } = require('./ventilation-report');
+const { buildCareProfile, buildConsentState, evaluateCareEvent, validateCareRule } = require('./care-profile');
 const {
   ensureConfigGitRepo,
   snapshotConfigGit,
@@ -243,7 +244,7 @@ const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
 
 // Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
 // Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
-const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report'];
+const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report', 'care_profile'];
 
 function stripDiacritics(s) {
   return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
@@ -1282,6 +1283,21 @@ function buildTools(chatId) {
           due_at: { type: 'string', description: 'ISO čas s časovou zónou, např. 2026-07-20T07:30:00+02:00 (add)' },
           text: { type: 'string', description: 'Co připomenout (add)' },
           reminder_id: { type: 'string', description: 'ID připomínky pro cancel' },
+        },
+        required: ['action'],
+      },
+    },
+    {
+      name: 'care_profile',
+      description: 'Návrh a kontrola pečovatelského profilu Duchna: souhlas se sdílením, pravidla pád/nečinnost/SOS/aktivita a bezpečné vyhodnocení události. Nic neposílá ven a nezapisuje do HA; bez aktivního opt-in souhlasu vždy blokuje sdílení.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['build_profile', 'consent', 'validate_rule', 'evaluate_event'] },
+          consent: { type: 'object', description: 'Souhlas nebo požadavek na změnu souhlasu. Pro action=consent: {action: enable|disable|status, subject, recipient, explained_at, accepted_at, current}.' },
+          current_consent: { type: 'object', description: 'Aktuální uložený stav souhlasu, pokud existuje.' },
+          rule: { type: 'object', description: 'Pravidlo typu {signal: fall|long_inactivity|sos|activity, source, recipient?, message?, raw_data?}.' },
+          rules: { type: 'array', items: { type: 'object' }, description: 'Seznam pravidel pro návrh profilu.' },
         },
         required: ['action'],
       },
@@ -2570,6 +2586,25 @@ async function executeTool(name, input, chatId) {
         return result;
       }
 
+      case 'care_profile': {
+        if (!isAdmin(chatId)) return { error: 'Pečovatelský profil vyžaduje admin přístup.' };
+        const action = String(input.action || '').toLowerCase();
+        let result;
+        if (action === 'consent') {
+          result = buildConsentState(input.consent || {});
+        } else if (action === 'validate_rule') {
+          result = validateCareRule(input.rule || {});
+        } else if (action === 'evaluate_event') {
+          result = evaluateCareEvent({ consent: input.consent || input.current_consent || {}, rule: input.rule || {} });
+        } else if (action === 'build_profile') {
+          result = buildCareProfile(input);
+        } else {
+          result = { error: 'Neznámá action pro care_profile.' };
+        }
+        logAction(chatId, user.name, 'care_profile', action || 'unknown', result.action || result.status || (result.ok === false ? 'blocked' : 'ok'));
+        return result;
+      }
+
       case 'setup_camera': {
         if (!isAdmin(chatId)) return { error: 'Přidání kamery vyžaduje admin přístup.' };
         try {
@@ -2949,6 +2984,8 @@ TV: pro chytrou televizi použij onboard_device(category="tv", candidate=...). S
 KLIMATIZACE: pro Wi-Fi/cloud klimatizaci použij onboard_device(category="climate", candidate=...). Daikin → handler daikin, Mitsubishi/MELCloud → melcloud nebo melcloud_home, Gree/Sinclair a podporované rebrandy → gree, Midea jen s potvrzeným CCM15 controllerem → ccm15, Tuya/Smart Life → tuya, Samsung/SmartThings → smartthings, Sensibo → sensibo. Handler netipuj podle slova "climate" samotného; když neznáš výrobce/model nebo způsob připojení, zeptej se. IR-only klimatizace bez podporovaného IR bridge nejde přidat softwarem — řekni potřebuju_dokoupit (IR bridge/proxy), ne "hotovo". Po párování nejdřív ověř novou climate nebo sensor entitu přes get_new_entities/get_states, přiřaď místnost až po potvrzení a výchozí chování drž read-only. Změnu teploty, režimu, zapnutí/vypnutí nebo automatizaci dělej až po jasném OK; nikdy nesahej na packages/topeni_* ani na domovní regulaci.
 
 REKUPERACE + CO2: první verze je vždy read-only. Než navrhneš HA package pro Modbus, musíš mít výrobce/model, komunikační cestu (Modbus TCP vs RTU/RS-485/serial) a mapu registrů z manuálu; registry nikdy nevymýšlej podle podobné jednotky. Použij get_states/scan_all_devices pro ověřené CO2/rekuperační entity a potom ventilation_report. Pokud máš dvě CO2 měření (přívod/venku + místnost/odtah), smíš popsat rozdíl v ppm; pokud máš jedno CO2 čidlo, říkej jen trend/odhad; pokud čidlo chybí, řekni "potřebuju CO2 čidlo". Neříkej "hotovo" bez ověřených entit. Nesmíš měnit výkon/režim větrání, zapisovat Modbus registry ani volat služby pro řízení rekuperace bez samostatného Ondrova potvrzení.
+
+PEČOVATELSKÝ PROFIL / DUCHNA: první verze je jen bezpečnostní a consent-first. Sdílet ven smíš jen odvozené signály pád / dlouhá nečinnost / SOS / aktivita, nikdy surová zdravotní data (tep, spánek, saturace, zdravotní trendy) a nikdy diagnózu nebo zdravotní doporučení. Bez výslovného opt-in souhlasu subjektu údajů a konkrétního příjemce neodesílej pečovatelský signál ven; použij care_profile pro kontrolu pravidla/souhlasu. U pádu nebo náramku vždy řekni, že jde o doplňkovou notifikaci rodině, ne náhradu tísňové linky ani lékaře. Notifikace je návrh/payload; skutečné odeslání rodině patří až po samostatném schválení a testu.
 
 ONBOARDING: vždy nejdřív zjisti stav — ha_setup_list + paměť (house.onboarding_done). Nikdy nezačínej naslepo.
   onboarding_done=true → nic z tohohle, běžný provoz.

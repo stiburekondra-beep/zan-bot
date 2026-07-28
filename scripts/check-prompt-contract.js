@@ -53,5 +53,13 @@ assertIncludes('Pouzij get_states/scan_all_devices', 'ventilation requires verif
 assertIncludes('ventilation_report', 'ventilation report tool usage');
 assertIncludes('pokud mas jedno CO2 cidlo, rikej jen trend/odhad', 'single CO2 sensor is only trend');
 assertIncludes('Nesmis menit vykon/rezim vetrani', 'forbid ventilation control');
+assertIncludes('PECOVATELSKY PROFIL / DUCHNA', 'care profile section exists');
+assertIncludes('Sdilet ven smis jen odvozene signaly', 'care profile shares only derived signals');
+assertIncludes('Bez vyslovneho opt-in souhlasu subjektu udaju', 'care profile requires explicit opt-in');
+assertIncludes('konkretniho prijemce', 'care profile requires specific recipient');
+assertIncludes('nikdy surova zdravotni data', 'care profile forbids raw health data');
+assertIncludes('nikdy diagnozu nebo zdravotni doporuceni', 'care profile forbids medical claims');
+assertIncludes('care_profile', 'care profile tool usage');
+assertIncludes('ne nahradu tisnove linky ani lekare', 'care profile disclaimer');
 
 console.log('Prompt contract OK');
