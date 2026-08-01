@@ -38,7 +38,8 @@ assertIncludes('Emoji nejvys jedno', 'emoji limit');
 assertIncludes('Kdyz je tema velke, dej kratke jadro odpovedi a nabidni pokracovani', 'offer continuation instead of flooding');
 
 assertRegex(/const\s+fast_max_tokens\s*=\s*900\s*;/, 'FAST max token limit');
-assertRegex(/temperature:\s*model\s*===\s*model_fast\s*\?\s*0\.35\s*:\s*0\.5/, 'FAST lower temperature');
+assertRegex(/function\s+clauderequestoptionsformodel\s*\(\s*model\s*\)[\s\S]*if\s*\(\s*model\s*===\s*model_fast\s*\)\s*options\.temperature\s*=\s*0\.35/, 'FAST-only temperature option');
+assertRegex(/\.\.\.clauderequestoptionsformodel\s*\(\s*model\s*\)/, 'agent loop uses model request options');
 assertRegex(/model\s*===\s*model_servis[\s\S]*servis/, 'service/admin route still exists');
 
 assertIncludes('MISTNOST U NOVEHO ZARIZENI', 'new device area rule exists');
