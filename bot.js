@@ -272,6 +272,12 @@ function maxTokensForModel(model) {
   return SMART_MAX_TOKENS;
 }
 
+function claudeRequestOptionsForModel(model) {
+  const options = { max_tokens: maxTokensForModel(model) };
+  if (model === MODEL_FAST) options.temperature = 0.35;
+  return options;
+}
+
 // ═══════════════════════════════════════════════
 // SECURITY — whitelist domén a zakázané entity
 // ═══════════════════════════════════════════════
@@ -3057,8 +3063,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const response = await claudeCreate({
       model,
-      max_tokens: maxTokensForModel(model),
-      temperature: model === MODEL_FAST ? 0.35 : 0.5,
+      ...claudeRequestOptionsForModel(model),
       system: [
         // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
         // (cache je per model — FAST a SMART si drží každý svou)
