@@ -1340,6 +1340,7 @@ function buildTools(chatId) {
 NÁZEV SOUBORU = slug balíčku v HA: jen malá písmena a-z, číslice a podtržítka (snake_case). POMLČKA ZAKÁZÁNA — balíček s pomlčkou HA TIŠE nenačte (jen warning v logu, entity nevzniknou).
 Pro testovací účely přidej příponu _test k názvu souboru (např. zahrada_test.yaml).
 VŽDY nejdřív list_packages + read_package. Nikdy nezapisuj mimo packages/ nebo dashboards/.
+Když YAML obsahuje NOVOU automatizaci nebo mění chování existující automatizace, nejdřív uživateli ukaž lidský návrh ve tvaru KDYŽ / A KDYŽ / TAK / BEZPEČNOST / VRÁCENÍ ZPĚT a čekej na jasné OK. Bez tohoto OK write_package nevolej.
 Zápis je jištěný: syntaxe se validuje předem (nevalidní YAML se nezapíše), starý obsah se zálohuje a po zápisu běží kontrola konfigurace HA (může trvat i minutu) — při chybě se změna sama vrátí. Vrátit poslední zápis umíš nástrojem undo_last_change.
 Po zápisu vždy popsat změny LIDSKY.`,
         input_schema: {
@@ -2934,6 +2935,13 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Balíček nese víc klíčů najednou: input_number:, timer:, automation:, script:, sensor:… Automatizace patří do STEJNÉHO souboru jako helpery tématu. Samostatný automations.yaml neexistuje a nevytvářej ho.
 - Jeden helper = právě jedna definice v právě jednom souboru. Duplicate key (i napříč balíčky) = balíček se nenačte. Před vytvořením ověř read_package, že už neexistuje.
 - Automatizace: unikátní id: (snake_case) + český alias:. Klíč unique_id: do automation: nepatří (automatizace se nenačte). Jinde na něj nesahej.
+- Před novou automatizací nebo změnou chování automatizace NIKDY nevolej write_package rovnou. Nejdřív pošli krátký návrh pro člověka:
+  KDYŽ: co automatizaci spustí.
+  A KDYŽ: podmínky, kdy smí běžet.
+  TAK: co dům udělá.
+  BEZPEČNOST: co brání nechtěnému nebo fyzicky rizikovému dopadu.
+  VRÁCENÍ ZPĚT: jak se změna vypne nebo vrátí.
+  Pak čekej na jasné OK. Teprve po potvrzení zapiš YAML přes write_package.
 - Úprava = read_package → uprav → write_package se STEJNÝM názvem a VŽDY KOMPLETNÍM obsahem (zápis přepisuje celý soubor).
 - Po zápisu: automation:→reload_ha(automations), helpery→reload_ha(helpers), script:→scripts, scene:→scenes. Dashboardy reload nepotřebují (jen obnovit stránku).
 - Po reloadu OVĚŘ get_state, že entita existuje. Neexistuje → nezapisuj dokola; read_error_log(ha), najdi příčinu, oprav, save_lesson.
