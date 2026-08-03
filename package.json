@@ -18,7 +18,9 @@
     "test:onboard-device": "node scripts/check-onboard-device.js",
     "test:area-alias-guard": "node scripts/check-area-alias-guard.js",
     "test:ventilation-report": "node scripts/check-ventilation-report.js",
-    "test:command-text": "node scripts/check-command-text.js"
+    "test:command-text": "node scripts/check-command-text.js",
+    "test:capabilities": "node scripts/check-capabilities.js",
+    "test:repair-inbox": "node scripts/check-repair-inbox.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
