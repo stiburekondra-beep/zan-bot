@@ -47,6 +47,11 @@ assertIncludes('pouzivej presny nazev, ktery rekl', 'use user supplied area name
 assertIncludes('Nesmis si ho potichu prelozit na jinou existujici mistnost', 'forbid silent area aliasing');
 assertIncludes('pracovna = Dilna', 'regression example for area aliasing');
 assertIncludes('zeptej se, jestli ji mas vytvorit', 'ask before creating or selecting a different area');
+assertIncludes('TECHNOLOGIE A DOKUMENTACE', 'technology documentation section exists');
+assertIncludes('pouzij technology_inventory', 'technology inventory tool usage');
+assertIncludes('planovano-nezapojeno', 'planned disconnected status is explicit');
+assertIncludes('neni dukaz ovladani', 'planned technology is not active control');
+assertIncludes('Zan dnes neridi teploty ani vetrani', 'no false HVAC control claim');
 assertIncludes('REKUPERACE + CO2', 'ventilation section exists');
 assertIncludes('prvni verze je vzdy read-only', 'ventilation read-only default');
 assertIncludes('registry nikdy nevymyslej podle podobne jednotky', 'forbid invented Modbus registers');
