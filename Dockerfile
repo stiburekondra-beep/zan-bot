@@ -23,6 +23,7 @@ COPY budget-report.js ./
 COPY onboard-device.js ./
 COPY area-alias-guard.js ./
 COPY ventilation-report.js ./
+COPY care-profile.js ./
 COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
 COPY memory-devices.js ./

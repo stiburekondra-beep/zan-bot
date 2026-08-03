@@ -18,6 +18,7 @@
     "test:onboard-device": "node scripts/check-onboard-device.js",
     "test:area-alias-guard": "node scripts/check-area-alias-guard.js",
     "test:ventilation-report": "node scripts/check-ventilation-report.js",
+    "test:care-profile": "node scripts/check-care-profile.js",
     "test:command-text": "node scripts/check-command-text.js"
   },
   "dependencies": {
