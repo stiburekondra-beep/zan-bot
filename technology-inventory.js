@@ -8,10 +8,10 @@ const VALID_STATUS = new Set(['aktivní', 'read-only', 'plánováno-nezapojeno']
 const SEED_TECHNOLOGIES = [
   {
     id: 'samsung_kanalova_jednotka_1',
-    name: 'Samsung kanálová jednotka 1',
+    name: 'Samsung kanálová jednotka LSP Slim Duct ACO71 (7,1 kW)',
     type: 'kanálová jednotka',
     manufacturer: 'Samsung',
-    model: '?',
+    model: 'LSP Slim Duct ACO71 (7,1 kW)',
     status: 'plánováno-nezapojeno',
     integration: 'čeká na dokumentaci a fyzické zapojení; netvrdit řízení teploty',
     documentation: {
@@ -22,10 +22,10 @@ const SEED_TECHNOLOGIES = [
   },
   {
     id: 'samsung_kanalova_jednotka_2',
-    name: 'Samsung kanálová jednotka 2',
+    name: 'Samsung kanálová jednotka MSP Duct HighEE AC071 (6,8 kW)',
     type: 'kanálová jednotka',
     manufacturer: 'Samsung',
-    model: '?',
+    model: 'MSP Duct HighEE AC071 (6,8 kW)',
     status: 'plánováno-nezapojeno',
     integration: 'čeká na dokumentaci a fyzické zapojení; netvrdit řízení teploty',
     documentation: {
@@ -36,10 +36,10 @@ const SEED_TECHNOLOGIES = [
   },
   {
     id: 'rekuperacni_jednotka',
-    name: 'Rekuperační jednotka',
+    name: 'Rekuperační jednotka Komfovent DOMEKT-R-400-V-L1',
     type: 'rekuperace',
-    manufacturer: '?',
-    model: '?',
+    manufacturer: 'Komfovent',
+    model: 'DOMEKT-R-400-V-L1',
     status: 'plánováno-nezapojeno',
     integration: 'Modbus TCP/RTU podle dokumentace; registry nevymýšlet',
     documentation: {
@@ -106,9 +106,20 @@ function ensureTechnologyInventory(file, docsDir) {
   const byId = new Map(inventory.technologies.map(t => [t.id, t]));
   let changed = false;
   for (const seed of SEED_TECHNOLOGIES) {
-    if (!byId.has(seed.id)) {
+    const existing = byId.get(seed.id);
+    if (!existing) {
       inventory.technologies.push(seed);
       changed = true;
+      continue;
+    }
+    // Doplň jen placeholdery '?' (výrobce/model), když je seed už zná — nikdy
+    // nepřepisuj hodnotu, kterou dům/uživatel reálně upřesnil.
+    for (const field of ['manufacturer', 'model']) {
+      const cur = existing[field];
+      if ((cur === undefined || cur === '?') && seed[field] && seed[field] !== '?') {
+        existing[field] = seed[field];
+        changed = true;
+      }
     }
   }
   if (inventory.docs_dir !== docsDir) {
