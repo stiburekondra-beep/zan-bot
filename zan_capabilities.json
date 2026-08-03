@@ -41,6 +41,7 @@
     { "name": "undo_last_change", "scope": "config-write", "admin_only": true, "skills_required": true },
     { "name": "config_history", "scope": "config-write", "admin_only": true, "skills_required": true },
     { "name": "read_error_log", "scope": "diagnostics-read", "admin_only": true, "skills_required": true },
+    { "name": "repair_inbox", "scope": "diagnostics-read", "admin_only": true, "skills_required": true },
     { "name": "save_playbook", "scope": "memory-write", "admin_only": true, "skills_required": true },
     { "name": "save_lesson", "scope": "memory-write", "admin_only": true, "skills_required": true },
     { "name": "list_dashboards", "scope": "config-read", "admin_only": true, "skills_required": true },

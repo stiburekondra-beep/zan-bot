@@ -31,6 +31,7 @@ COPY tts-announcements.js ./
 COPY config-git-backup.js ./
 COPY command-text.js ./
 COPY zan_capabilities.json ./
+COPY repair-inbox.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

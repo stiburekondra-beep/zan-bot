@@ -33,6 +33,7 @@ const {
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
 const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
+const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -132,6 +133,7 @@ const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
 const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
+const REPAIRS_FILE      = path.join(DATA_DIR, 'zan_repairs.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -142,6 +144,15 @@ function loadLessons() {
 }
 function saveLessons(lessons) {
   try { fs.writeFileSync(LESSONS_FILE, JSON.stringify(lessons.slice(-50), null, 2), 'utf8'); } catch {}
+}
+
+function recordRepair(input) {
+  try {
+    return upsertRepairItem(REPAIRS_FILE, input).item;
+  } catch (e) {
+    console.warn('⚠️ Repair inbox zápis selhal:', e.message);
+    return null;
+  }
 }
 
 // Lessons v2 (audit sekce 4.1): do kontextu jdou 3 nejnovější poučení
@@ -1382,6 +1393,18 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'repair_inbox',
+        description: 'Přečte jednotný repair inbox Žána: otevřené problémy z neúspěšného onboardingu, watchdogu a servisní obchůzky. Jen čtení — nic neopravuje, nemaže ani nespouští.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', enum: ['open', 'all'], description: 'Výchozí open.' },
+            limit: { type: 'number', description: 'Kolik položek vypsat, výchozí 12.' },
+          },
+          required: [],
+        },
+      },
+      {
         name: 'save_playbook',
         description: 'Uloží OVĚŘENÝ postup jako playbook (markdown, kroky za sebou, včetně čísel/nástrojů, které fungovaly). Ukládej JEN když postup prokazatelně funguje a Ondra řekl "ulož si to jako postup" (nebo to potvrdil na tvůj návrh). Playbook = "takhle se dělá X"; poučení (save_lesson) = "tohle nedělej".',
         input_schema: {
@@ -1591,7 +1614,7 @@ async function executeTool(name, input, chatId) {
   const memory = loadMemory();
 
   // Security check — admin-only nástroje
-  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'save_lesson', 'save_playbook', 'undo_last_change'];
+  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'repair_inbox', 'save_lesson', 'save_playbook', 'undo_last_change'];
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
@@ -2243,6 +2266,12 @@ async function executeTool(name, input, chatId) {
         return { log: filtrovane.slice(-lines).join('\n') || '(žádné chyby ani warningy)' };
       }
 
+      case 'repair_inbox': {
+        const status = input.status === 'all' ? 'all' : 'open';
+        const limit = Math.min(Math.max(Number(input.limit || 12), 1), 30);
+        return { status, text: formatRepairInbox(REPAIRS_FILE, { status, limit }) };
+      }
+
       case 'save_playbook': {
         const slug = savePlaybook(input.name, input.content);
         if (!slug) return { error: 'Uložení playbooku selhalo (zkontroluj /config/zan_data).' };
@@ -2559,9 +2588,35 @@ async function executeTool(name, input, chatId) {
         try {
           const result = await runOnboardDeviceFlow(input);
           if (result.success) logAction(chatId, user.name, 'onboard_device', `${input.category}/${input.handler || result.handler || ''}`, result.message || 'ok');
+          if (result.error) {
+            recordRepair({
+              source: 'onboard_device',
+              capability: 'onboard_device',
+              dedupe_key: `${input.category || 'unknown'}_${input.handler || result.handler || 'no_handler'}`,
+              severity: 'warning',
+              title: `Přidání zařízení selhalo (${input.category || 'neznámá kategorie'})`,
+              detail: result.error,
+              next_step: 'Doplnit potvrzeného výrobce/model nebo zkusit ruční přidání v HA; handler netipovat.',
+              evidence: {
+                category: input.category,
+                handler: input.handler || result.handler,
+                suggested_handlers: result.suggested_handlers,
+              },
+            });
+          }
           return result;
         } catch (e) {
           console.error(`🔴 onboard_device vyjimka: ${e.message}`);
+          recordRepair({
+            source: 'onboard_device',
+            capability: 'onboard_device',
+            dedupe_key: `${input.category || 'unknown'}_${input.handler || 'exception'}`,
+            severity: 'warning',
+            title: `Přidání zařízení spadlo (${input.category || 'neznámá kategorie'})`,
+            detail: e.message,
+            next_step: 'Přečíst log, ověřit vstupy a netvrdit hotovo bez nové entity v HA.',
+            evidence: { category: input.category, handler: input.handler },
+          });
           return {
             error: `Přidání zařízení selhalo: ${e.message}`,
             tip: 'Zkus přidat ručně v HA: Nastavení → Zařízení a služby → Přidat integraci. Neříkej uživateli, že je hotovo, dokud HA nevrátí create_entry nebo neuvidíš novou entitu.',
@@ -3579,6 +3634,19 @@ if (!HARNESS_ONLY) {
     restartCooldownMs: POLLING_WATCHDOG_COOLDOWN_MS,
     logger: console,
     alert: async (e, state) => {
+      recordRepair({
+        source: 'polling_watchdog',
+        capability: 'read_error_log',
+        dedupe_key: 'telegram_polling_deadman',
+        severity: 'critical',
+        title: 'Telegram příjem Žána se nepodařilo obnovit',
+        detail: `Watchdog po ${state.consecutiveRestartFailures} selháních restartu pořád nevidí úspěšný getUpdates. Chyba: ${e.message}`,
+        next_step: 'Zkontrolovat Telegram polling, token/síť a logy; Žán sám už jen upozornil, další oprava je provozní krok.',
+        evidence: {
+          consecutiveRestartFailures: state.consecutiveRestartFailures,
+          lastSuccessfulGetUpdatesAt: new Date(state.lastSuccessfulGetUpdatesAt).toISOString(),
+        },
+      });
       if (!Number.isInteger(CHAT_ONDRA)) return;
       await sendSafe(
         CHAT_ONDRA,
@@ -3945,6 +4013,28 @@ async function runObchuzka() {
     //   - max 2 stejné zásahy/den; po druhém už jen hlásí
     //   - nic nevratného (žádné updaty, mazání, restarty — ty se jen ptají)
     const hasFindings = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0;
+    if (hasFindings) {
+      recordRepair({
+        source: 'obchuzka',
+        capability: 'get_states',
+        dedupe_key: 'service_walk_findings',
+        severity: unavailable.length > 0 ? 'warning' : 'info',
+        title: 'Servisní obchůzka našla věci ke kontrole',
+        detail: [
+          unavailable.length ? `${unavailable.length}× nedostupné/neznámé zařízení déle než 1 h` : '',
+          zigbeeUnavailable.length ? `${zigbeeUnavailable.length}× Zigbee kandidát k fyzické kontrole` : '',
+          updates.length ? `${updates.length}× čekající aktualizace` : '',
+          lowBattery.length ? `${lowBattery.length}× baterie pod 20 %` : '',
+        ].filter(Boolean).join('; '),
+        next_step: 'Přečíst servisní obchůzku, ověřit příčinu a rozhodnout ručně; Žán v repair inboxu nic neopravuje sám.',
+        evidence: {
+          unavailable: unavailable.slice(0, 20).map(s => s.entity_id),
+          zigbee_unavailable: zigbeeUnavailable.slice(0, 20).map(z => z.entity_id),
+          updates: updates.slice(0, 20).map(u => u.name),
+          low_battery: lowBattery.slice(0, 20).map(s => s.entity_id),
+        },
+      });
+    }
     if (hasFindings) {
       try {
         let errorExcerpt = '';
