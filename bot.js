@@ -23,6 +23,14 @@ const {
   markReminderPending,
 } = require('./reminders');
 const { announceHome } = require('./tts-announcements');
+const {
+  addScheduledAction,
+  cancelScheduledAction,
+  dueScheduledActions,
+  listScheduledActions,
+  markActionDone,
+  markActionFailed,
+} = require('./schedule-action');
 const { buildVentilationReport } = require('./ventilation-report');
 const {
   ensureConfigGitRepo,
@@ -133,6 +141,7 @@ const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
 const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
+const SCHEDULED_ACTIONS_FILE = path.join(DATA_DIR, 'zan_scheduled_actions.json');
 const REPAIRS_FILE      = path.join(DATA_DIR, 'zan_repairs.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
@@ -1374,6 +1383,26 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'schedule_action',
+      description: `Naplánuje JEDNORÁZOVOU odloženou akci — „za 10 minut rozsviť v obýváku", „ve 21:00 mi napiš, ať zkontroluju garáž". Akce se provede sama v zadaný čas a tím skončí (žádné opakování). Druhy: service (HA služba, stejné povolené domény jako call_service), message (zpráva do tohohle chatu), announce (TTS oznámení — media_player entitu VŽDY ověř přes get_states). Čas zadej jako ISO s časovou zónou (aktuální čas máš v kontextu, relativní časy z něj spočítej). Horizont max 7 dní — co je dál nebo se má opakovat, je automatizace (write_package), ne plán. U akcí na kotel/zámky/alarm platí pravidlo 1 stejně jako u okamžitých. Actions: add / list / cancel.`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['add', 'list', 'cancel'] },
+          due_at: { type: 'string', description: 'ISO čas s časovou zónou, např. 2026-08-04T21:30:00+02:00 (add)' },
+          action_type: { type: 'string', enum: ['service', 'message', 'announce'], description: 'Druh akce (add)' },
+          description: { type: 'string', description: 'Lidský popis, co se stane — zobrazí se v list (add)' },
+          domain: { type: 'string', description: 'HA doména pro service, např. light (add)' },
+          service: { type: 'string', description: 'HA služba, např. turn_on (add)' },
+          data: { type: 'object', description: 'Payload služby vč. entity_id, např. {"entity_id":"light.obyvak"} (add)' },
+          message: { type: 'string', description: 'Text pro message/announce (add)' },
+          media_player_entity_id: { type: 'string', description: 'Cílový reproduktor pro announce (add)' },
+          action_id: { type: 'string', description: 'ID akce pro cancel' },
+        },
+        required: ['action'],
+      },
+    },
+    {
       name: 'read_cookbook',
       description: `Přečte katalog hotových nápadů na automatizace (100+ položek), roztříděný do stejných kategorií jako packages/ (${Object.keys(PACKAGE_CATEGORIES).join(', ')}). Použij VŽDY, když uživatel chce něco běžného ("ať se rozsvítí, když...", "chci vědět, když nechám otevřené dveře") — dřív než začneš vymýšlet YAML od nuly. V katalogu je hotový vzor na doladění (trigger/condition/action), stačí ho upravit na reálné entity.
 Entity_id v katalogu jsou PLACEHOLDERY ve špičatých závorkách (např. <light.OBYVAK_STROP>) — vždy je nahraď reálným ID z get_states, nikdy je nezapisuj doslova do write_package.`,
@@ -2332,6 +2361,38 @@ async function executeTool(name, input, chatId) {
         return { error: 'Neznámá action' };
       }
 
+      case 'schedule_action': {
+        if (input.action === 'add') {
+          const result = addScheduledAction(SCHEDULED_ACTIONS_FILE, {
+            due_at: input.due_at,
+            action_type: input.action_type,
+            description: input.description,
+            domain: input.domain,
+            service: input.service,
+            data: input.data,
+            message: input.message,
+            media_player_entity_id: input.media_player_entity_id,
+            chat_id: chatId,
+            created_by: user.name,
+          }, ALLOWED_DOMAINS);
+          if (result.success) {
+            logAction(chatId, user.name, 'schedule_action_add', result.action.id, result.action.description || result.action.action_type);
+          }
+          return result;
+        }
+        if (input.action === 'list') {
+          return { actions: listScheduledActions(SCHEDULED_ACTIONS_FILE).filter(a => a.chat_id === chatId) };
+        }
+        if (input.action === 'cancel') {
+          const owned = listScheduledActions(SCHEDULED_ACTIONS_FILE).find(a => a.id === input.action_id && a.chat_id === chatId);
+          if (!owned) return { error: 'Naplánovaná akce nenalezena nebo nepatří do tohoto chatu.' };
+          const result = cancelScheduledAction(SCHEDULED_ACTIONS_FILE, input.action_id);
+          if (result.success) logAction(chatId, user.name, 'schedule_action_cancel', result.action.id, result.action.description || '-');
+          return result;
+        }
+        return { error: 'Neznámá action' };
+      }
+
       case 'rodina_update': {
         // Jana (user) smí — profil plní hlavně ona; hosté ne
         if (user.role === 'guest') return { error: 'Profil domácnosti smí upravovat jen rodina.' };
@@ -3122,6 +3183,7 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Po reloadu OVĚŘ get_state, že entita existuje. Neexistuje → nezapisuj dokola; read_error_log(ha), najdi příčinu, oprav, save_lesson.
 - Než navrhneš KDYŽ/A KDYŽ/TAK/BEZPEČNOST/VRÁCENÍ ZPĚT od nuly, zkontroluj read_cookbook — je tam přes 100 hotových běžných nápadů roztříděných po kategoriích (stejných jako packages/). Entity_id v katalogu jsou placeholdery <domena.NÁZEV>, vždy je nahraď reálným ID z get_states.
 - Mazání balíčku = delete_package, vždy až po výslovném potvrzení v TÉTO konverzaci (jako kotel/alarm). Kopie/sdílení balíčku (např. pro jinou instalaci nebo jiného Žána) = export_package, pošle soubor přímo do Telegramu — nic to nemění v HA.
+- „Za 10 minut / v 21:00 udělej X" JEDNOU = schedule_action, NE write_package. Balíček je pro věci, co se opakují nebo mají platit trvale; jednorázový odložený záměr do configu nepatří (zůstal by tam hnít). Opačně: „každý den v 7:00" = automatizace v balíčku, ne schedule_action.
 
 ═══ 4. HA TAHÁK (vzory — drž se jich, neimprovizuj) ═══
 Vzory používají klasický zápis (platform:, service:) — drž ho a nemíchej s novějším (triggers:/actions:).
@@ -4588,6 +4650,42 @@ async function deliverDueReminders() {
   }
 }
 
+async function executeDueScheduledActions() {
+  // Jednorázové odložené akce (schedule_action). Selhání = jeden pokus a
+  // zpráva člověku, žádné tiché opakování — viz komentář v schedule-action.js.
+  const actions = dueScheduledActions(SCHEDULED_ACTIONS_FILE);
+  for (const action of actions) {
+    const label = action.description || `${action.action_type}`;
+    try {
+      if (action.action_type === 'service') {
+        // Whitelist se kontroluje znovu i při provedení — kdyby se
+        // ALLOWED_DOMAINS mezi naplánováním a spuštěním zúžil.
+        if (!ALLOWED_DOMAINS.includes(action.domain)) throw new Error(`Doména ${action.domain} už není povolena.`);
+        await haPost(`services/${action.domain}/${action.service}`, action.data || {});
+      } else if (action.action_type === 'message') {
+        await sendSafe(action.chat_id, `🕐 ${action.message}`);
+      } else if (action.action_type === 'announce') {
+        const result = await announceHome(haPost, {
+          message: action.message,
+          media_player_entity_id: action.media_player_entity_id,
+        });
+        if (result && result.error) throw new Error(result.error);
+      } else {
+        throw new Error(`Neznámý druh akce: ${action.action_type}`);
+      }
+      markActionDone(SCHEDULED_ACTIONS_FILE, action.id);
+      logAction(action.chat_id, action.created_by || 'Žán', 'schedule_action_done', action.id, label);
+      if (action.action_type !== 'message') {
+        sendSafe(action.chat_id, `🕐 Hotovo: ${label}`);
+      }
+    } catch (e) {
+      markActionFailed(SCHEDULED_ACTIONS_FILE, action.id, e.message);
+      logAction(action.chat_id, action.created_by || 'Žán', 'schedule_action_failed', action.id, e.message);
+      sendSafe(action.chat_id, `⚠️ Naplánovaná akce se nepovedla (${label}): ${e.message}`);
+    }
+  }
+}
+
 // ═══════════════════════════════════════════════
 // ČASOVAČE
 // ═══════════════════════════════════════════════
@@ -4597,6 +4695,10 @@ if (!HARNESS_ONLY) {
 
   // Osobní připomínky — čistě Telegram, bez zásahu do HA nebo domu.
   setInterval(deliverDueReminders, 30 * 1000);
+
+  // Jednorázové odložené akce („za 10 minut rozsviť") — tick po 15 s,
+  // ať „za minutu" nemá půlminutový skluz.
+  setInterval(executeDueScheduledActions, 15 * 1000);
 
   // Každou hodinu zkontroluj jestli je neděle 20:00 → analýza návyků
   setInterval(() => {

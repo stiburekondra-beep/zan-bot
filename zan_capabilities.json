@@ -33,6 +33,7 @@
     { "name": "update_house_info", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "checkin_schedule", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "reminder", "scope": "memory-write", "admin_only": false, "skills_required": true },
+    { "name": "schedule_action", "scope": "ha-write", "admin_only": false, "skills_required": true },
     { "name": "rodina_update", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "list_packages", "scope": "config-read", "admin_only": true, "skills_required": true },
     { "name": "read_package", "scope": "config-read", "admin_only": true, "skills_required": true },

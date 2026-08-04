@@ -27,6 +27,7 @@ COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
 COPY memory-devices.js ./
 COPY reminders.js ./
+COPY schedule-action.js ./
 COPY tts-announcements.js ./
 COPY config-git-backup.js ./
 COPY command-text.js ./
