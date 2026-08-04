@@ -254,7 +254,7 @@ const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';
 
 // Nástroje, jejichž pokus o použití FAST modelem eskaluje smyčku na SMART.
 // Čtení a průzkum udělá levně Haiku; zápis/tvorbu vždy silnější model.
-const SMART_ESCALATION_TOOLS = ['write_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report'];
+const SMART_ESCALATION_TOOLS = ['write_package', 'delete_package', 'write_dashboard', 'ha_setup_create_floor', 'ha_setup_create_area', 'ha_setup_assign_device', 'onboard_device', 'ventilation_report'];
 
 function stripDiacritics(s) {
   return String(s).normalize('NFD').replace(/[̀-ͯ]/g, ''); // combining marks U+0300–U+036F
@@ -931,6 +931,37 @@ function validateYamlSyntax(content) {
   catch (e) { return e.message; }
 }
 
+function detectContentShrink(oldContent, newContent) {
+  // Syntaxe + check_config nechytí, když model přepíše soubor jen ČÁSTÍ
+  // původního obsahu (validní YAML, jen chybí polovina) — typicky když
+  // nepřečetl celý soubor přes read_package před zápisem. Vzor převzatý
+  // z code review HA addonu OpenCode (write_config_safe/confirm_deletions),
+  // viz docs/knowledge/2026-08-03_opencode-ha-addon-code-review.md v CHoS-.
+  const problems = [];
+  let oldObj, newObj;
+  try { oldObj = yaml.load(oldContent); } catch { return problems; } // starý obsah nevalidní — nesrovnávat
+  try { newObj = yaml.load(newContent); } catch { return problems; } // nový už chytí validateYamlSyntax dřív
+  if (!oldObj || typeof oldObj !== 'object' || !newObj || typeof newObj !== 'object') return problems;
+
+  const oldKeys = Object.keys(oldObj);
+  const newKeys = new Set(Object.keys(newObj));
+  const droppedKeys = oldKeys.filter((k) => !newKeys.has(k));
+  if (droppedKeys.length > 0) problems.push(`mizí klíče: ${droppedKeys.join(', ')}`);
+
+  for (const key of oldKeys) {
+    if (Array.isArray(oldObj[key]) && Array.isArray(newObj[key]) && newObj[key].length < oldObj[key].length) {
+      problems.push(`${key}: ubývá položek (${oldObj[key].length} → ${newObj[key].length})`);
+    }
+  }
+
+  const oldSize = Buffer.byteLength(oldContent, 'utf8');
+  const newSize = Buffer.byteLength(newContent, 'utf8');
+  if (oldSize > 200 && newSize < oldSize * 0.5) {
+    problems.push(`soubor se zmenšil o víc než 50 % (${oldSize} → ${newSize} bytů)`);
+  }
+  return problems;
+}
+
 function backupFile(fp) {
   // Kopie do /config/zan_data/backups/<soubor>.<timestamp>, drží se
   // posledních 10 záloh na soubor. Vrací cestu k záloze, null když
@@ -1002,6 +1033,33 @@ function listPackages() {
     }
   } catch {}
   return result;
+}
+
+// ═══════════════════════════════════════════════
+// AUTOMATION COOKBOOK — katalog hotových nápadů (100+), viz COOKBOOK.md
+// v repu. Stejný vzor jako rodina.md (ensureRodina): seedni do zan_data,
+// jen když tam ještě není, ať to přežije update add-onu a jde to ručně
+// editovat přes Sambu. Bundlovaný zdroj MUSÍ být v Dockerfile (COPY
+// COOKBOOK.md ./) — jinak container spadne při čtení, viz poznámka u
+// polling-watchdog.js incidentu 2026-07-14.
+// ═══════════════════════════════════════════════
+const COOKBOOK_PATH = path.join(DATA_DIR, 'AUTOMATION_COOKBOOK.md');
+function ensureCookbook() {
+  try {
+    if (fs.existsSync(COOKBOOK_PATH)) return readYamlFile(COOKBOOK_PATH);
+    const bundled = path.join(__dirname, 'COOKBOOK.md');
+    if (!fs.existsSync(bundled)) return null;
+    const content = fs.readFileSync(bundled, 'utf8');
+    writeYamlFile(COOKBOOK_PATH, content);
+    return content;
+  } catch (e) { console.warn('ensureCookbook:', e.message); return null; }
+}
+function cookbookSection(content, categorySlug) {
+  // Sekce jsou "## <Český název> (<slug>)" — viz COOKBOOK.md. Vrátí jen
+  // blok od nadpisu se slugem po další "## " nebo konec souboru.
+  const re = new RegExp(`## [^\\n]*\\(${categorySlug}\\)[\\s\\S]*?(?=\\n## |$)`);
+  const m = content.match(re);
+  return m ? m[0] : null;
 }
 
 // ═══════════════════════════════════════════════
@@ -1315,6 +1373,18 @@ function buildTools(chatId) {
         required: ['section', 'content'],
       },
     },
+    {
+      name: 'read_cookbook',
+      description: `Přečte katalog hotových nápadů na automatizace (100+ položek), roztříděný do stejných kategorií jako packages/ (${Object.keys(PACKAGE_CATEGORIES).join(', ')}). Použij VŽDY, když uživatel chce něco běžného ("ať se rozsvítí, když...", "chci vědět, když nechám otevřené dveře") — dřív než začneš vymýšlet YAML od nuly. V katalogu je hotový vzor na doladění (trigger/condition/action), stačí ho upravit na reálné entity.
+Entity_id v katalogu jsou PLACEHOLDERY ve špičatých závorkách (např. <light.OBYVAK_STROP>) — vždy je nahraď reálným ID z get_states, nikdy je nezapisuj doslova do write_package.`,
+      input_schema: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', enum: [...Object.keys(PACKAGE_CATEGORIES), 'all'], description: 'Kategorie ke čtení, nebo "all" pro celý katalog (delší odpověď).' },
+        },
+        required: [],
+      },
+    },
   ];
 
   // Admin-only nástroje
@@ -1342,6 +1412,7 @@ Pro testovací účely přidej příponu _test k názvu souboru (např. zahrada_
 VŽDY nejdřív list_packages + read_package. Nikdy nezapisuj mimo packages/ nebo dashboards/.
 Když YAML obsahuje NOVOU automatizaci nebo mění chování existující automatizace, nejdřív uživateli ukaž lidský návrh ve tvaru KDYŽ / A KDYŽ / TAK / BEZPEČNOST / VRÁCENÍ ZPĚT a čekej na jasné OK. Bez tohoto OK write_package nevolej.
 Zápis je jištěný: syntaxe se validuje předem (nevalidní YAML se nezapíše), starý obsah se zálohuje a po zápisu běží kontrola konfigurace HA (může trvat i minutu) — při chybě se změna sama vrátí. Vrátit poslední zápis umíš nástrojem undo_last_change.
+NAVÍC: pokud přepisuješ existující soubor a nový obsah by ztratil klíče nebo položky seznamu oproti starému (typicky když jsi neposlal celý soubor, jen část), zápis se odmítne s popisem, co by zmizelo — to je ochrana proti nechtěnému smazání, ne proti vědomému. Pokud je zmenšení opravdu záměrné (uživatel řekl "smaž tohle" / "zjednoduš to"), zavolej znovu s confirm_deletions: true.
 Po zápisu vždy popsat změny LIDSKY.`,
         input_schema: {
           type: 'object',
@@ -1350,8 +1421,33 @@ Po zápisu vždy popsat změny LIDSKY.`,
             filename: { type: 'string' },
             content: { type: 'string' },
             description: { type: 'string' },
+            confirm_deletions: { type: 'boolean', description: 'true = potvrzuju, že úbytek obsahu oproti starému souboru je záměrný.' },
           },
           required: ['category', 'filename', 'content', 'description'],
+        },
+      },
+      {
+        name: 'delete_package',
+        description: 'Smaže YAML balíček z packages/ (celý soubor, ne jednu entitu z něj). VŽDY nejdřív VÝSLOVNÉ potvrzení uživatele v TÉTO konverzaci (pravidlo 1 — mazání je nevratná akce jako kotel/alarm). Zálohuje před smazáním a po smazání běží stejná kontrola konfigurace HA jako u write_package — invalid = automatický návrat. Vrátit umíš nástrojem undo_last_change. Po smazání zavolej reload_ha na domény, co balíček obsahoval (automation/helpers/scripts/scenes).',
+        input_schema: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', enum: Object.keys(PACKAGE_CATEGORIES) },
+            filename: { type: 'string' },
+          },
+          required: ['category', 'filename'],
+        },
+      },
+      {
+        name: 'export_package',
+        description: 'Pošle existující YAML balíček jako soubor přímo do Telegramu (ke stažení nebo přeposlání dál — třeba na jinou instalaci nebo jinému Žánovi). Nic nemění v HA, jen posílá to, co už je na disku.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', enum: Object.keys(PACKAGE_CATEGORIES) },
+            filename: { type: 'string' },
+          },
+          required: ['category', 'filename'],
         },
       },
       {
@@ -1615,7 +1711,7 @@ async function executeTool(name, input, chatId) {
   const memory = loadMemory();
 
   // Security check — admin-only nástroje
-  const adminOnlyTools = ['write_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'repair_inbox', 'save_lesson', 'save_playbook', 'undo_last_change'];
+  const adminOnlyTools = ['write_package', 'delete_package', 'export_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'repair_inbox', 'save_lesson', 'save_playbook', 'undo_last_change'];
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
@@ -2254,6 +2350,15 @@ async function executeTool(name, input, chatId) {
         return { content };
       }
 
+      case 'read_cookbook': {
+        const content = ensureCookbook();
+        if (!content) return { error: 'Katalog nenalezen (COOKBOOK.md se nepodařilo seednout do zan_data ani načíst bundlovaný soubor).' };
+        if (!input.category || input.category === 'all') return { content };
+        const section = cookbookSection(content, input.category);
+        if (!section) return { error: `Kategorie ${input.category} v katalogu nenalezena.` };
+        return { content: section };
+      }
+
       case 'read_error_log': {
         const lines = Math.min(input.lines || 60, 200);
         if (input.source === 'zan_actions' || input.source === 'zan_conversation') {
@@ -2305,6 +2410,19 @@ async function executeTool(name, input, chatId) {
         }
         const fp = getPackagePath(input.category, input.filename);
         const oldContent = readYamlFile(fp);
+
+        if (oldContent) {
+          const shrinkProblems = detectContentShrink(oldContent, input.content);
+          if (shrinkProblems.length > 0 && !input.confirm_deletions) {
+            logAction(chatId, user.name, 'write_package', `${input.category}/${input.filename}`, 'content-shrink-blocked');
+            return {
+              error: `Zápis odmítnut — ${input.category}/${input.filename} by přišel o obsah:\n` +
+                shrinkProblems.map((p) => `- ${p}`).join('\n') +
+                `\nZkontroluj, žes přečetl CELÝ soubor přes read_package a poslal ho zpátky kompletní. Pokud je zmenšení opravdu záměrné, zavolej write_package znovu s confirm_deletions: true.`,
+            };
+          }
+        }
+
         const backup = backupFile(fp);
         const beforeSnapshot = snapshotConfig(`before Zan write_package ${input.category}/${input.filename}`);
         const ok = writeYamlFile(fp, input.content);
@@ -2347,6 +2465,63 @@ async function executeTool(name, input, chatId) {
             ? 'Soubor existoval — popiš uživateli CO KONKRÉTNĚ se změnilo, ne technické detaily'
             : `Nový soubor vytvořen${isTest ? ' (TESTOVACÍ — bez reálného HW)' : ''} — popiš co jsi vytvořil a proč to bude užitečné`,
         };
+      }
+
+      case 'delete_package': {
+        const fp = getPackagePath(input.category, input.filename);
+        if (!fs.existsSync(fp)) return { error: `Balíček ${input.category}/${input.filename} neexistuje — nic k smazání.` };
+        const backup = backupFile(fp);
+        const beforeSnapshot = snapshotConfig(`before Zan delete_package ${input.category}/${input.filename}`);
+        try { fs.unlinkSync(fp); }
+        catch (e) { return { error: `Smazání selhalo: ${e.message}` }; }
+        // wasNew:false → undo_last_change zkopíruje zálohu zpátky, tedy
+        // smazaný soubor obnoví. Stejná restoreLastChange logika jako write.
+        recordChange(fp, backup, false);
+
+        sendSafe(chatId, '🧪 Smazáno, ověřuju konfiguraci HA…');
+        let checkNote = '';
+        try {
+          const check = await haCheckConfig();
+          if (check && check.result === 'invalid') {
+            const restored = restoreLastChange();
+            logAction(chatId, user.name, 'delete_package', `${input.category}/${input.filename}`, 'check_config-invalid-rollback');
+            return {
+              error: `HA check_config hlásí chybu po smazání (asi na balíček odkazovalo něco jiného) — smazání jsem vrátil (${restored.success ? 'obnoveno ze zálohy' : 'POZOR: návrat selhal, obnov ručně z backups/'}).\nChyby: ${String(check.errors || '').slice(0, 1500)}`,
+            };
+          }
+          checkNote = 'check_config: valid';
+        } catch (e) {
+          checkNote = `check_config nedoběhl (${e.message}) — smazání platí, ale neověřené`;
+        }
+
+        logAction(chatId, user.name, 'delete_package', `${input.category}/${input.filename}`, 'ok');
+        const afterSnapshot = snapshotConfig(`after Zan delete_package ${input.category}/${input.filename}`, fp);
+        return {
+          success: true,
+          path: `packages/${input.category}/${input.filename}`,
+          check_config: checkNote,
+          config_history: `${configGitNote(beforeSnapshot)}; ${configGitNote(afterSnapshot)}`,
+          undo_hint: 'Kdyby se to nemělo smazat, umíš to vrátit nástrojem undo_last_change.',
+          reload_hint: 'Nezapomeň zavolat reload_ha na domény, co ten balíček obsahoval.',
+        };
+      }
+
+      case 'export_package': {
+        const fp = getPackagePath(input.category, input.filename);
+        const content = readYamlFile(fp);
+        if (content === null) return { error: `Balíček ${input.category}/${input.filename} neexistuje.` };
+        try {
+          await bot.sendDocument(
+            chatId,
+            Buffer.from(content, 'utf8'),
+            {},
+            { filename: input.filename.endsWith('.yaml') ? input.filename : `${input.filename}.yaml`, contentType: 'text/yaml' }
+          );
+        } catch (e) {
+          return { error: `Odeslání souboru selhalo: ${e.message}` };
+        }
+        logAction(chatId, user.name, 'export_package', `${input.category}/${input.filename}`, 'ok');
+        return { success: true, note: 'Soubor odeslán do chatu ke stažení/přeposlání.' };
       }
 
       case 'write_dashboard': {
@@ -2945,6 +3120,8 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Úprava = read_package → uprav → write_package se STEJNÝM názvem a VŽDY KOMPLETNÍM obsahem (zápis přepisuje celý soubor).
 - Po zápisu: automation:→reload_ha(automations), helpery→reload_ha(helpers), script:→scripts, scene:→scenes. Dashboardy reload nepotřebují (jen obnovit stránku).
 - Po reloadu OVĚŘ get_state, že entita existuje. Neexistuje → nezapisuj dokola; read_error_log(ha), najdi příčinu, oprav, save_lesson.
+- Než navrhneš KDYŽ/A KDYŽ/TAK/BEZPEČNOST/VRÁCENÍ ZPĚT od nuly, zkontroluj read_cookbook — je tam přes 100 hotových běžných nápadů roztříděných po kategoriích (stejných jako packages/). Entity_id v katalogu jsou placeholdery <domena.NÁZEV>, vždy je nahraď reálným ID z get_states.
+- Mazání balíčku = delete_package, vždy až po výslovném potvrzení v TÉTO konverzaci (jako kotel/alarm). Kopie/sdílení balíčku (např. pro jinou instalaci nebo jiného Žána) = export_package, pošle soubor přímo do Telegramu — nic to nemění v HA.
 
 ═══ 4. HA TAHÁK (vzory — drž se jich, neimprovizuj) ═══
 Vzory používají klasický zápis (platform:, service:) — drž ho a nemíchej s novějším (triggers:/actions:).
