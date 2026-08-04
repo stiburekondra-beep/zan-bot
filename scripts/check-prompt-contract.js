@@ -52,6 +52,11 @@ assertIncludes('pouzij technology_inventory', 'technology inventory tool usage')
 assertIncludes('planovano-nezapojeno', 'planned disconnected status is explicit');
 assertIncludes('neni dukaz ovladani', 'planned technology is not active control');
 assertIncludes('Zan dnes neridi teploty ani vetrani', 'no false HVAC control claim');
+assertIncludes('MAPA DOMU', 'house map section exists');
+assertIncludes('pouzij house_map', 'house map tool usage');
+assertIncludes('overene HA area_id', 'house map links to HA areas');
+assertIncludes('nevytvarej druhy ciselnik mistnosti', 'house map must not fork room truth');
+assertIncludes('Sousednost, dvere, schody a veci ukladej jen z potvrzeneho pudorysu', 'house map does not invent topology');
 assertIncludes('REKUPERACE + CO2', 'ventilation section exists');
 assertIncludes('prvni verze je vzdy read-only', 'ventilation read-only default');
 assertIncludes('registry nikdy nevymyslej podle podobne jednotky', 'forbid invented Modbus registers');
