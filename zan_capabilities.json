@@ -20,6 +20,7 @@
     { "name": "remember", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "recall", "scope": "memory-read", "admin_only": false, "skills_required": true },
     { "name": "technology_inventory", "scope": "memory-read", "admin_only": false, "skills_required": true },
+    { "name": "house_map", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "get_new_entities", "scope": "ha-read", "admin_only": false, "skills_required": true },
     { "name": "zigbee_permit_join", "scope": "ha-write", "admin_only": false, "skills_required": true },
     { "name": "scan_all_devices", "scope": "ha-read", "admin_only": false, "skills_required": true },

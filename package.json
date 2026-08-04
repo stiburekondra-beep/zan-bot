@@ -21,7 +21,8 @@
     "test:command-text": "node scripts/check-command-text.js",
     "test:capabilities": "node scripts/check-capabilities.js",
     "test:repair-inbox": "node scripts/check-repair-inbox.js",
-    "test:technology-inventory": "node scripts/check-technology-inventory.js"
+    "test:technology-inventory": "node scripts/check-technology-inventory.js",
+    "test:house-map": "node scripts/check-house-map.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
