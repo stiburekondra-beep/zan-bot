@@ -41,6 +41,7 @@ const {
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
 const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
+const { evaluateActuation } = require('./actuation-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap } = require('./house-map');
@@ -818,6 +819,18 @@ async function haPost(p, data = {}, retries = 2) {
 
 async function isHaOnline() {
   try { await haGet(''); return true; } catch { return false; }
+}
+
+// Přečte stav jedné entity (HA REST GET /states/<id>). Vrací state objekt, nebo
+// null když se čtení nepodaří — actuation-guard z null neudělá falešné selhání,
+// jen výsledek označí jako neověřený.
+async function readEntityState(entityId) {
+  try {
+    const s = await haGet(`states/${entityId}`);
+    return (s && typeof s === 'object') ? s : null;
+  } catch {
+    return null;
+  }
 }
 
 // HA config registry — zkusí GET, pak POST, pak template API fallback
@@ -2011,30 +2024,50 @@ async function executeTool(name, input, chatId) {
           logSecurity(chatId, `blocked_entity:${input.entity_id}`);
           return { error: 'Tato entita je blokována z bezpečnostních důvodů.' };
         }
-        const result = await haPost(`services/${domain}/turn_on`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'turn_on', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} zapnuto`, confirmed: true };
+        await haPost(`services/${domain}/turn_on`, { entity_id: input.entity_id });
+        // Guard: HA REST vrací 200 i pro unavailable entitu — ověř skutečný stav
+        // PO aktuaci, ať Žán nehlásí „✅ zapnuto" do tmy (bug -03).
+        const onState = await readEntityState(input.entity_id);
+        const onVerdict = evaluateActuation({ action: 'turn_on', entityId: input.entity_id, postState: onState });
+        logAction(chatId, user.name, 'turn_on', input.entity_id, onVerdict.success ? 'ok' : `unavailable:${onVerdict.entity_state || '?'}`);
+        return onVerdict;
       }
 
       case 'turn_off': {
         const domain = input.entity_id.split('.')[0];
         if (!ALLOWED_DOMAINS.includes(domain)) return { error: `Doména ${domain} není povolena.` };
         await haPost(`services/${domain}/turn_off`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'turn_off', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} vypnuto`, confirmed: true };
+        const offState = await readEntityState(input.entity_id);
+        const offVerdict = evaluateActuation({ action: 'turn_off', entityId: input.entity_id, postState: offState });
+        logAction(chatId, user.name, 'turn_off', input.entity_id, offVerdict.success ? 'ok' : `unavailable:${offVerdict.entity_state || '?'}`);
+        return offVerdict;
       }
 
       case 'toggle': {
         const domain = input.entity_id.split('.')[0];
         if (!ALLOWED_DOMAINS.includes(domain)) return { error: `Doména ${domain} není povolena.` };
         await haPost(`services/${domain}/toggle`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'toggle', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} přepnuto`, confirmed: true };
+        const tgState = await readEntityState(input.entity_id);
+        const tgVerdict = evaluateActuation({ action: 'toggle', entityId: input.entity_id, postState: tgState });
+        logAction(chatId, user.name, 'toggle', input.entity_id, tgVerdict.success ? 'ok' : `unavailable:${tgVerdict.entity_state || '?'}`);
+        return tgVerdict;
       }
 
       case 'call_service': {
         if (!ALLOWED_DOMAINS.includes(input.domain)) return { error: `Doména ${input.domain} není povolena.` };
         await haPost(`services/${input.domain}/${input.service}`, input.data);
+        // Tatáž třída chyby jako turn_on/off/toggle: když call_service aktuuje
+        // JEDNU entitu přes turn_on/turn_off/toggle, ověř stav po akci (bug -03).
+        // Vícenásobné/area cíle a jiné služby necháváme na optimistickém success —
+        // guard nefabuluje výsledek u volání, jehož efekt neumíme jednoznačně přečíst.
+        const csAction = { turn_on: 'turn_on', turn_off: 'turn_off', toggle: 'toggle' }[input.service];
+        const csEntity = input.data && typeof input.data.entity_id === 'string' ? input.data.entity_id : null;
+        if (csAction && csEntity) {
+          const csState = await readEntityState(csEntity);
+          const csVerdict = evaluateActuation({ action: csAction, entityId: csEntity, postState: csState });
+          logAction(chatId, user.name, `${input.domain}.${input.service}`, JSON.stringify(input.data), csVerdict.success ? 'ok' : `unavailable:${csVerdict.entity_state || '?'}`);
+          return csVerdict;
+        }
         logAction(chatId, user.name, `${input.domain}.${input.service}`, JSON.stringify(input.data), 'ok');
         return { success: true, confirmed: true };
       }
@@ -3212,6 +3245,7 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 
 ═══ 1. ŽELEZNÁ PRAVIDLA (nikdy neporušit) ═══
 - Potvrzuj jen SKUTEČNĚ provedené akce. Bez zavolaného nástroje se nic nestalo — pak piš „chystám se / navrhuju", ne „hotovo".
+- Aktuace na NEDOSTUPNÉ zařízení není úspěch. Když nástroj (turn_on/turn_off/toggle/call_service) vrátí success:false s unavailable/entity_state, NIKDY nehlaš „zapnul jsem / hotovo" — poctivě řekni, že je zařízení nedostupné a akci nešlo potvrdit. Nepřepisuj tool-result na optimistické „Hurá".
 - Kotel, alarm, zámky, restart HA, mazání čehokoli = teprve po výslovném souhlasu v TÉHLE konverzaci. Souhlas z minula neplatí.
 - Zapisuješ výhradně do packages/ a dashboards/.
 - HA offline → oznam to, nic nepředstírej.
