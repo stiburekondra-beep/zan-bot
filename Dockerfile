@@ -22,6 +22,7 @@ COPY bot.js ./
 COPY budget-report.js ./
 COPY onboard-device.js ./
 COPY area-alias-guard.js ./
+COPY house-map-guard.js ./
 COPY ventilation-report.js ./
 COPY polling-watchdog.js ./
 COPY dashboard-validator.js ./
