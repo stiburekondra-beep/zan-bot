@@ -44,6 +44,9 @@ const { guardAreaAlias } = require('./area-alias-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap } = require('./house-map');
+const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
+const { createVoiceHandler } = require('./voice-channel');
+const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -290,6 +293,8 @@ const MAX_TOOL_RESULT_CHARS = 12000;
 const FAST_MAX_TOKENS = 900;
 const SMART_MAX_TOKENS = 4096;
 const SERVIS_MAX_TOKENS = 2200;
+// Hlasový režim: krátká mluvená odpověď (1–2 věty) → tvrdý strop tokenů.
+const VOICE_MAX_TOKENS = 220;
 
 function maxTokensForModel(model) {
   if (model === MODEL_FAST) return FAST_MAX_TOKENS;
@@ -1094,7 +1099,7 @@ async function transcribeVoice(fileBuffer, mimeType) {
 // ═══════════════════════════════════════════════
 // NÁSTROJE
 // ═══════════════════════════════════════════════
-function buildTools(chatId) {
+function buildTools(chatId, profil) {
   const admin = isAdmin(chatId);
   const tools = [
     {
@@ -1767,7 +1772,10 @@ Po zápisu vždy popsat změny LIDSKY.`,
     );
   }
 
-  return tools;
+  // Profil kanálu (zast. 65): explicitně vyžádaný profil (hlas → 'ovladani')
+  // jinak podle admin gate = dnešní chování. Filtr je deterministický →
+  // stabilní prompt-cache prefix per kanál.
+  return filterToolsByProfile(tools, resolveProfile(profil, admin));
 }
 
 // ═══════════════════════════════════════════════
@@ -3422,23 +3430,30 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   // (a platila) s každou další zprávou dalších ~10 kol konverzace
   conversationHistory[chatId].push({ role: 'user', content: imageBase64 ? `[fotka] ${userMessage}` : userMessage });
   const messages = [...conversationHistory[chatId].slice(0, -1), { role: 'user', content: userContent }];
-  const tools = buildTools(chatId);
+  const tools = buildTools(chatId, opts.profil);
 
   // Model routing: fronta/servis si model vynutí (opts.forceModel),
   // jinak rozhodne heuristika na zprávě. Eskalace v běhu viz níže.
   let model = opts.forceModel || pickModelForMessage(userMessage);
   let escalated = model !== MODEL_FAST;
+  // Hlasový režim (opts.voice): drž FAST a NIKDY neeskaluj — u hlasu je
+  // 10–30 s eskalace na SMART nepoužitelné a zápisy hlasem stejně nejsou
+  // v profilu 'ovladani'. Krátký strop tokenů řeší VOICE_MAX_TOKENS níže.
+  if (opts.voice) { model = MODEL_FAST; escalated = true; }
 
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
+    const reqOptions = claudeRequestOptionsForModel(model);
+    if (opts.voice) reqOptions.max_tokens = VOICE_MAX_TOKENS; // hlas = krátká mluvená odpověď
     const response = await claudeCreate({
       model,
-      ...claudeRequestOptionsForModel(model),
+      ...reqOptions,
       system: [
         // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
-        // (cache je per model — FAST a SMART si drží každý svou)
+        // (cache je per model — FAST a SMART si drží každý svou). Voice instrukce
+        // patří do DYNAMICKÉHO (necachovaného) bloku — nesmí rozbít SYSTEM_STATIC cache.
         { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` },
+        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — 1–2 věty, žádné odrážky, markdown ani emoji. Když je toho víc, řekni to nejdůležitější a nabídni pokračování.' : '') },
       ],
       tools,
       messages,
@@ -3939,6 +3954,49 @@ function startHarnessInbox() {
 }
 
 startHarnessInbox();
+
+// ═══════════════════════════════════════════════
+// VOICE HTTP KANÁL — text in → odpověď out pro HA custom conversation
+// component (zast. 65/66). Default OFF: poslouchá jen když je nastavený
+// ZAN_VOICE_TOKEN. Bind na 127.0.0.1 + bearer token → žádná nová veřejná
+// plocha. Profil 'ovladani' + voice režim (krátká mluvená odpověď, bez
+// eskalace) sdílí STEJNÝ processMessage = stejná paměť i nástroje.
+// ═══════════════════════════════════════════════
+function startVoiceChannel() {
+  if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál
+  const token = process.env.ZAN_VOICE_TOKEN;
+  if (!token) return; // fail-closed: bez tokenu kanál neexistuje
+  const port = parseInt(process.env.ZAN_VOICE_HTTP_PORT || '8099', 10);
+  const host = process.env.ZAN_VOICE_HTTP_HOST || '127.0.0.1';
+  const defaultChatId = parseInt(process.env.ZAN_VOICE_CHAT_ID || '', 10) || CHAT_ONDRA;
+  const handle = createVoiceHandler({
+    token,
+    allowedChats: ALLOWED_CHATS,
+    defaultChatId,
+    dispatch: (chatId, text) =>
+      enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
+  });
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
+    req.on('end', async () => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch { res.writeHead(400); return res.end(JSON.stringify({ error: 'bad json' })); }
+      try {
+        const out = await handle({ authHeader: req.headers['authorization'], body });
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.json));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+  });
+  server.on('error', (e) => console.error('Voice kanál error:', e.message));
+  server.listen(port, host, () => console.log(`🎙️ Voice kanál: http://${host}:${port}/voice (profil ovladani, bearer token)`));
+}
+startVoiceChannel();
 
 bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 
