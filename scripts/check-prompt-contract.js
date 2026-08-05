@@ -39,7 +39,12 @@ assertIncludes('Kdyz je tema velke, dej kratke jadro odpovedi a nabidni pokracov
 
 assertRegex(/const\s+fast_max_tokens\s*=\s*900\s*;/, 'FAST max token limit');
 assertRegex(/function\s+clauderequestoptionsformodel\s*\(\s*model\s*\)[\s\S]*if\s*\(\s*model\s*===\s*model_fast\s*\)\s*options\.temperature\s*=\s*0\.35/, 'FAST-only temperature option');
-assertRegex(/\.\.\.clauderequestoptionsformodel\s*\(\s*model\s*\)/, 'agent loop uses model request options');
+// Per-model request options se MUSÍ v agentní smyčce použít (invariant temperature
+// allowlistu 2026-08-01). Snese inline spread i lokální proměnnou (voice max_tokens
+// override, 2026-08-05): povinné je volání clauderequestoptionsformodel(model) i jeho
+// spread do requestu.
+assertRegex(/clauderequestoptionsformodel\s*\(\s*model\s*\)/, 'agent loop computes model request options');
+assertRegex(/\.\.\.(clauderequestoptionsformodel\s*\(\s*model\s*\)|reqoptions)/, 'agent loop spreads model request options into request');
 assertRegex(/model\s*===\s*model_servis[\s\S]*servis/, 'service/admin route still exists');
 
 assertIncludes('MISTNOST U NOVEHO ZARIZENI', 'new device area rule exists');
