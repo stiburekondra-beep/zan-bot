@@ -34,6 +34,8 @@ COPY command-text.js ./
 COPY zan_capabilities.json ./
 COPY repair-inbox.js ./
 COPY COOKBOOK.md ./
+COPY technology-inventory.js ./
+COPY house-map.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

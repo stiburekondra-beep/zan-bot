@@ -42,6 +42,8 @@ const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard
 const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
+const { formatTechnologyInventory } = require('./technology-inventory');
+const { applyHouseMapAction, formatHouseMap } = require('./house-map');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -143,6 +145,9 @@ const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
 const SCHEDULED_ACTIONS_FILE = path.join(DATA_DIR, 'zan_scheduled_actions.json');
 const REPAIRS_FILE      = path.join(DATA_DIR, 'zan_repairs.json');
+const TECHNOLOGIES_FILE  = path.join(DATA_DIR, 'technologies.json');
+const TECHNOLOGY_DOCS_DIR = path.join(DATA_DIR, 'docs');
+const HOUSE_MAP_FILE    = path.join(DATA_DIR, 'house_map.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -1237,6 +1242,39 @@ function buildTools(chatId) {
       },
     },
     {
+      name: 'technology_inventory',
+      description: 'Přečte seznam technologií domu a dokumentaci k nim z /config/zan_data/technologies.json + /config/zan_data/docs/. Jen čtení: žádné ovládání domu, žádné HA služby, žádné vymýšlení modelů nebo Modbus registrů. Položky se stavem plánováno-nezapojeno nikdy nepopisuj jako ovládané.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'get'], description: 'list = stručný přehled, get = detail jedné technologie' },
+          id: { type: 'string', description: 'ID nebo název technologie pro action=get, např. rekuperacni_jednotka' },
+        },
+        required: ['action'],
+      },
+    },
+    {
+      name: 'house_map',
+      description: 'Znalostní mapa domu v /config/zan_data/house_map.json: patra, místnosti navázané na HA area_id, sousednost a věci v místnostech. Použij pro dotazy typu co je vedle čeho, kde něco stojí, nebo pro uložení uživatelem potvrzené informace o půdorysu/věci. Sousednost ani místnost nikdy nefabuluj; pro zápis místnosti potřebuješ skutečný HA area_id.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['get', 'set_room', 'set_adjacency', 'add_item', 'remove_item'] },
+          room_id: { type: 'string', description: 'ID místnosti v house_map nebo HA area_id, např. kuchyn' },
+          name: { type: 'string', description: 'Název místnosti nebo věci' },
+          area_id: { type: 'string', description: 'HA area_id pro set_room; ověř přes get_areas/ha_setup_list, netipuj' },
+          floor_id: { type: 'string', description: 'Volitelné patro, např. prizemi' },
+          floor_name: { type: 'string', description: 'Volitelný čitelný název patra' },
+          from: { type: 'string', description: 'První místnost pro sousednost' },
+          to: { type: 'string', description: 'Druhá místnost pro sousednost' },
+          type: { type: 'string', enum: ['dveře', 'průchod', 'schody', 'sousedí'] },
+          item_id: { type: 'string', description: 'ID věci pro remove_item' },
+          notes: { type: 'string', description: 'Krátká poznámka' },
+        },
+        required: ['action'],
+      },
+    },
+    {
       name: 'get_new_entities',
       description: 'Najde entity které Žán ještě nezná — nově přidaná zařízení. U každé vrátí i konzervativní návrh kategorie pro onboarding (plug/tv/climate/camera), ale finální typ vždy potvrzuje uživatel.',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -2033,6 +2071,34 @@ async function executeTool(name, input, chatId) {
         }
         const map = { rooms: 'rooms', devices: 'devices', preferences: 'preferences', notes: 'notes', residents: 'residents', checkin: 'checkin' };
         return memory[map[input.category]] || {};
+      }
+
+      case 'technology_inventory': {
+        const detailId = input.action === 'get' ? input.id : undefined;
+        return {
+          action: input.action,
+          text: formatTechnologyInventory(TECHNOLOGIES_FILE, TECHNOLOGY_DOCS_DIR, { id: detailId }),
+          docs_dir: TECHNOLOGY_DOCS_DIR,
+          data_file: TECHNOLOGIES_FILE,
+          safety: 'Read-only inventář. Stav plánováno-nezapojeno nikdy neznamená, že Žán zařízení ovládá.',
+        };
+      }
+
+      case 'house_map': {
+        if (input.action === 'get') {
+          return {
+            action: input.action,
+            text: formatHouseMap(HOUSE_MAP_FILE, { room_id: input.room_id }),
+            data_file: HOUSE_MAP_FILE,
+            safety: 'Znalostní mapa domu. Chybějící sousednost nebo věci se nesmí domýšlet.',
+          };
+        }
+        return {
+          action: input.action,
+          result: applyHouseMapAction(HOUSE_MAP_FILE, input),
+          data_file: HOUSE_MAP_FILE,
+          safety: 'Zápis do house_map ukládej jen z potvrzeného půdorysu nebo výslovné věty uživatele; area_id ověř přes HA.',
+        };
       }
 
       case 'get_new_entities': {
@@ -3249,6 +3315,8 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 ═══ 5. WORKFLOWY ═══
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
+TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
+MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
