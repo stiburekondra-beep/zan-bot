@@ -1,16 +1,36 @@
-# Kontraktní testy Žána — brána proti regresi na každý push/PR.
+# Kontraktní testy Žána — brána proti regresi na každý push (kromě release větví).
 # Stroj hlídá, ne role: 20 offline check-*.js + node --check bot.js.
 # check-capabilities.js má cross-repo závislost (SKILLS.md v privátním CHoS-),
 # proto běží jen jako samostatný krok, když je k dispozici token CHOS_REPO_TOKEN;
 # jinak se přeskočí a zůstává na rolích (viz karta 2026-08-05-provozak-05).
+#
+# Spouští se JEN na push (ne pull_request) — karta 2026-08-06-provozak-09:
+#  - pull_request běh duplikoval push běh na téže větvi/commitu a po rychlém
+#    firemním auto-merge se rušil (cancelled) → GitHub posílal Ondrovi maily
+#    „run failed: contract-tests, all jobs cancelled". Navíc cancelled check
+#    zůstal ve statusCheckRollup PR → blokoval firma-auto-merge poller
+#    (vyžaduje všechny checky SUCCESS). Ověřeno na PR #43.
+#  - push běh doběhne a jeho check se v rollupu PR objeví na head SHA → dává
+#    firma-auto-merge polleru zelenou i splní branch protection na main.
+#  - release větve (`*zan-release*`) mají VLASTNÍ interní bránu (testy +
+#    bot-to-bot + záloha) a mergnou se i bez zeleného GitHub checku (PR #42
+#    sloučen s cancelled checky) → jejich contract-tests běh je jen dekorativní
+#    šum, který se stejně ruší. Job se pro ně SKIPNE (job-level `if`), takže
+#    run doběhne jako `skipped` (žádný cancelled → žádný mail); main se po
+#    merge zvaliduje tak jako tak. Skip řešíme na úrovni JOBU, ne přes trigger
+#    `branches-ignore` — job-level `if` nemění spouštěcí sémantiku push (na
+#    kterou spoléhá firma-auto-merge poller přes CI check), jen přeskočí obsah.
+#    Concurrency VĚDOMĚ nepřidána — chování GitHubu u concurrency-zrušeného
+#    běhu (posílá mail?) nešlo ověřit → riziko znovuzavedení spamu.
 name: contract-tests
 
 on:
   push:
-  pull_request:
 
 jobs:
   tests:
+    # release větve mají vlastní interní bránu → GitHub běh je jen šum, přeskoč ho
+    if: ${{ !contains(github.ref, 'zan-release') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout zan-bot
