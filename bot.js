@@ -41,9 +41,10 @@ const {
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
 const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
+const { guardHouseMap } = require('./house-map-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
-const { applyHouseMapAction, formatHouseMap } = require('./house-map');
+const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -3508,6 +3509,17 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (aliasGuard.changed) {
       finalText = aliasGuard.text;
       console.warn(`area-alias-guard: neutralizován odhad místnosti ${JSON.stringify(aliasGuard.guesses)} (chat ${chatId})`);
+    }
+    // Tvrdá pojistka: Žán nesmí fabulovat sousednost a vydávat ji za data z mapy
+    // domu, když je house_map prázdná (bug 2026-08-05, scénář 25). Prompt to sám
+    // nezajistí — deterministicky opravíme až hotovou odpověď. Počet hran čteme
+    // líně, jen když text nese signály (funkce se nezavolá u nesouvisejících zpráv).
+    const houseGuard = guardHouseMap(finalText, () => {
+      try { return readHouseMap(HOUSE_MAP_FILE).adjacency.length; } catch { return 0; }
+    });
+    if (houseGuard.changed) {
+      finalText = houseGuard.text;
+      console.warn(`house-map-guard: neutralizována fabulace sousednosti z prázdné mapy (chat ${chatId})`);
     }
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
