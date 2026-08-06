@@ -15,18 +15,21 @@
 #  - release větve (`*zan-release*`) mají VLASTNÍ interní bránu (testy +
 #    bot-to-bot + záloha) a mergnou se i bez zeleného GitHub checku (PR #42
 #    sloučen s cancelled checky) → jejich contract-tests běh je jen dekorativní
-#    šum, který se stejně ruší. Vyřazeny z push; main se po merge zvaliduje tak
-#    jako tak. Concurrency VĚDOMĚ nepřidána — chování GitHubu u concurrency-
-#    zrušeného běhu (posílá mail?) nešlo ověřit, riziko znovuzavedení spamu.
+#    šum, který se stejně ruší. Job se pro ně SKIPNE (job-level `if`), takže
+#    run doběhne jako `skipped` (žádný cancelled → žádný mail); main se po
+#    merge zvaliduje tak jako tak. Skip řešíme na úrovni JOBU, ne triggeru
+#    (`branches-ignore` empiricky tichounce vyřadil i legitimní push → poller
+#    by pak neměl žádný CI check). Concurrency VĚDOMĚ nepřidána — chování
+#    GitHubu u concurrency-zrušeného běhu (posílá mail?) nešlo ověřit.
 name: contract-tests
 
 on:
   push:
-    branches-ignore:
-      - 'firma/*zan-release*'
 
 jobs:
   tests:
+    # release větve mají vlastní interní bránu → GitHub běh je jen šum, přeskoč ho
+    if: ${{ !contains(github.ref, 'zan-release') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout zan-bot
@@ -77,5 +80,3 @@ jobs:
             /tmp/chos
           ZAN_SKILLS_PATH=/tmp/chos/projects/baklazan/zan/SKILLS.md \
             node scripts/check-capabilities.js
-
-# (empirický test triggeru push — karta -09)
