@@ -17,10 +17,11 @@
 #    sloučen s cancelled checky) → jejich contract-tests běh je jen dekorativní
 #    šum, který se stejně ruší. Job se pro ně SKIPNE (job-level `if`), takže
 #    run doběhne jako `skipped` (žádný cancelled → žádný mail); main se po
-#    merge zvaliduje tak jako tak. Skip řešíme na úrovni JOBU, ne triggeru
-#    (`branches-ignore` empiricky tichounce vyřadil i legitimní push → poller
-#    by pak neměl žádný CI check). Concurrency VĚDOMĚ nepřidána — chování
-#    GitHubu u concurrency-zrušeného běhu (posílá mail?) nešlo ověřit.
+#    merge zvaliduje tak jako tak. Skip řešíme na úrovni JOBU, ne přes trigger
+#    `branches-ignore` — job-level `if` nemění spouštěcí sémantiku push (na
+#    kterou spoléhá firma-auto-merge poller přes CI check), jen přeskočí obsah.
+#    Concurrency VĚDOMĚ nepřidána — chování GitHubu u concurrency-zrušeného
+#    běhu (posílá mail?) nešlo ověřit → riziko znovuzavedení spamu.
 name: contract-tests
 
 on:
