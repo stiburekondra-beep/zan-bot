@@ -41,9 +41,15 @@ const {
 const { inferCandidateCategory, buildOnboardDeviceRequest } = require('./onboard-device');
 const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
+const { evaluateActuation } = require('./actuation-guard');
+const { guardHouseMap } = require('./house-map-guard');
+const { guardActionClaim } = require('./action-claim-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
-const { applyHouseMapAction, formatHouseMap } = require('./house-map');
+const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
+const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
+const { createVoiceHandler } = require('./voice-channel');
+const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -290,6 +296,8 @@ const MAX_TOOL_RESULT_CHARS = 12000;
 const FAST_MAX_TOKENS = 900;
 const SMART_MAX_TOKENS = 4096;
 const SERVIS_MAX_TOKENS = 2200;
+// Hlasový režim: krátká mluvená odpověď (1–2 věty) → tvrdý strop tokenů.
+const VOICE_MAX_TOKENS = 220;
 
 function maxTokensForModel(model) {
   if (model === MODEL_FAST) return FAST_MAX_TOKENS;
@@ -820,6 +828,18 @@ async function isHaOnline() {
   try { await haGet(''); return true; } catch { return false; }
 }
 
+// Přečte stav jedné entity (HA REST GET /states/<id>). Vrací state objekt, nebo
+// null když se čtení nepodaří — actuation-guard z null neudělá falešné selhání,
+// jen výsledek označí jako neověřený.
+async function readEntityState(entityId) {
+  try {
+    const s = await haGet(`states/${entityId}`);
+    return (s && typeof s === 'object') ? s : null;
+  } catch {
+    return null;
+  }
+}
+
 // HA config registry — zkusí GET, pak POST, pak template API fallback
 async function haRegistry(name) {
   try { const r = await haGet(`config/${name}/list`); if (Array.isArray(r)) return r; } catch {}
@@ -1094,7 +1114,7 @@ async function transcribeVoice(fileBuffer, mimeType) {
 // ═══════════════════════════════════════════════
 // NÁSTROJE
 // ═══════════════════════════════════════════════
-function buildTools(chatId) {
+function buildTools(chatId, profil) {
   const admin = isAdmin(chatId);
   const tools = [
     {
@@ -1767,7 +1787,10 @@ Po zápisu vždy popsat změny LIDSKY.`,
     );
   }
 
-  return tools;
+  // Profil kanálu (zast. 65): explicitně vyžádaný profil (hlas → 'ovladani')
+  // jinak podle admin gate = dnešní chování. Filtr je deterministický →
+  // stabilní prompt-cache prefix per kanál.
+  return filterToolsByProfile(tools, resolveProfile(profil, admin));
 }
 
 // ═══════════════════════════════════════════════
@@ -2011,30 +2034,50 @@ async function executeTool(name, input, chatId) {
           logSecurity(chatId, `blocked_entity:${input.entity_id}`);
           return { error: 'Tato entita je blokována z bezpečnostních důvodů.' };
         }
-        const result = await haPost(`services/${domain}/turn_on`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'turn_on', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} zapnuto`, confirmed: true };
+        await haPost(`services/${domain}/turn_on`, { entity_id: input.entity_id });
+        // Guard: HA REST vrací 200 i pro unavailable entitu — ověř skutečný stav
+        // PO aktuaci, ať Žán nehlásí „✅ zapnuto" do tmy (bug -03).
+        const onState = await readEntityState(input.entity_id);
+        const onVerdict = evaluateActuation({ action: 'turn_on', entityId: input.entity_id, postState: onState });
+        logAction(chatId, user.name, 'turn_on', input.entity_id, onVerdict.success ? 'ok' : `unavailable:${onVerdict.entity_state || '?'}`);
+        return onVerdict;
       }
 
       case 'turn_off': {
         const domain = input.entity_id.split('.')[0];
         if (!ALLOWED_DOMAINS.includes(domain)) return { error: `Doména ${domain} není povolena.` };
         await haPost(`services/${domain}/turn_off`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'turn_off', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} vypnuto`, confirmed: true };
+        const offState = await readEntityState(input.entity_id);
+        const offVerdict = evaluateActuation({ action: 'turn_off', entityId: input.entity_id, postState: offState });
+        logAction(chatId, user.name, 'turn_off', input.entity_id, offVerdict.success ? 'ok' : `unavailable:${offVerdict.entity_state || '?'}`);
+        return offVerdict;
       }
 
       case 'toggle': {
         const domain = input.entity_id.split('.')[0];
         if (!ALLOWED_DOMAINS.includes(domain)) return { error: `Doména ${domain} není povolena.` };
         await haPost(`services/${domain}/toggle`, { entity_id: input.entity_id });
-        logAction(chatId, user.name, 'toggle', input.entity_id, 'ok');
-        return { success: true, message: `✅ ${input.entity_id} přepnuto`, confirmed: true };
+        const tgState = await readEntityState(input.entity_id);
+        const tgVerdict = evaluateActuation({ action: 'toggle', entityId: input.entity_id, postState: tgState });
+        logAction(chatId, user.name, 'toggle', input.entity_id, tgVerdict.success ? 'ok' : `unavailable:${tgVerdict.entity_state || '?'}`);
+        return tgVerdict;
       }
 
       case 'call_service': {
         if (!ALLOWED_DOMAINS.includes(input.domain)) return { error: `Doména ${input.domain} není povolena.` };
         await haPost(`services/${input.domain}/${input.service}`, input.data);
+        // Tatáž třída chyby jako turn_on/off/toggle: když call_service aktuuje
+        // JEDNU entitu přes turn_on/turn_off/toggle, ověř stav po akci (bug -03).
+        // Vícenásobné/area cíle a jiné služby necháváme na optimistickém success —
+        // guard nefabuluje výsledek u volání, jehož efekt neumíme jednoznačně přečíst.
+        const csAction = { turn_on: 'turn_on', turn_off: 'turn_off', toggle: 'toggle' }[input.service];
+        const csEntity = input.data && typeof input.data.entity_id === 'string' ? input.data.entity_id : null;
+        if (csAction && csEntity) {
+          const csState = await readEntityState(csEntity);
+          const csVerdict = evaluateActuation({ action: csAction, entityId: csEntity, postState: csState });
+          logAction(chatId, user.name, `${input.domain}.${input.service}`, JSON.stringify(input.data), csVerdict.success ? 'ok' : `unavailable:${csVerdict.entity_state || '?'}`);
+          return csVerdict;
+        }
         logAction(chatId, user.name, `${input.domain}.${input.service}`, JSON.stringify(input.data), 'ok');
         return { success: true, confirmed: true };
       }
@@ -3212,6 +3255,7 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 
 ═══ 1. ŽELEZNÁ PRAVIDLA (nikdy neporušit) ═══
 - Potvrzuj jen SKUTEČNĚ provedené akce. Bez zavolaného nástroje se nic nestalo — pak piš „chystám se / navrhuju", ne „hotovo".
+- Aktuace na NEDOSTUPNÉ zařízení není úspěch. Když nástroj (turn_on/turn_off/toggle/call_service) vrátí success:false s unavailable/entity_state, NIKDY nehlaš „zapnul jsem / hotovo" — poctivě řekni, že je zařízení nedostupné a akci nešlo potvrdit. Nepřepisuj tool-result na optimistické „Hurá".
 - Kotel, alarm, zámky, restart HA, mazání čehokoli = teprve po výslovném souhlasu v TÉHLE konverzaci. Souhlas z minula neplatí.
 - Zapisuješ výhradně do packages/ a dashboards/.
 - HA offline → oznam to, nic nepředstírej.
@@ -3422,23 +3466,34 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   // (a platila) s každou další zprávou dalších ~10 kol konverzace
   conversationHistory[chatId].push({ role: 'user', content: imageBase64 ? `[fotka] ${userMessage}` : userMessage });
   const messages = [...conversationHistory[chatId].slice(0, -1), { role: 'user', content: userContent }];
-  const tools = buildTools(chatId);
+  const tools = buildTools(chatId, opts.profil);
 
   // Model routing: fronta/servis si model vynutí (opts.forceModel),
   // jinak rozhodne heuristika na zprávě. Eskalace v běhu viz níže.
   let model = opts.forceModel || pickModelForMessage(userMessage);
   let escalated = model !== MODEL_FAST;
+  // Hlasový režim (opts.voice): drž FAST a NIKDY neeskaluj — u hlasu je
+  // 10–30 s eskalace na SMART nepoužitelné a zápisy hlasem stejně nejsou
+  // v profilu 'ovladani'. Krátký strop tokenů řeší VOICE_MAX_TOKENS níže.
+  if (opts.voice) { model = MODEL_FAST; escalated = true; }
+
+  // Nástroje, které v TOMTO kole (napříč iteracemi smyčky) reálně proběhly
+  // a jestli doběhly úspěšně — vstup pro action-claim-guard (fabrikace akce).
+  const actionCalls = [];
 
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
+    const reqOptions = claudeRequestOptionsForModel(model);
+    if (opts.voice) reqOptions.max_tokens = VOICE_MAX_TOKENS; // hlas = krátká mluvená odpověď
     const response = await claudeCreate({
       model,
-      ...claudeRequestOptionsForModel(model),
+      ...reqOptions,
       system: [
         // cache_control na statickém bloku → cachuje se prefix tools + SYSTEM_STATIC
-        // (cache je per model — FAST a SMART si drží každý svou)
+        // (cache je per model — FAST a SMART si drží každý svou). Voice instrukce
+        // patří do DYNAMICKÉHO (necachovaného) bloku — nesmí rozbít SYSTEM_STATIC cache.
         { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` },
+        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — 1–2 věty, žádné odrážky, markdown ani emoji. Když je toho víc, řekni to nejdůležitější a nabídni pokračování.' : '') },
       ],
       tools,
       messages,
@@ -3468,6 +3523,10 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
           // si potvrzení nesmí "přibalit" sám (schema ho nezná, ale poslat by šlo)
           if (block.input && block.input.__confirmed) delete block.input.__confirmed;
           const result = await executeTool(block.name, block.input, chatId);
+          // Zaznamenej pro action-claim-guard: proběhl nástroj a byl úspěšný?
+          // ok = žádná chyba a nástroj se sám neoznačil za neúspěch.
+          const toolOk = !!result && !result.error && result.success !== false && result.ok !== false;
+          actionCalls.push({ name: block.name, ok: toolOk });
           if (result && result.error) {
             // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
             // něco selhalo, jen že Žán o tom slušně informoval uživatele.
@@ -3508,6 +3567,26 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (aliasGuard.changed) {
       finalText = aliasGuard.text;
       console.warn(`area-alias-guard: neutralizován odhad místnosti ${JSON.stringify(aliasGuard.guesses)} (chat ${chatId})`);
+    }
+    // Tvrdá pojistka: Žán nesmí fabulovat sousednost a vydávat ji za data z mapy
+    // domu, když je house_map prázdná (bug 2026-08-05, scénář 25). Prompt to sám
+    // nezajistí — deterministicky opravíme až hotovou odpověď. Počet hran čteme
+    // líně, jen když text nese signály (funkce se nezavolá u nesouvisejících zpráv).
+    const houseGuard = guardHouseMap(finalText, () => {
+      try { return readHouseMap(HOUSE_MAP_FILE).adjacency.length; } catch { return 0; }
+    });
+    if (houseGuard.changed) {
+      finalText = houseGuard.text;
+      console.warn(`house-map-guard: neutralizována fabulace sousednosti z prázdné mapy (chat ${chatId})`);
+    }
+    // Tvrdá pojistka proti FABRIKACI PROVEDENÉ AKCE (bug 2026-08-06-01):
+    // Žán nesmí tvrdit „vrátil/zapsal/smazal jsem" nebo „restartoval jsem HA",
+    // když si to uživatel právě vyžádal a žádný odpovídající nástroj v tomhle
+    // kole úspěšně neproběhl. Prompt to sám nezajistí — LLM tvrzení protlačí.
+    const actionGuard = guardActionClaim(finalText, userMessage, actionCalls);
+    if (actionGuard.changed) {
+      finalText = actionGuard.text;
+      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
     }
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
@@ -3939,6 +4018,49 @@ function startHarnessInbox() {
 }
 
 startHarnessInbox();
+
+// ═══════════════════════════════════════════════
+// VOICE HTTP KANÁL — text in → odpověď out pro HA custom conversation
+// component (zast. 65/66). Default OFF: poslouchá jen když je nastavený
+// ZAN_VOICE_TOKEN. Bind na 127.0.0.1 + bearer token → žádná nová veřejná
+// plocha. Profil 'ovladani' + voice režim (krátká mluvená odpověď, bez
+// eskalace) sdílí STEJNÝ processMessage = stejná paměť i nástroje.
+// ═══════════════════════════════════════════════
+function startVoiceChannel() {
+  if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál
+  const token = process.env.ZAN_VOICE_TOKEN;
+  if (!token) return; // fail-closed: bez tokenu kanál neexistuje
+  const port = parseInt(process.env.ZAN_VOICE_HTTP_PORT || '8099', 10);
+  const host = process.env.ZAN_VOICE_HTTP_HOST || '127.0.0.1';
+  const defaultChatId = parseInt(process.env.ZAN_VOICE_CHAT_ID || '', 10) || CHAT_ONDRA;
+  const handle = createVoiceHandler({
+    token,
+    allowedChats: ALLOWED_CHATS,
+    defaultChatId,
+    dispatch: (chatId, text) =>
+      enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
+  });
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
+    req.on('end', async () => {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch { res.writeHead(400); return res.end(JSON.stringify({ error: 'bad json' })); }
+      try {
+        const out = await handle({ authHeader: req.headers['authorization'], body });
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.json));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+  });
+  server.on('error', (e) => console.error('Voice kanál error:', e.message));
+  server.listen(port, host, () => console.log(`🎙️ Voice kanál: http://${host}:${port}/voice (profil ovladani, bearer token)`));
+}
+startVoiceChannel();
 
 bot.on('polling_error', (e) => console.error('Polling error:', e.message));
 
