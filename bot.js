@@ -4022,9 +4022,12 @@ startHarnessInbox();
 // ═══════════════════════════════════════════════
 // VOICE HTTP KANÁL — text in → odpověď out pro HA custom conversation
 // component (zast. 65/66). Default OFF: poslouchá jen když je nastavený
-// ZAN_VOICE_TOKEN. Bind na 127.0.0.1 + bearer token → žádná nová veřejná
-// plocha. Profil 'ovladani' + voice režim (krátká mluvená odpověď, bez
-// eskalace) sdílí STEJNÝ processMessage = stejná paměť i nástroje.
+// ZAN_VOICE_TOKEN (fail-closed). Bind je konfigurovatelný: add-on jede
+// host_network:true, takže produkce bindne 0.0.0.0 (run.sh), aby HA Core
+// dosáhl na 172.30.32.1:8099 — 127.0.0.1 by byl jen host loopback. Bezpečnost
+// drží bearer token, NE izolace sítě (s host_network je port i na LAN).
+// Profil 'ovladani' + voice režim (krátká mluvená odpověď, bez eskalace)
+// sdílí STEJNÝ processMessage = stejná paměť i nástroje.
 // ═══════════════════════════════════════════════
 function startVoiceChannel() {
   if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál

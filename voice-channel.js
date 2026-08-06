@@ -8,8 +8,10 @@
 //    přirozený tvar; file write+poll na HA straně by byl krkolomný.
 //  - Hlas potřebuje sub-sekundový pickup; file polling přidá až celý poll
 //    interval (research: file polling ≤ 500 ms, jinak HTTP).
-//  - Žádná nová VEŘEJNÁ plocha: bind na 127.0.0.1 + bearer token, fail-closed
-//    (bez tokenu kanál neexistuje) — mantinel karty splněn.
+//  - Bezpečnost stojí na fail-closed bearer tokenu (bez tokenu kanál vůbec
+//    neexistuje), NE na izolaci sítě: add-on má host_network:true, takže se
+//    produkčně bindne 0.0.0.0 kvůli dosažitelnosti z HA Core kontejneru
+//    (172.30.32.1:8099) — port je pak dosažitelný i na LAN, proto NIKDY bez tokenu.
 //
 // Tento modul je framework-agnostický a bez závislosti na Anthropic/HA —
 // dispatch (text→odpověď) se injektuje, takže jde otestovat bez modelu.

@@ -12,6 +12,15 @@ export ANTHROPIC_API_KEY=$(jq --raw-output '.ANTHROPIC_API_KEY' /data/options.js
 export OPENAI_API_KEY=$(jq --raw-output '.OPENAI_API_KEY' /data/options.json)
 export PLANTID_API_KEY=$(jq --raw-output '.PLANTID_API_KEY // ""' /data/options.json)
 
+# Voice kanál (HA custom conversation component). Fail-closed: bez tokenu se
+# HTTP server vůbec nespustí. Add-on jede host_network:true → default bind
+# 0.0.0.0, aby HA Core kontejner dosáhl na 172.30.32.1:8099 (127.0.0.1 = jen
+# host loopback, který Core nevidí). Bezpečnost drží bearer token, NE izolace
+# sítě — s host_network je port dosažitelný i na LAN, proto NIKDY bez tokenu.
+export ZAN_VOICE_TOKEN=$(jq --raw-output '.ZAN_VOICE_TOKEN // ""' /data/options.json)
+export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"' /data/options.json)
+export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
+
 # HA přístup přes supervisor
 # s6-overlay v3 ukládá env vars jako soubory v /var/run/s6/container_environment/
 export SUPERVISOR_TOKEN=$(cat /var/run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || echo "")
