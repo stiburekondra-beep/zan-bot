@@ -43,6 +43,7 @@ const { normalizeCommandText } = require('./command-text');
 const { guardAreaAlias } = require('./area-alias-guard');
 const { evaluateActuation } = require('./actuation-guard');
 const { guardHouseMap } = require('./house-map-guard');
+const { guardActionClaim } = require('./action-claim-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
@@ -3476,6 +3477,10 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   // v profilu 'ovladani'. Krátký strop tokenů řeší VOICE_MAX_TOKENS níže.
   if (opts.voice) { model = MODEL_FAST; escalated = true; }
 
+  // Nástroje, které v TOMTO kole (napříč iteracemi smyčky) reálně proběhly
+  // a jestli doběhly úspěšně — vstup pro action-claim-guard (fabrikace akce).
+  const actionCalls = [];
+
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const reqOptions = claudeRequestOptionsForModel(model);
@@ -3518,6 +3523,10 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
           // si potvrzení nesmí "přibalit" sám (schema ho nezná, ale poslat by šlo)
           if (block.input && block.input.__confirmed) delete block.input.__confirmed;
           const result = await executeTool(block.name, block.input, chatId);
+          // Zaznamenej pro action-claim-guard: proběhl nástroj a byl úspěšný?
+          // ok = žádná chyba a nástroj se sám neoznačil za neúspěch.
+          const toolOk = !!result && !result.error && result.success !== false && result.ok !== false;
+          actionCalls.push({ name: block.name, ok: toolOk });
           if (result && result.error) {
             // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
             // něco selhalo, jen že Žán o tom slušně informoval uživatele.
@@ -3569,6 +3578,15 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (houseGuard.changed) {
       finalText = houseGuard.text;
       console.warn(`house-map-guard: neutralizována fabulace sousednosti z prázdné mapy (chat ${chatId})`);
+    }
+    // Tvrdá pojistka proti FABRIKACI PROVEDENÉ AKCE (bug 2026-08-06-01):
+    // Žán nesmí tvrdit „vrátil/zapsal/smazal jsem" nebo „restartoval jsem HA",
+    // když si to uživatel právě vyžádal a žádný odpovídající nástroj v tomhle
+    // kole úspěšně neproběhl. Prompt to sám nezajistí — LLM tvrzení protlačí.
+    const actionGuard = guardActionClaim(finalText, userMessage, actionCalls);
+    if (actionGuard.changed) {
+      finalText = actionGuard.text;
+      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
     }
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);

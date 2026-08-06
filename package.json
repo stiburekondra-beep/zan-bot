@@ -18,6 +18,7 @@
     "test:onboard-device": "node scripts/check-onboard-device.js",
     "test:area-alias-guard": "node scripts/check-area-alias-guard.js",
     "test:actuation-guard": "node scripts/check-actuation-guard.js",
+    "test:action-claim-guard": "node scripts/check-action-claim-guard.js",
     "test:ventilation-report": "node scripts/check-ventilation-report.js",
     "test:command-text": "node scripts/check-command-text.js",
     "test:capabilities": "node scripts/check-capabilities.js",
