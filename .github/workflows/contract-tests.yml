@@ -1,0 +1,63 @@
+# Kontraktní testy Žána — brána proti regresi na každý push/PR.
+# Stroj hlídá, ne role: 20 offline check-*.js + node --check bot.js.
+# check-capabilities.js má cross-repo závislost (SKILLS.md v privátním CHoS-),
+# proto běží jen jako samostatný krok, když je k dispozici token CHOS_REPO_TOKEN;
+# jinak se přeskočí a zůstává na rolích (viz karta 2026-08-05-provozak-05).
+name: contract-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout zan-bot
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Instalace závislostí
+        run: npm ci
+
+      - name: Syntaxe bota
+        run: node --check bot.js
+
+      - name: Kontraktní testy (offline, bez cross-repo)
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in scripts/check-*.js; do
+            if [ "$f" = "scripts/check-capabilities.js" ]; then
+              echo ":: přeskočeno (cross-repo, běží níž nebo lokálně role): $f"
+              continue
+            fi
+            echo ":: $f"
+            if ! node "$f"; then
+              echo "!! FAIL: $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: check-capabilities vs SKILLS.md (jen když je token)
+        env:
+          CHOS_TOKEN: ${{ secrets.CHOS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CHOS_TOKEN}" ]; then
+            echo "CHOS_REPO_TOKEN není nastaven → check-capabilities přeskočen."
+            echo "Kontrolu capabilities vs SKILLS.md zatím drží role lokálně (CHoS- je vedle repa)."
+            echo "Aktivuje se sama, jakmile Ondra přidá read-only PAT do secrets jako CHOS_REPO_TOKEN."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${CHOS_TOKEN}@github.com/stiburekondra-beep/CHoS-.git" \
+            /tmp/chos
+          ZAN_SKILLS_PATH=/tmp/chos/projects/baklazan/zan/SKILLS.md \
+            node scripts/check-capabilities.js
