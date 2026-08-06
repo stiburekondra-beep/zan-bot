@@ -44,6 +44,7 @@ const { guardAreaAlias } = require('./area-alias-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap } = require('./house-map');
+const { backupFile: backupFileCore, restoreChange } = require('./config-restore');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
 // aby ho měl v globálním scope. 'ws' má stejné .onopen/.onmessage/.onerror
@@ -976,23 +977,10 @@ function detectContentShrink(oldContent, newContent) {
   return problems;
 }
 
+// Záloha + rollback jsou v modulu config-restore.js (testovatelné izolovaně,
+// restore drill). Tady jen tenké wrappery, které dodají BACKUP_DIR a git hook.
 function backupFile(fp) {
-  // Kopie do /config/zan_data/backups/<soubor>.<timestamp>, drží se
-  // posledních 10 záloh na soubor. Vrací cestu k záloze, null když
-  // originál neexistuje (= nový soubor, zálohovat není co).
-  try {
-    if (!fs.existsSync(fp)) return null;
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const bp = path.join(BACKUP_DIR, `${path.basename(fp)}.${ts}`);
-    fs.copyFileSync(fp, bp);
-    const siblings = fs.readdirSync(BACKUP_DIR)
-      .filter(f => f.startsWith(path.basename(fp) + '.')).sort();
-    while (siblings.length > 10) {
-      try { fs.unlinkSync(path.join(BACKUP_DIR, siblings.shift())); } catch {}
-    }
-    return bp;
-  } catch (e) { console.warn('backupFile:', e.message); return null; }
+  return backupFileCore(fp, BACKUP_DIR);
 }
 
 function recordChange(fp, backupPath, wasNew) {
@@ -1014,18 +1002,13 @@ function configGitNote(res) {
 }
 
 function restoreLastChange() {
-  // Vrátí poslední zápis: nový soubor smaže, přepsaný obnoví ze zálohy.
-  if (!lastChange) return { error: 'Není co vracet — od startu add-onu žádný zaznamenaný zápis.' };
-  try {
-    const { file, backup, wasNew, when } = lastChange;
-    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `before Zan undo ${path.basename(file)}`);
-    if (wasNew) { if (fs.existsSync(file)) fs.unlinkSync(file); }
-    else if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, file);
-    else return { error: 'Záloha se nenašla — obnov ručně z /config/zan_data/backups/.' };
-    if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, `after Zan undo ${path.basename(file)}`, file);
-    lastChange = null;
-    return { success: true, restored: path.basename(file), was_new_file_deleted: wasNew, change_from: when };
-  } catch (e) { return { error: e.message }; }
+  const res = restoreChange(lastChange, {
+    onSnapshot: (label, changedFile) => {
+      if (CONFIG_GIT_ENABLED) snapshotConfigGit(HA_CONFIG_PATH, label, changedFile);
+    },
+  });
+  if (res.success) lastChange = null;
+  return res;
 }
 
 async function haCheckConfig() {
