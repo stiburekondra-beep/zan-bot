@@ -24,6 +24,20 @@ AI správce domu pro Home Assistant ovládaný přes Telegram.
 | ANTHROPIC_API_KEY | Klíč z console.anthropic.com |
 | OPENAI_API_KEY | Klíč z platform.openai.com |
 | PLANTID_API_KEY | Klíč z plant.id (volitelné) |
+| ZAN_VOICE_TOKEN | Sdílený secret hlasového mostu — musí sedět s tokenem v HA integraci `zan_conversation` (volitelné; bez něj je hlas vypnutý) |
+| ZAN_VOICE_HTTP_HOST | Bind adresa voice kanálu (default `0.0.0.0` kvůli dosažitelnosti z HA Core; volitelné) |
+| ZAN_VOICE_CHAT_ID | Telegram Chat ID, na které hlas mapuje (default = admin/Ondra; volitelné) |
+
+### Hlasový kanál (voice)
+
+Žán umí přijímat text z HA custom conversation componentu `zan_conversation`
+(hlas → text → Žán → odpověď) přes lokální HTTP kanál na portu `8099`. Kanál je
+**fail-closed**: dokud není vyplněný `ZAN_VOICE_TOKEN`, HTTP server se vůbec
+nespustí. `ZAN_VOICE_TOKEN` je **sdílený secret** — stejnou hodnotu vyplň v
+add-onu i v HA integraci `zan_conversation`. Add-on jede `host_network:true`,
+takže se kanál bindne na `0.0.0.0` (aby ho HA Core dosáhl na
+`172.30.32.1:8099`); ochranu drží bearer token, ne izolace sítě, proto kanál
+**nikdy neprovozuj bez tokenu**.
 
 Pro cizí dům nepřenášej `/config/zan_data/` z jiné instalace. Prázdná
 instalace si vytvoří vlastní `rodina.md` a `home_memory.json` podle hodnot
