@@ -50,8 +50,24 @@ function createPollingWatchdog(bot, options = {}) {
     lastRestartAttemptAt = ts;
     try {
       log('warn', `Telegram polling watchdog: ${reason}; restartuji polling`);
-      if (typeof bot.stopPolling === 'function') await bot.stopPolling({ cancel: true });
-      if (typeof bot.startPolling === 'function') await bot.startPolling();
+      // Zastavení je best-effort ve VLASTNÍM try/catch: node-telegram-bot-api
+      // 0.66 volá při stopPolling({cancel:true}) lastRequest.cancel() na
+      // zaseknutém getUpdates requestu, jehož objekt .cancel() metodu nemá →
+      // synchronní TypeError. Ten NESMÍ shodit celý restart (přesně incident
+      // 2026-08-08: bot hluchý ~4,5 h, 7× „restart selhal", startPolling se
+      // nikdy nezavolal). Knihovna přitom v stop() vynuluje _lastRequest JEŠTĚ
+      // PŘED cancel(), takže po pádu je stav čistý a start naběhne nanovo.
+      if (typeof bot.stopPolling === 'function') {
+        try {
+          await bot.stopPolling({ cancel: true });
+        } catch (stopErr) {
+          log('warn', `Telegram polling watchdog: stopPolling selhal, pokracuji v nahození: ${stopErr.message}`);
+        }
+      }
+      // startPolling se MUSÍ zavolat VŽDY, i když stop selhal — jinak zůstane
+      // příjem mrtvý. restart:true vynutí čerstvý polling i kdyby _lastRequest
+      // nebyl vynulovaný.
+      if (typeof bot.startPolling === 'function') await bot.startPolling({ restart: true });
       lastSuccessfulGetUpdatesAt = now();
       consecutiveRestartFailures = 0;
       log('warn', 'Telegram polling watchdog: polling restartovan');
