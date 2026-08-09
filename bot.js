@@ -49,6 +49,7 @@ const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
+const { analyzeConversationLog } = require('./conversation-quality');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -145,6 +146,7 @@ if (DATA_DIR !== __dirname) {
 const MEMORY_FILE       = path.join(DATA_DIR, 'home_memory.json');
 const LOG_FILE          = path.join(DATA_DIR, 'zan_actions.log');
 const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
+const CONVO_QUALITY_FILE = path.join(DATA_DIR, 'conversation_quality.jsonl');
 const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
 const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
@@ -1577,6 +1579,17 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'conversation_quality',
+        description: 'Privacy-safe přehled kvality reálných rozhovorů ze zan_conversation.log. Nevrací text zpráv ani citace; jen počty kategorií, anonymní agregaci a backlog kroky typu chybí data / chybí skill / možný bug. Zapisuje anonymní conversation_quality.jsonl do /config/zan_data.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            max_lines: { type: 'number', description: 'Kolik posledních řádků konverzačního logu analyzovat (default 2000, max 2000).' },
+          },
+          required: [],
+        },
+      },
+      {
         name: 'repair_inbox',
         description: 'Přečte jednotný repair inbox Žána: otevřené problémy z neúspěšného onboardingu, watchdogu a servisní obchůzky. Jen čtení — nic neopravuje, nemaže ani nespouští.',
         input_schema: {
@@ -1801,7 +1814,7 @@ async function executeTool(name, input, chatId) {
   const memory = loadMemory();
 
   // Security check — admin-only nástroje
-  const adminOnlyTools = ['write_package', 'delete_package', 'export_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'repair_inbox', 'save_lesson', 'save_playbook', 'undo_last_change'];
+  const adminOnlyTools = ['write_package', 'delete_package', 'export_package', 'write_dashboard', 'reload_ha', 'restart_ha', 'read_error_log', 'conversation_quality', 'repair_inbox', 'save_lesson', 'save_playbook', 'undo_last_change'];
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
@@ -2540,6 +2553,13 @@ async function executeTool(name, input, chatId) {
         const filtrovane = String(raw.data || '').split('\n')
           .filter(l => /ERROR|WARNING|Invalid|failed|Traceback/i.test(l));
         return { log: filtrovane.slice(-lines).join('\n') || '(žádné chyby ani warningy)' };
+      }
+
+      case 'conversation_quality': {
+        const maxLines = Math.min(input.max_lines || 2000, 2000);
+        const result = analyzeConversationLog(CONVO_LOG_FILE, CONVO_QUALITY_FILE, { maxLines });
+        logAction(chatId, user.name, 'conversation_quality', `${result.records_written} assistant turns`, 'ok');
+        return result;
       }
 
       case 'repair_inbox': {
