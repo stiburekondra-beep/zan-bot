@@ -20,6 +20,7 @@ export PLANTID_API_KEY=$(jq --raw-output '.PLANTID_API_KEY // ""' /data/options.
 export ZAN_VOICE_TOKEN=$(jq --raw-output '.ZAN_VOICE_TOKEN // ""' /data/options.json)
 export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"' /data/options.json)
 export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
+export ZAN_MUSIC_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_MUSIC_PLAYER_ENTITY_ID // "media_player.zan_media_player"' /data/options.json)
 
 # HA přístup přes supervisor
 # s6-overlay v3 ukládá env vars jako soubory v /var/run/s6/container_environment/

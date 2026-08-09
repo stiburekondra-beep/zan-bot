@@ -17,6 +17,7 @@
     { "name": "toggle", "scope": "ha-write", "admin_only": false, "skills_required": true },
     { "name": "call_service", "scope": "ha-write", "admin_only": false, "skills_required": true },
     { "name": "announce_home", "scope": "ha-write", "admin_only": false, "skills_required": true },
+    { "name": "play_music", "scope": "ha-write", "admin_only": false, "skills_required": true },
     { "name": "remember", "scope": "memory-write", "admin_only": false, "skills_required": true },
     { "name": "recall", "scope": "memory-read", "admin_only": false, "skills_required": true },
     { "name": "technology_inventory", "scope": "memory-read", "admin_only": false, "skills_required": true },
