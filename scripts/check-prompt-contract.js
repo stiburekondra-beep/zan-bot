@@ -77,5 +77,10 @@ assertIncludes('BEZPECNOST: co brani nechtenemu nebo fyzicky rizikovemu dopadu',
 assertIncludes('VRACENI ZPET: jak se zmena vypne nebo vrati', 'automation proposal rollback section');
 assertIncludes('Pak cekej na jasne OK. Teprve po potvrzeni zapis YAML pres write_package', 'automation waits for explicit OK');
 assertRegex(/write_package'[\s\S]*kdyz\s*\/\s*a kdyz\s*\/\s*tak\s*\/\s*bezpecnost\s*\/\s*vraceni zpet[\s\S]*bez tohoto ok write_package nevolej/, 'write_package tool description carries automation OK gate');
+assertIncludes('HUDBA DOMA', 'music section exists');
+assertIncludes('pouzij play_music pres Music Assistant', 'music commands use narrow play_music tool');
+assertIncludes('Nezkousej otevrit music_assistant pres call_service', 'music_assistant is not opened through generic call_service');
+assertIncludes('bez overeni nastrojem', 'music refusal must first try the tool');
+assertIncludes('dej dalsi krok', 'music failure includes next step');
 
 console.log('Prompt contract OK');
