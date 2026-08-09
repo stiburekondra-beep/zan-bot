@@ -28,6 +28,7 @@
     "test:house-map": "node scripts/check-house-map.js",
     "test:tool-profiles": "node scripts/check-tool-profiles.js",
     "test:voice-channel": "node scripts/check-voice-channel.js",
+    "test:conversation-quality": "node scripts/check-conversation-quality.js",
     "test:house-map-guard": "node scripts/check-house-map-guard.js"
   },
   "dependencies": {
