@@ -4296,16 +4296,31 @@ function formatAge(ms) {
   if (hours < 48) return `${hours} h`;
   return `${Math.round(hours / 24)} d`;
 }
-function looksLikeZigbeeDevice(device, state) {
-  const hay = [
+function classifyZigbeeDevice(device, state) {
+  const identifiers = (device?.identifiers || []).flat().filter(Boolean).map(String);
+  const connections = (device?.connections || []).flat().filter(Boolean).map(String);
+  const manufacturer = String(device?.manufacturer || '').toLowerCase();
+  const model = String(device?.model || '').toLowerCase();
+  const entityText = [
     state?.entity_id,
     state?.attributes?.friendly_name,
-    device?.manufacturer,
-    device?.model,
-    ...(device?.identifiers || []).flat(),
-    ...(device?.connections || []).flat(),
+    device?.name_by_user,
+    device?.name,
   ].filter(Boolean).join(' ').toLowerCase();
-  return /zigbee|zha|z2m|zigbee2mqtt|aqara|lumi|ikea|tradfri|zbbridge|ewelink|\bzb[-_\s]?\w*/.test(hay);
+  const registryText = [...identifiers, ...connections].join(' ').toLowerCase();
+  const hwText = [manufacturer, model].join(' ');
+
+  if (/(^|[\s,])zha($|[\s,])|zigbee2mqtt|deconz|zigbee/.test(registryText)) {
+    return { isZigbee: true, confidence: 'vysoká', source: 'registry integrace' };
+  }
+  if (/(aqara|lumi|ikea|tradfri|trådfri|philips hue|sonoff.*zb|zbbridge)/.test(hwText)) {
+    return { isZigbee: true, confidence: 'vysoká', source: 'výrobce/model' };
+  }
+  if (/(zigbee|zha|z2m|zigbee2mqtt|\bzb[-_\s]?\w*)/.test(entityText)) {
+    return { isZigbee: true, confidence: 'střední', source: 'název entity' };
+  }
+
+  return { isZigbee: false, confidence: 'nízká', source: 'bez Zigbee signálu' };
 }
 async function describeUnavailableZigbee(states) {
   const unavailable = states.filter(isUnavailableState);
@@ -4322,7 +4337,8 @@ async function describeUnavailableZigbee(states) {
     .map(s => {
       const entity = entityById.get(s.entity_id);
       const device = entity?.device_id ? deviceById.get(entity.device_id) : null;
-      if (!looksLikeZigbeeDevice(device, s)) return null;
+      const zigbee = classifyZigbeeDevice(device, s);
+      if (!zigbee.isZigbee) return null;
       return {
         entity_id: s.entity_id,
         name: s.attributes?.friendly_name || entity?.name || entity?.original_name || s.entity_id,
@@ -4330,6 +4346,8 @@ async function describeUnavailableZigbee(states) {
         manufacturer: device?.manufacturer || '',
         model: device?.model || '',
         integration: (device?.identifiers || []).map(i => i[0]).filter(Boolean).join(', '),
+        confidence: zigbee.confidence,
+        source: zigbee.source,
       };
     })
     .filter(Boolean)
@@ -4416,7 +4434,7 @@ async function runObchuzka() {
       lines.push(`🛜 *Zigbee zařízení k fyzické kontrole / re-pair:*`);
       for (const z of zigbeeUnavailable.slice(0, 10)) {
         const hw = [z.manufacturer, z.model].filter(Boolean).join(' ');
-        lines.push(`  • ${z.name} (${z.entity_id}, ${formatAge(z.age_ms)}${hw ? `, ${hw}` : ''})`);
+        lines.push(`  • ${z.name} (${z.entity_id}, ${formatAge(z.age_ms)}${hw ? `, ${hw}` : ''}, jistota: ${z.confidence} — ${z.source})`);
       }
       if (zigbeeUnavailable.length > 10) lines.push(`  • ...a ${zigbeeUnavailable.length - 10} dalších`);
       lines.push('Re-pair nespouštím sám: můžu jen na výslovný pokyn otevřít Zigbee párování, fyzické reset/párování zařízení musí udělat člověk.');
@@ -4485,14 +4503,14 @@ async function runObchuzka() {
 
         const diagPrompt = `Jsi Žán, údržbář chytrého domu. Výsledky servisní obchůzky:
 NEDOSTUPNÉ ENTITY: ${JSON.stringify(unavailable.slice(0, 30).map(s => ({ id: s.entity_id, name: s.attributes.friendly_name || s.entity_id })))}
-ZIGBEE OFFLINE KANDIDÁTI: ${JSON.stringify(zigbeeUnavailable.slice(0, 20).map(z => ({ id: z.entity_id, name: z.name, age: formatAge(z.age_ms), manufacturer: z.manufacturer, model: z.model, integration: z.integration })))}
+ZIGBEE OFFLINE KANDIDÁTI: ${JSON.stringify(zigbeeUnavailable.slice(0, 20).map(z => ({ id: z.entity_id, name: z.name, age: formatAge(z.age_ms), manufacturer: z.manufacturer, model: z.model, integration: z.integration, confidence: z.confidence, source: z.source })))}
 ČEKAJÍCÍ UPDATY: ${JSON.stringify(updates)}
 SLABÉ BATERIE: ${JSON.stringify(lowBattery.map(s => ({ id: s.entity_id, pct: s.state })))}
 VÝŇATEK Z ERROR LOGU HA:
 ${errorExcerpt.slice(0, 4000) || '(prázdný)'}
 
 Úkol: 1) urči pravděpodobné PŘÍČINY (skupiny entit stejné integrace = jedna příčina), 2) rozliš vážné od kosmetického, 3) navrhni zásahy.
-Jediný automaticky povolený zásah je reload integrace přes entitu (homeassistant.reload_config_entry) — dává smysl u zamrzlé integrace nebo síťového zařízení, NE u vybité baterie nebo fyzicky odpojeného Zigbee zařízení. Zigbee re-pair jen doporuč člověku; nespouštěj ho jako zásah. Max 3 zásahy.
+Jediný automaticky povolený zásah je reload integrace přes entitu (homeassistant.reload_config_entry) — dává smysl u zamrzlé integrace nebo síťového zařízení, NE u vybité baterie nebo fyzicky odpojeného Zigbee zařízení. Zigbee re-pair jen doporuč člověku; nespouštěj ho jako zásah. U Zigbee kandidátů s vysokou/střední jistotou reload vůbec nenavrhuj. Max 3 zásahy.
 Vrať POUZE JSON bez komentářů: {"diagnoza":"stručně česky pro majitele — příčiny a co je vážné","zasahy":[{"entity_id":"...","duvod":"..."}]}`;
 
         const diagResp = await claudeCreate({
@@ -4511,6 +4529,7 @@ Vrať POUZE JSON bez komentářů: {"diagnoza":"stručně česky pro majitele �
 
         // Reaktivní zásahy s mantinely (vynucuje kód)
         const unavailableIds = new Set(unavailable.map(s => s.entity_id));
+        const zigbeeIds = new Set(zigbeeUnavailable.map(z => z.entity_id));
         u.interventions = u.interventions || {};
         const dayKey = today;
         u.interventions[dayKey] = u.interventions[dayKey] || {};
@@ -4520,6 +4539,10 @@ Vrať POUZE JSON bez komentářů: {"diagnoza":"stručně česky pro majitele �
         const proposed = Array.isArray(diag?.zasahy) ? diag.zasahy.slice(0, 3) : [];
         for (const z of proposed) {
           if (!z || !unavailableIds.has(z.entity_id)) continue; // mimo allowlist/seznam → ignoruj
+          if (zigbeeIds.has(z.entity_id)) {
+            lines.push(`🔧 ${z.entity_id}: reload integrace přeskočen — vypadá jako Zigbee zařízení a může chtít fyzickou kontrolu/re-pair (${z.duvod})`);
+            continue;
+          }
           const count = u.interventions[dayKey][z.entity_id] || 0;
           if (count >= 2) {
             lines.push(`🔧 ${z.entity_id}: dnes už jsem to zkoušel ${count}× — dál nezasahuju, chce to lidský pohled (${z.duvod})`);
