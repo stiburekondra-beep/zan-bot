@@ -77,5 +77,10 @@ assertIncludes('BEZPECNOST: co brani nechtenemu nebo fyzicky rizikovemu dopadu',
 assertIncludes('VRACENI ZPET: jak se zmena vypne nebo vrati', 'automation proposal rollback section');
 assertIncludes('Pak cekej na jasne OK. Teprve po potvrzeni zapis YAML pres write_package', 'automation waits for explicit OK');
 assertRegex(/write_package'[\s\S]*kdyz\s*\/\s*a kdyz\s*\/\s*tak\s*\/\s*bezpecnost\s*\/\s*vraceni zpet[\s\S]*bez tohoto ok write_package nevolej/, 'write_package tool description carries automation OK gate');
+assertIncludes('LIMITY A MEZERY SCHOPNOSTI', 'capability gap section exists');
+assertIncludes('nikdy nekonci holym "neumim", "nemuzu", "nesmim" nebo "nemam pristup"', 'no bare refusal rule');
+assertIncludes('zapis anonymni mezeru do repair inboxu', 'capability gap writes repair inbox');
+assertIncludes('raw vety rodiny ani citace do repair zaznamu neukladej', 'capability gap does not leak raw conversation');
+assertIncludes('Poctivost zustava: limit priznej', 'honesty guards are not weakened by next-step rule');
 
 console.log('Prompt contract OK');

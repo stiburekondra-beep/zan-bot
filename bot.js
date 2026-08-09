@@ -51,6 +51,7 @@ const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
+const { handleCapabilityGap } = require('./capability-gap-repair');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -3401,6 +3402,7 @@ RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé pozn
 
 PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
 OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
+LIMITY A MEZERY SCHOPNOSTÍ: nikdy nekonči holým "neumím", "nemůžu", "nesmím" nebo "nemám přístup". Nejdřív zkus vlastní dostupné nástroje, playbooky a jinou bezpečnou cestu. Když to opravdu nejde, řekni poctivě proč, přidej konkrétní další krok pro člověka nebo firmu a zapiš anonymní mezeru do repair inboxu; raw věty rodiny ani citace do repair záznamu neukládej. Poctivost zůstává: limit přiznej, jen k němu vždy dej cestu dál.
 
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.
 
@@ -3608,6 +3610,21 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (actionGuard.changed) {
       finalText = actionGuard.text;
       console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
+    }
+    // Holé „neumím/nemůžu" bez dalšího kroku boří služebnickou důvěru.
+    // Zůstává poctivé přiznání limitu, ale přidá se cesta dál a anonymní
+    // repair záznam bez raw rodinné konverzace.
+    const gapRepair = handleCapabilityGap(finalText, userMessage, {
+      repairFile: REPAIRS_FILE,
+      upsertRepair: upsertRepairItem,
+    });
+    if (gapRepair.changed || gapRepair.recorded) {
+      finalText = gapRepair.text;
+      if (gapRepair.error) {
+        console.warn(`capability-gap-repair: záznam se nepodařilo uložit (${gapRepair.error.message})`);
+      } else {
+        console.warn(`capability-gap-repair: ${gapRepair.recorded ? 'zapsána' : 'detekována'} mezera ${gapRepair.capability} (chat ${chatId})`);
+      }
     }
     if (opts.voice) {
       finalText = sanitizeVoiceResponse(finalText);
