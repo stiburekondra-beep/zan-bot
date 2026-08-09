@@ -82,5 +82,10 @@ assertIncludes('pouzij play_music pres Music Assistant', 'music commands use nar
 assertIncludes('Nezkousej otevrit music_assistant pres call_service', 'music_assistant is not opened through generic call_service');
 assertIncludes('bez overeni nastrojem', 'music refusal must first try the tool');
 assertIncludes('dej dalsi krok', 'music failure includes next step');
+assertIncludes('LIMITY A MEZERY SCHOPNOSTI', 'capability gap section exists');
+assertIncludes('nikdy nekonci holym "neumim", "nemuzu", "nesmim" nebo "nemam pristup"', 'no bare refusal rule');
+assertIncludes('zapis anonymni mezeru do repair inboxu', 'capability gap writes repair inbox');
+assertIncludes('raw vety rodiny ani citace do repair zaznamu neukladej', 'capability gap does not leak raw conversation');
+assertIncludes('Poctivost zustava: limit priznej', 'honesty guards are not weakened by next-step rule');
 
 console.log('Prompt contract OK');

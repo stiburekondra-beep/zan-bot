@@ -31,6 +31,7 @@
     "test:voice-response": "node scripts/check-voice-response.js",
     "test:play-music": "node scripts/check-play-music.js",
     "test:conversation-quality": "node scripts/check-conversation-quality.js",
+    "test:capability-gap-repair": "node scripts/check-capability-gap-repair.js",
     "test:house-map-guard": "node scripts/check-house-map-guard.js"
   },
   "dependencies": {
