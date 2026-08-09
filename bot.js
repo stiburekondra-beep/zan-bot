@@ -49,6 +49,7 @@ const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
+const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
@@ -3513,7 +3514,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
         // (cache je per model — FAST a SMART si drží každý svou). Voice instrukce
         // patří do DYNAMICKÉHO (necachovaného) bloku — nesmí rozbít SYSTEM_STATIC cache.
         { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
-        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — 1–2 věty, žádné odrážky, markdown ani emoji. Když je toho víc, řekni to nejdůležitější a nabídni pokračování.' : '') },
+        { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — nejvýš 2 krátké věty. Piš jen čistý mluvený text: žádné markdown značky, tučné písmo, nadpisy, odrážky, tabulky, emoji ani seznamy. Když je toho víc, řekni nejdůležitější věc a nabídni pokračování.' : '') },
       ],
       tools,
       messages,
@@ -3607,6 +3608,9 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (actionGuard.changed) {
       finalText = actionGuard.text;
       console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
+    }
+    if (opts.voice) {
+      finalText = sanitizeVoiceResponse(finalText);
     }
     conversationHistory[chatId].push({ role: 'assistant', content: finalText });
     if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
