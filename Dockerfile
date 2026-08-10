@@ -42,7 +42,9 @@ COPY house-map.js ./
 COPY tool-profiles.js ./
 COPY voice-channel.js ./
 COPY voice-response.js ./
+COPY play-music.js ./
 COPY conversation-quality.js ./
+COPY capability-gap-repair.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

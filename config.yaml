@@ -1,6 +1,6 @@
 name: "Žán Bot"
 description: "AI správce domu Žán — Telegram bot pro Home Assistant"
-version: "5.11.9"
+version: "5.11.10"
 slug: "zan_bot"
 init: false
 arch:
@@ -35,6 +35,7 @@ options:
   ZAN_VOICE_TOKEN: ""
   ZAN_VOICE_HTTP_HOST: "0.0.0.0"
   ZAN_VOICE_CHAT_ID: 0
+  ZAN_MUSIC_PLAYER_ENTITY_ID: "media_player.zan_media_player"
 schema:
   TELEGRAM_TOKEN: str
   CHAT_ID_ONDRA: str
@@ -51,3 +52,4 @@ schema:
   ZAN_VOICE_TOKEN: str?
   ZAN_VOICE_HTTP_HOST: str?
   ZAN_VOICE_CHAT_ID: int?
+  ZAN_MUSIC_PLAYER_ENTITY_ID: str?

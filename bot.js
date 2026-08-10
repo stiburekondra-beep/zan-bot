@@ -51,6 +51,8 @@ const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
+const { playMusic } = require('./play-music');
+const { handleCapabilityGap } = require('./capability-gap-repair');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -86,6 +88,7 @@ const POLLING_WATCHDOG_STALE_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_STAL
 const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHECK_MS || String(60 * 1000), 10);
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
 const CONFIG_GIT_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.ZAN_CONFIG_GIT_ENABLED || 'true'));
+const ZAN_MUSIC_PLAYER_ENTITY_ID = String(process.env.ZAN_MUSIC_PLAYER_ENTITY_ID || '').trim();
 
 function localDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('cs-CZ', {
@@ -1243,6 +1246,19 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'play_music',
+      description: 'Pustí hudbu přes Home Assistant Music Assistant. Použij na povely typu "pusť Coldplay" nebo "pusť Linkin Park". Neotevírá obecný call_service; volá jen music_assistant.play_media na ověřený media_player. Když není známý nebo dostupný přehrávač, vrať konkrétní další krok, ne holé "neumím".',
+      input_schema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Co pustit, např. Coldplay, Linkin Park - Numb nebo název playlistu.' },
+          media_type: { type: 'string', enum: ['track', 'artist', 'album', 'playlist', 'radio'], description: 'Typ média. Výchozí track; pro samotného interpreta použij artist.' },
+          player_entity_id: { type: 'string', description: 'Volitelný cíl media_player.*. Když chybí, použije se ZAN_MUSIC_PLAYER_ENTITY_ID nebo ověřený media_player.zan_media_player.' },
+        },
+        required: ['query'],
+      },
+    },
+    {
       name: 'remember',
       description: 'Uloží informaci do paměti.',
       input_schema: {
@@ -2101,6 +2117,12 @@ async function executeTool(name, input, chatId) {
         if (result.success) {
           logAction(chatId, user.name, 'announce_home', `${result.tts_entity_id}->${result.media_player_entity_id}`, 'ok');
         }
+        return result;
+      }
+
+      case 'play_music': {
+        const result = await playMusic({ input, haGet, haPost, defaultPlayer: ZAN_MUSIC_PLAYER_ENTITY_ID });
+        logAction(chatId, user.name, 'play_music', `${input.query || ''}->${result.player_entity_id || '?'}`, result.success ? 'ok' : `fail:${result.reason || result.error || '?'}`);
         return result;
       }
 
@@ -3401,6 +3423,8 @@ RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé pozn
 
 PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
 OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
+HUDBA DOMA: když uživatel řekne „pusť Coldplay", „pusť Linkin Park" nebo podobný hudební povel, použij play_music přes Music Assistant. Nezkoušej otevřít music_assistant přes call_service a neodpovídej holým „nemám přehrávač" bez ověření nástrojem. Když play_music vrátí player_missing/player_unavailable, řekni krátce proč a dej další krok (nastavit nebo zapnout přehrávač); pokud je to capability gap, zapiš ho do repair_inbox, jakmile máš k dispozici admin profil.
+LIMITY A MEZERY SCHOPNOSTÍ: nikdy nekonči holým "neumím", "nemůžu", "nesmím" nebo "nemám přístup". Nejdřív zkus vlastní dostupné nástroje, playbooky a jinou bezpečnou cestu. Když to opravdu nejde, řekni poctivě proč, přidej konkrétní další krok pro člověka nebo firmu a zapiš anonymní mezeru do repair inboxu; raw věty rodiny ani citace do repair záznamu neukládej. Poctivost zůstává: limit přiznej, jen k němu vždy dej cestu dál.
 
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.
 
@@ -3608,6 +3632,21 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     if (actionGuard.changed) {
       finalText = actionGuard.text;
       console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
+    }
+    // Holé „neumím/nemůžu" bez dalšího kroku boří služebnickou důvěru.
+    // Zůstává poctivé přiznání limitu, ale přidá se cesta dál a anonymní
+    // repair záznam bez raw rodinné konverzace.
+    const gapRepair = handleCapabilityGap(finalText, userMessage, {
+      repairFile: REPAIRS_FILE,
+      upsertRepair: upsertRepairItem,
+    });
+    if (gapRepair.changed || gapRepair.recorded) {
+      finalText = gapRepair.text;
+      if (gapRepair.error) {
+        console.warn(`capability-gap-repair: záznam se nepodařilo uložit (${gapRepair.error.message})`);
+      } else {
+        console.warn(`capability-gap-repair: ${gapRepair.recorded ? 'zapsána' : 'detekována'} mezera ${gapRepair.capability} (chat ${chatId})`);
+      }
     }
     if (opts.voice) {
       finalText = sanitizeVoiceResponse(finalText);
