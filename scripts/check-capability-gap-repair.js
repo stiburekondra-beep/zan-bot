@@ -27,7 +27,8 @@ const r1 = handleCapabilityGap(bareRefusal, rawUserText, {
 assert.strictEqual(r1.changed, true, 'holé neumím musí dostat další krok');
 assert.strictEqual(r1.recorded, true, 'capability gap se zapíše do repair inboxu');
 assert.strictEqual(r1.capability, 'music', 'hudební požadavek se klasifikuje jako music');
-assert.ok(/Zapsal jsem to jako mezeru pro firmu/.test(r1.text), 'odpověď obsahuje další krok pro firmu');
+assert.ok(/Poznamenal jsem si to/.test(r1.text), 'odpověď obsahuje lidské poznamenání bez firemního žargonu');
+assert.ok(!/mezera pro firmu|firma rozhodne|ověřit to testem/i.test(r1.text), 'uživatelský text nesmí nést interní firemní žargon');
 
 const saved1 = fs.readFileSync(file, 'utf8');
 assert.ok(!saved1.includes(rawUserText), 'raw věta uživatele se nesmí uložit do repair inboxu');
@@ -48,6 +49,7 @@ assert.strictEqual(store.items[0].count, 2, 'opakovaný gap zvýší count míst
 assert.strictEqual(store.items[0].source, 'konverzace', 'zdroj je konverzace');
 assert.strictEqual(store.items[0].capability, 'music', 'capability zůstává music');
 assert.strictEqual(store.items[0].evidence.privacy, 'raw_conversation_not_stored', 'privacy evidence zůstává');
+assert.ok(/CEO\/programátor zkontroluje repair inbox/.test(store.items[0].next_step), 'interní repair next_step zůstává pro firmu');
 
 assert.strictEqual(hasRefusalOrLimit('Jasně, zkusím to.'), false, 'běžná odpověď není limit');
 assert.strictEqual(hasRefusalOrLimit('Nemám k tomu přístup.'), true, 'nemám přístup je limit');
@@ -57,5 +59,6 @@ assert.strictEqual(classifyCapability('Co je vedle kuchyně?', 'Mapu domu nemám
 const r3 = handleCapabilityGap('Nemůžu potvrdit výsledek.', 'zapni světlo', {});
 assert.strictEqual(r3.recorded, false, 'bez repairFile/upsert helperu se nic nezapisuje');
 assert.strictEqual(r3.changed, true, 'i bez zápisu odpověď dostane další krok');
+assert.ok(!/mezera pro firmu|firma rozhodne|ověřit to testem/i.test(r3.text), 'fallback text bez zápisu je pořád lidský');
 
 console.log('capability gap repair contract OK');
