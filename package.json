@@ -32,7 +32,8 @@
     "test:play-music": "node scripts/check-play-music.js",
     "test:conversation-quality": "node scripts/check-conversation-quality.js",
     "test:capability-gap-repair": "node scripts/check-capability-gap-repair.js",
-    "test:house-map-guard": "node scripts/check-house-map-guard.js"
+    "test:house-map-guard": "node scripts/check-house-map-guard.js",
+    "test:guest-privacy": "node scripts/check-guest-privacy.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

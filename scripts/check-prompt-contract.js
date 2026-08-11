@@ -87,5 +87,8 @@ assertIncludes('nikdy nekonci holym "neumim", "nemuzu", "nesmim" nebo "nemam pri
 assertIncludes('zapis anonymni mezeru do repair inboxu', 'capability gap writes repair inbox');
 assertIncludes('raw vety rodiny ani citace do repair zaznamu neukladej', 'capability gap does not leak raw conversation');
 assertIncludes('Poctivost zustava: limit priznej', 'honesty guards are not weakened by next-step rule');
+assertIncludes('Host/neznamy chat nesmi cist ani zapisovat rodinnou pamet', 'guest cannot read/write family memory');
+assertIncludes('neprozrazuj rodinnou pamet, jmena deti, rutiny, preference, mistnosti, zarizeni, kamery/mikrofony ani souhrn stavu domu', 'guest privacy covers memory and HA status summaries');
+assertIncludes('rodinna data muzes ukazat az po potvrzeni adminem', 'guest must be routed to admin approval');
 
 console.log('Prompt contract OK');
