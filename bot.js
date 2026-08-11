@@ -534,7 +534,29 @@ function getUser(chatId) {
 
 function isAdmin(chatId) { return ADMIN_CHATS.includes(chatId); }
 
+function isKnownHouseholdChat(chatId) {
+  return chatId === CHAT_ONDRA || chatId === CHAT_JANA || isAdmin(chatId);
+}
+
+function canAccessHouseholdPrivateData(chatId, user = getUser(chatId)) {
+  return isKnownHouseholdChat(chatId) || (user && user.role !== 'guest');
+}
+
+function guestPrivacyMessage() {
+  return 'Tuhle rodinnou paměť můžu ukázat jen někomu z domácnosti. Zatím tě beru jako hosta; požádej Ondru, ať tě přidá mezi známé uživatele.';
+}
+
 function renderStartMessage(memory, user) {
+  if (user && user.role === 'guest') {
+    return {
+      text:
+        '👋 Ahoj, jsem *Žán* — správce téhle domácnosti.\n\n' +
+        'Zatím tě beru jako hosta, takže ti neukážu rodinnou paměť, děti, rutiny ani stav domu. ' +
+        'Když máš patřit do domácnosti, popros Ondru, ať tě přidá mezi známé uživatele.',
+      extra: { parse_mode: 'Markdown' },
+    };
+  }
+
   const homeKnown = Object.keys(memory.rooms || {}).length > 0;
   const residentsKnown = Object.keys(memory.residents || {}).length > 0;
 
@@ -561,7 +583,14 @@ function renderStartMessage(memory, user) {
   };
 }
 
-function renderPametMessage(memory) {
+function renderPametMessage(memory, user = { role: 'admin' }) {
+  if (user && user.role === 'guest') {
+    return {
+      text: `🧠 *Paměť domácnosti je soukromá.*\n\n${guestPrivacyMessage()}`,
+      extra: { parse_mode: 'Markdown' },
+    };
+  }
+
   let out = '🧠 *Co Žán ví o domě:*\n\n';
   const residents = memory.residents || {};
   if (Object.keys(residents).length > 0) out += `*Obyvatelé:*\n${Object.entries(residents).map(([k, v]) => `• ${v.name || k}${v.role ? ': ' + v.role : ''}`).join('\n')}\n\n`;
@@ -570,6 +599,41 @@ function renderPametMessage(memory) {
   if ((memory.notes || []).length > 0) out += `*Poslední poznámky:*\n${memory.notes.slice(-5).map(n => `• ${n.text}`).join('\n')}`;
   if (out === '🧠 *Co Žán ví o domě:*\n\n') out += 'Zatím nic — řekněte mi něco o vašem domě! 😊';
   return { text: out, extra: { parse_mode: 'Markdown' } };
+}
+
+function renderHouseholdContext(memory, user, chatId) {
+  if (!canAccessHouseholdPrivateData(chatId, user)) {
+    return [
+      'PŘÍSTUP HOSTA: aktuální chat není známý člen domácnosti ani admin.',
+      'Rodinná paměť, obyvatelé, děti, rutiny, preference, místnosti, zařízení, kamera/mikrofon inventář a rodina.md jsou pro hosta SKRYTÉ.',
+      'Když se host ptá, co si pamatuješ, co se děje doma, kdo tu bydlí, kde jsou kamery, nebo chce něco uložit do rodinné paměti, neprozrazuj obsah. Řekni stručně, že to můžeš ukázat nebo uložit až po potvrzení Ondrou/adminem.',
+      'Obyvatelé: skryto pro hosta',
+      'Dům detaily: skryto pro hosta',
+      'Místnosti: skryto pro hosta',
+      'Zařízení v paměti: skryto pro hosta',
+      'Preference: skryto pro hosta',
+      'Poznámky: skryto pro hosta',
+      'PROFIL DOMÁCNOSTI (rodina.md): skryto pro hosta',
+    ].join('\n');
+  }
+
+  const residents = memory.residents || {};
+  const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
+  const rodina = (() => {
+    const r = ensureRodina();
+    return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)';
+  })();
+
+  return [
+    `Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}`,
+    `Dům detaily: ${JSON.stringify(memory.house || {})}`,
+    `Místnosti: ${roomNames || 'žádné'}`,
+    `Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)`,
+    `Preference: ${JSON.stringify(memory.preferences)}`,
+    `Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}`,
+    'PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):',
+    rodina,
+  ].join('\n');
 }
 
 function resolveOnboardingTarget(target) {
@@ -1122,6 +1186,7 @@ async function transcribeVoice(fileBuffer, mimeType) {
 // ═══════════════════════════════════════════════
 function buildTools(chatId, profil) {
   const admin = isAdmin(chatId);
+  const user = getUser(chatId);
   const tools = [
     {
       name: 'get_areas',
@@ -1820,7 +1885,13 @@ Po zápisu vždy popsat změny LIDSKY.`,
   // Profil kanálu (zast. 65): explicitně vyžádaný profil (hlas → 'ovladani')
   // jinak podle admin gate = dnešní chování. Filtr je deterministický →
   // stabilní prompt-cache prefix per kanál.
-  return filterToolsByProfile(tools, resolveProfile(profil, admin));
+  const profiledTools = filterToolsByProfile(tools, resolveProfile(profil, admin));
+  if (!canAccessHouseholdPrivateData(chatId, user)) {
+    // Host nedostane žádné nástroje k domu: i read-only HA stav umí prozradit
+    // kamery, mikrofony, rutiny nebo obsazenost. Rodina/admin jedou beze změny.
+    return [];
+  }
+  return profiledTools;
 }
 
 // ═══════════════════════════════════════════════
@@ -1835,6 +1906,11 @@ async function executeTool(name, input, chatId) {
   if (adminOnlyTools.includes(name) && !isAdmin(chatId)) {
     logSecurity(chatId, `blocked_admin_tool:${name}`);
     return { error: 'Tato akce je dostupná pouze pro administrátora.' };
+  }
+
+  if (!canAccessHouseholdPrivateData(chatId, user)) {
+    logSecurity(chatId, `blocked_guest_tool:${name}`);
+    return { error: guestPrivacyMessage() };
   }
 
   // Vynucené potvrzení citlivých akcí (kotel/žaluzie/restart) — akce se
@@ -3315,7 +3391,8 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Před akcí přemýšlej: CO chce člověk dosáhnout → JAK to v HA postavit → teprve pak nástroje. U větších návrhů řekni záměr jednou větou, než začneš.
 - Po každé změně popiš výsledek LIDSKY (co to dělá pro dům), technikálie jen když se někdo zeptá.
 - Víc otázek najednou = očísluj je tak, aby šlo odpovědět „3: kuchyň, 6: ano" z mobilu. Jedno zadání, jedna odpověď — netříšti je do víc zpráv s jiným číslováním.
-- Nové info o domě/lidech ukládej hned (remember, update_family_member, update_house_info, rodina_update), nečekej na potvrzení.
+- Nové info o domě/lidech ukládej hned (remember, update_family_member, update_house_info, rodina_update), nečekej na potvrzení — ale jen od známého člena domácnosti/admina. Host/neznámý chat nesmí číst ani zapisovat rodinnou paměť; požádej ho, ať ho Ondra přidá mezi známé uživatele.
+- Host/neznámý chat: neprozrazuj rodinnou paměť, jména dětí, rutiny, preference, místnosti, zařízení, kamery/mikrofony ani souhrn stavu domu. Řekni stručně, že rodinná data můžeš ukázat až po potvrzení adminem.
 - Téma neurčuje osobu. Zahrada, děti ani dům automaticky neznamenají Jana/Ondra; oslovuj jen aktuálního uživatele z kontextu. Když není jasné, komu rada patří nebo kdo něco pěstuje, zeptej se krátce „ty, nebo Jana/Ondra?".
 
 ═══ 3. STRUKTURA KONFIGURACE (závazná konvence domu) ═══
@@ -3458,18 +3535,17 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
 
   if (!conversationHistory[chatId]) conversationHistory[chatId] = [];
   
-  const residents = memory.residents || {};
-  const residentNames = Object.values(residents).map(r => r.name || r).join(', ') || 'zatím neznám';
-
   const garden = loadGarden();
   const month = new Date().getMonth() + 1;
   const seasonal = getSeasonalTasks(month);
   const isJana = chatId === CHAT_JANA;
-  const includeGardenContext = isJana || isGardenRelated(userMessage);
+  const trustedHousehold = canAccessHouseholdPrivateData(chatId, user);
+  const includeGardenContext = trustedHousehold && (isJana || isGardenRelated(userMessage));
+  const displayHomeName = trustedHousehold ? memory.home_name : 'domácnost';
 
   // Dynamický kontext — proměnlivé věci patří sem (za cache breakpoint),
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
-  const roomNames = Object.values(memory.rooms || {}).map(r => (r && r.name) ? r.name : r).filter(Boolean).join(', ');
+  const householdContext = renderHouseholdContext(memory, user, chatId);
   const todayUsage = loadUsage().days[new Date().toISOString().slice(0, 10)] || { calls: 0, input: 0, output: 0, cache_read: 0, cache_write: 0 };
   const todayCzk = (usageCostUsd(todayUsage, MODEL) * USD_CZK).toFixed(1);
   const activeReminders = listReminders(REMINDERS_FILE)
@@ -3478,20 +3554,13 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
     .map(r => `${r.id}: ${r.text} @ ${r.due_at_input || r.due_at}`)
     .join(' | ');
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
-Dům: "${memory.home_name}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
+Dům: "${displayHomeName}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
-UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : 'uživatel — může ovládat zařízení, ne YAML'})
-Obyvatelé: ${Object.values(residents).map(r => `${r.emoji || ''} ${r.name}${r.born ? ' (*' + r.born + '*)' : ''}${r.info ? ' — ' + r.info : ''}`).join(', ') || 'zatím neznám'}
-Dům detaily: ${JSON.stringify(memory.house || {})}
-Místnosti: ${roomNames || 'žádné'}
-Zařízení v paměti: ${Object.keys(memory.devices || {}).length} (detaily si vyžádej nástroji, do kontextu se neposílají)
-Preference: ${JSON.stringify(memory.preferences)}
-Poznámky: ${memory.notes.slice(-6).map(n => n.text).join(' | ') || 'žádné'}
+UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : user.role === 'guest' ? 'host — rodinná data a nástroje domu skryté' : 'uživatel — může ovládat zařízení, ne YAML'})
+${householdContext}
 Aktivní připomínky v tomhle chatu: ${activeReminders || 'žádné'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
-PROFIL DOMÁCNOSTI (rodina.md — tvůj hlavní zdroj, jak tahle rodina žije; sekce "(zatím nevyplněno)" = příležitost k JEDNÉ otázce):
-${(() => { const r = ensureRodina(); return r.length < 4500 ? r : r.slice(0, 4500) + '\n…(zkráceno — celý profil je v /config/zan_data/rodina.md)'; })()}
 ${includeGardenContext ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}
 Zahradní poznámky: ${garden.notes.slice(-2).map(n => n.text).join(' | ') || 'žádné'}
 Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profile (profily rostlin), garden_planting_plan (střídání plodin), garden_note (deník). Když aktuální uživatel popisuje zahradu nebo rostlinu → automaticky ulož do příslušného nástroje. Když pošle fotku rostliny → nabídni vytvoření profilu a zařazení na mapu. Zahradní dotaz sám o sobě neznamená, že mluví Jana; drž se UŽIVATEL výše.` : ''}`;
@@ -3540,7 +3609,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
         { type: 'text', text: SYSTEM_STATIC, cache_control: { type: 'ephemeral' } },
         { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — nejvýš 2 krátké věty. Piš jen čistý mluvený text: žádné markdown značky, tučné písmo, nadpisy, odrážky, tabulky, emoji ani seznamy. Když je toho víc, řekni nejdůležitější věc a nabídni pokračování.' : '') },
       ],
-      tools,
+      ...(tools.length ? { tools } : {}),
       messages,
     });
 
@@ -3849,7 +3918,7 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
 
   if (cmdText === '/pamet') {
     const memory = loadMemory();
-    const rendered = renderPametMessage(memory);
+    const rendered = renderPametMessage(memory, user);
     send(chatId, rendered.text, rendered.extra);
     return;
   }
@@ -5081,6 +5150,12 @@ if (TEST_EXPORTS) {
     CHAT_NAME_ONDRA,
     CHAT_NAME_JANA,
     getUser,
+    isKnownHouseholdChat,
+    canAccessHouseholdPrivateData,
+    renderHouseholdContext,
+    guestPrivacyMessage,
+    buildTools,
+    executeTool,
     loadMemory,
     saveMemory,
     ensureRodina,
