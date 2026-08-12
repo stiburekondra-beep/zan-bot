@@ -79,6 +79,8 @@ assertIncludes('Pak cekej na jasne OK. Teprve po potvrzeni zapis YAML pres write
 assertRegex(/write_package'[\s\S]*kdyz\s*\/\s*a kdyz\s*\/\s*tak\s*\/\s*bezpecnost\s*\/\s*vraceni zpet[\s\S]*bez tohoto ok write_package nevolej/, 'write_package tool description carries automation OK gate');
 assertIncludes('HUDBA DOMA', 'music section exists');
 assertIncludes('pouzij play_music pres Music Assistant', 'music commands use narrow play_music tool');
+assertIncludes('Kdyz uz neco hraje a uzivatel chce jineho interpreta, zanr, radio, playlist nebo skladbu, znamena to PREPNOUT hudbu pres play_music', 'music switch intent calls play_music even while already playing');
+assertRegex(/nikdy neodpovidej[\s\S]*uz hraju[\s\S]*jen proto[\s\S]*prehravac uz je ve stavu playing/, 'music command must not be short-circuited by playing state');
 assertIncludes('Nezkousej otevrit music_assistant pres call_service', 'music_assistant is not opened through generic call_service');
 assertIncludes('bez overeni nastrojem', 'music refusal must first try the tool');
 assertIncludes('dej dalsi krok', 'music failure includes next step');
