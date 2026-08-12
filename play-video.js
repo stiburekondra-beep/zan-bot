@@ -46,6 +46,11 @@ function extractVideoId(value) {
   return '';
 }
 
+function isYouTubeApp(app) {
+  const s = String(app || '').toLowerCase();
+  return s.includes('youtube') || s === '233637de'; // cast app ID YouTube receiveru
+}
+
 function stateIsUsable(state) {
   return !!state && !['unavailable', 'unknown'].includes(String(state.state || '').toLowerCase());
 }
@@ -55,26 +60,44 @@ function supportsPlayMedia(state) {
   return (feat & 512) === 512; // SUPPORT_PLAY_MEDIA
 }
 
-// Kandidát na cast cíl: umí play_media, není to Music Assistant fronta ani
-// hlasový satelit. Když jich je víc, nehádáme — chceme explicitní nastavení.
+// Cast-schopná obrazovka: umí play_media, není to Music Assistant fronta ani
+// hlasový satelit. POZOR: platí i na cíl, který si vyžádal model — jinak
+// pošle cast payload do MA fronty a z „videa" vyleze zvuk (stalo se 2026-08-12,
+// play_video -> media_player.living_room_tv, což je MA entita).
+function isCastCapable(state) {
+  if (!state || !String(state.entity_id || '').startsWith('media_player.')) return false;
+  if (!stateIsUsable(state) || !supportsPlayMedia(state)) return false;
+  const appId = String((state.attributes && state.attributes.app_id) || '').toLowerCase();
+  if (MUSIC_APP_IDS.has(appId)) return false;
+  if (/voice|assist|satellite/i.test(state.entity_id)) return false;
+  return true;
+}
+
 function castCandidates(states) {
-  return (Array.isArray(states) ? states : []).filter((s) => {
-    if (!s || !String(s.entity_id || '').startsWith('media_player.')) return false;
-    if (!stateIsUsable(s) || !supportsPlayMedia(s)) return false;
-    const appId = String((s.attributes && s.attributes.app_id) || '').toLowerCase();
-    if (MUSIC_APP_IDS.has(appId)) return false;
-    if (/voice|assist|satellite/i.test(s.entity_id)) return false;
-    return true;
-  });
+  return (Array.isArray(states) ? states : []).filter(isCastCapable);
 }
 
 function resolveVideoPlayer({ states, requestedPlayer, defaultPlayer }) {
   const requested = normalizeEntityId(requestedPlayer);
   const configured = normalizeEntityId(defaultPlayer);
+  const rejected = [];
 
   for (const entityId of [requested, configured].filter(Boolean)) {
     const state = (Array.isArray(states) ? states : []).find(s => s && s.entity_id === entityId) || null;
-    if (stateIsUsable(state)) return { ok: true, entity_id: entityId, source: entityId === requested ? 'requested' : 'configured' };
+    if (stateIsUsable(state) && !isCastCapable(state)) {
+      // Existuje, ale na video se nehodí (typicky Music Assistant fronta) —
+      // nepoužít a zkusit další v pořadí, ne poslat video do zvukové fronty.
+      rejected.push(entityId);
+      continue;
+    }
+    if (stateIsUsable(state)) {
+      return {
+        ok: true,
+        entity_id: entityId,
+        source: entityId === requested ? 'requested' : 'configured',
+        ...(rejected.length ? { rejected_players: rejected } : {}),
+      };
+    }
     if (state) {
       return {
         ok: false,
@@ -87,7 +110,14 @@ function resolveVideoPlayer({ states, requestedPlayer, defaultPlayer }) {
   }
 
   const candidates = castCandidates(states);
-  if (candidates.length === 1) return { ok: true, entity_id: candidates[0].entity_id, source: 'autodetect' };
+  if (candidates.length === 1) {
+    return {
+      ok: true,
+      entity_id: candidates[0].entity_id,
+      source: 'autodetect',
+      ...(rejected.length ? { rejected_players: rejected } : {}),
+    };
+  }
   if (candidates.length > 1) {
     return {
       ok: false,
@@ -204,20 +234,41 @@ async function playVideo({ input = {}, haGet, haPost, defaultPlayer, apiKey, fet
   await haPost('services/media_player/play_media', payload.data);
 
   // Ověření, ne domněnka: Chromecast chvíli bufferuje, tak se ptáme víckrát.
+  // Nestačí „playing" — na téže entitě může hrát něco úplně jiného (Music
+  // Assistant). Úspěch = běží YouTube app.
   const sleep = sleepImpl || (ms => new Promise(r => setTimeout(r, ms)));
   let playerState = 'neověřeno';
   let playingTitle = '';
+  let runningApp = '';
   for (let i = 0; i < 3; i++) {
     await sleep(waitMs);
     const st = await haGet(`states/${player.entity_id}`).catch(() => null);
     if (st) {
       playerState = st.state;
-      playingTitle = (st.attributes && st.attributes.media_title) || playingTitle;
-      if (['playing', 'buffering'].includes(String(st.state).toLowerCase())) break;
+      const attrs = st.attributes || {};
+      playingTitle = attrs.media_title || playingTitle;
+      runningApp = attrs.app_name || attrs.app_id || runningApp;
+      const playing = ['playing', 'buffering'].includes(String(st.state).toLowerCase());
+      if (playing && isYouTubeApp(runningApp)) break;
     }
   }
 
-  const confirmed = ['playing', 'buffering'].includes(String(playerState).toLowerCase());
+  const isPlaying = ['playing', 'buffering'].includes(String(playerState).toLowerCase());
+  const confirmed = isPlaying && isYouTubeApp(runningApp);
+  if (isPlaying && !confirmed) {
+    return {
+      success: false,
+      confirmed: false,
+      reason: 'wrong_app',
+      error: 'Na obrazovce neběží YouTube.',
+      video_id: videoId,
+      player_entity_id: player.entity_id,
+      player_state: playerState,
+      running_app: runningApp || 'neznámá',
+      next_step: `Na ${player.entity_id} běží ${runningApp || 'jiná aplikace'}, ne YouTube — vypni, co tam hraje (typicky hudba z Music Assistantu), a zkus to znovu.`,
+      message: `Video se mi na televizi nepodařilo pustit — běží tam ${runningApp || 'něco jiného'} místo YouTube.`,
+    };
+  }
   return {
     success: true,
     confirmed,
@@ -235,7 +286,75 @@ async function playVideo({ input = {}, haGet, haPost, defaultPlayer, apiKey, fet
   };
 }
 
+// ── Ovládání toho, co na televizi běží ───────────────────────────────
+// Cast entita v labu umí PAUSE/PLAY/STOP/VOLUME_SET/MUTE, ale NE VOLUME_STEP —
+// „hlasitěji/tišeji" se proto počítá z aktuální hlasitosti a posílá jako
+// absolutní volume_set.
+const VIDEO_ACTIONS = new Set(['pause', 'resume', 'stop', 'volume', 'volume_up', 'volume_down', 'mute', 'unmute']);
+const VOLUME_STEP = 0.1;
+
+function clampVolume(v) {
+  return Math.min(1, Math.max(0, Math.round(v * 100) / 100));
+}
+
+function buildControlCall({ action, volumePercent, currentVolume }) {
+  const a = String(action || '').trim();
+  if (!VIDEO_ACTIONS.has(a)) return { ok: false, error: `Neznámý povel pro televizi: ${action}.` };
+  const cur = Number.isFinite(Number(currentVolume)) ? Number(currentVolume) : 0.5;
+
+  if (a === 'pause') return { ok: true, service: 'media_player/media_pause', data: {} };
+  if (a === 'resume') return { ok: true, service: 'media_player/media_play', data: {} };
+  if (a === 'stop') return { ok: true, service: 'media_player/media_stop', data: {} };
+  if (a === 'mute') return { ok: true, service: 'media_player/volume_mute', data: { is_volume_muted: true } };
+  if (a === 'unmute') return { ok: true, service: 'media_player/volume_mute', data: { is_volume_muted: false } };
+
+  if (a === 'volume') {
+    const pct = Number(volumePercent);
+    if (!Number.isFinite(pct)) return { ok: false, error: 'Chybí hlasitost v procentech.' };
+    return { ok: true, service: 'media_player/volume_set', data: { volume_level: clampVolume(pct / 100) } };
+  }
+  const next = clampVolume(cur + (a === 'volume_up' ? VOLUME_STEP : -VOLUME_STEP));
+  return { ok: true, service: 'media_player/volume_set', data: { volume_level: next } };
+}
+
+async function controlVideo({ input = {}, haGet, haPost, defaultPlayer, sleepImpl, waitMs = 1500 }) {
+  const states = await haGet('states');
+  const player = resolveVideoPlayer({ states, requestedPlayer: input.player_entity_id, defaultPlayer });
+  if (!player.ok) {
+    return { success: false, error: 'Nemám ověřenou obrazovku.', reason: player.reason, next_step: player.next_step };
+  }
+  const before = (Array.isArray(states) ? states : []).find(s => s && s.entity_id === player.entity_id) || {};
+  const call = buildControlCall({
+    action: input.action,
+    volumePercent: input.volume_percent,
+    currentVolume: before.attributes && before.attributes.volume_level,
+  });
+  if (!call.ok) return { success: false, error: call.error };
+
+  await haPost(`services/${call.service}`, { entity_id: player.entity_id, ...call.data });
+
+  const sleep = sleepImpl || (ms => new Promise(r => setTimeout(r, ms)));
+  await sleep(waitMs);
+  const after = await haGet(`states/${player.entity_id}`).catch(() => null);
+  const vol = after && after.attributes ? after.attributes.volume_level : null;
+  const volPct = Number.isFinite(Number(vol)) ? Math.round(Number(vol) * 100) : null;
+  return {
+    success: true,
+    confirmed: !!after,
+    action: input.action,
+    player_entity_id: player.entity_id,
+    player_state: after ? after.state : 'neověřeno',
+    volume_percent: volPct,
+    message: /^volume/.test(String(input.action))
+      ? `Hlasitost televize je na ${volPct != null ? volPct : '?'} procentech.`
+      : `Televize: ${after ? after.state : 'neověřeno'}.`,
+  };
+}
+
 module.exports = {
+  isYouTubeApp,
+  buildControlCall,
+  controlVideo,
   extractVideoId,
   resolveVideoPlayer,
   buildCastPayload,

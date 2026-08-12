@@ -9,6 +9,9 @@ const {
   parseSearchHtml,
   searchYouTube,
   playVideo,
+  isYouTubeApp,
+  buildControlCall,
+  controlVideo,
 } = require('../play-video');
 const { VOICE_CONTROL_TOOLS } = require('../tool-profiles');
 
@@ -124,7 +127,7 @@ assert.strictEqual(parseSearchHtml('nic tady není'), null, 'rozbité HTML nevra
     haGet: async (path) => {
       calls.push(['GET', path]);
       if (path === 'states') return states;
-      return { entity_id: 'media_player.tv_obyvak_cast', state: 'playing', attributes: { media_title: 'TRAKTORY V BAHNĚ' } };
+      return { entity_id: 'media_player.tv_obyvak_cast', state: 'playing', attributes: { app_name: 'YouTube', media_title: 'TRAKTORY V BAHNĚ' } };
     },
     haPost: async (path, data) => {
       calls.push(['POST', path, data]);
@@ -157,6 +160,59 @@ assert.strictEqual(parseSearchHtml('nic tady není'), null, 'rozbité HTML nevra
   // prázdný dotaz
   const empty = await playVideo({ input: {}, haGet: async () => states, haPost: async () => ({}) });
   assert.strictEqual(empty.success, false, 'bez dotazu se nic nepouští');
+
+  // ── regrese 2026-08-12: cast payload nesmí skončit v Music Assistant frontě ──
+  const maRequested = resolveVideoPlayer({
+    states,
+    requestedPlayer: 'media_player.living_room_tv', // MA entita, model si ji vybral sám
+    defaultPlayer: 'media_player.tv_obyvak_cast',
+  });
+  assert.strictEqual(maRequested.entity_id, 'media_player.tv_obyvak_cast', 'MA entita se odmítne i když si ji vyžádal model');
+  assert.deepStrictEqual(maRequested.rejected_players, ['media_player.living_room_tv'], 'odmítnutý cíl se přizná');
+
+  assert.strictEqual(isYouTubeApp('YouTube'), true, 'app_name YouTube je YouTube');
+  assert.strictEqual(isYouTubeApp('233637DE'), true, 'cast app ID YouTube receiveru');
+  assert.strictEqual(isYouTubeApp('Music Assistant'), false, 'Music Assistant není YouTube');
+
+  // hraje, ale hraje hudba → NESMÍ hlásit úspěch (bug: "Hotovo, traktory hrají")
+  const wrongApp = await playVideo({
+    input: { query: 'https://youtu.be/qmOfZe47eok' },
+    defaultPlayer: 'media_player.tv_obyvak_cast',
+    waitMs: 0,
+    sleepImpl: async () => {},
+    haGet: async (path) => (path === 'states' ? states : { state: 'playing', attributes: { app_name: 'Music Assistant', media_title: 'Media' } }),
+    haPost: async () => ({}),
+  });
+  assert.strictEqual(wrongApp.success, false, 'hudba na obrazovce není úspěšně puštěné video');
+  assert.strictEqual(wrongApp.reason, 'wrong_app', 'špatná aplikace má konkrétní důvod');
+  assert(wrongApp.next_step.includes('Music Assistant'), 'next_step pojmenuje, co tam běží');
+
+  // ── ovládání televize ────────────────────────────────────────────────
+  assert.deepStrictEqual(
+    buildControlCall({ action: 'volume', volumePercent: 35 }),
+    { ok: true, service: 'media_player/volume_set', data: { volume_level: 0.35 } },
+    'konkrétní hlasitost jde jako volume_set',
+  );
+  assert.strictEqual(buildControlCall({ action: 'volume_up', currentVolume: 0.95 }).data.volume_level, 1, 'zesílení se ořízne na 100 %');
+  assert.strictEqual(buildControlCall({ action: 'volume_down', currentVolume: 0.05 }).data.volume_level, 0, 'ztlumení se ořízne na 0 %');
+  assert.strictEqual(buildControlCall({ action: 'pause' }).service, 'media_player/media_pause', 'pauza');
+  assert.strictEqual(buildControlCall({ action: 'mute' }).data.is_volume_muted, true, 'ztlumení');
+  assert.strictEqual(buildControlCall({ action: 'volume' }).ok, false, 'volume bez hodnoty neprojde');
+  assert.strictEqual(buildControlCall({ action: 'sebedestrukce' }).ok, false, 'neznámý povel neprojde');
+
+  const volCalls = [];
+  const volResult = await controlVideo({
+    input: { action: 'volume_up' },
+    defaultPlayer: 'media_player.tv_obyvak_cast',
+    waitMs: 0,
+    sleepImpl: async () => {},
+    haGet: async (path) => (path === 'states'
+      ? [{ entity_id: 'media_player.tv_obyvak_cast', state: 'playing', attributes: { supported_features: 152461, app_name: 'YouTube', volume_level: 0.4 } }]
+      : { state: 'playing', attributes: { volume_level: 0.5 } }),
+    haPost: async (path, data) => { volCalls.push([path, data]); return {}; },
+  });
+  assert.deepStrictEqual(volCalls[0], ['services/media_player/volume_set', { entity_id: 'media_player.tv_obyvak_cast', volume_level: 0.5 }], 'zesílení počítá z aktuální hlasitosti');
+  assert.strictEqual(volResult.volume_percent, 50, 'výsledek hlásí ověřenou hlasitost');
 
   // profil hlasu
   assert(VOICE_CONTROL_TOOLS.includes('play_video'), 'play_video je dostupný hlasem u satelitu');
