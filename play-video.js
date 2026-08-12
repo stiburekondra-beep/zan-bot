@@ -355,12 +355,17 @@ async function controlVideo({ input = {}, haGet, haPost, defaultPlayer, sleepImp
 // (ne dotaz) + cíl obrazovka. Používá bot.js k vynucení nástroje v prvním
 // kole agentické smyčky, aby model nemohl odpovědět "hotovo" bez akce.
 const VIDEO_ORDER = /(?<![\p{L}])(pusť|pust|spusť|spust|přehraj|prehraj|hoď|hod|dej)\p{L}*/iu;
-const VIDEO_TARGET = /(youtube|youtub|na\s+telev|na\s+telc|na\s+telk|na\s+tv\b|video|videj?ko)/i;
+const VIDEO_TARGET = /(youtube|youtub|na\s+telev|na\s+telc|na\s+telk|na\s+tv\b|televiz\p{L}*|video|videj?ko)/iu;
+// Ovládání běžící obrazovky — stejný nástroj (action), takže se vynucuje taky.
+// „vypni televizi" schválně NENÍ mezi nimi: to je turn_off, ne ovládání videa.
+const VIDEO_CONTROL_ORDER = /(?<![\p{L}])(ztlum|ztiš|ztis|zesil|zeslab|zeslabuj|pauzni|pauza|zapauzuj|zastav|stopni|nastav\s+hlasitost|dej\s+hlasitost|hlasitost)\p{L}*/iu;
 
 function requiresVideoTool(text) {
   const s = String(text || '');
   if (/\?\s*$/.test(s.trim())) return false; // otázka není rozkaz
-  return VIDEO_ORDER.test(s) && VIDEO_TARGET.test(s);
+  if (/vypni/i.test(s) && !/zvuk|hlasitost/i.test(s)) return false; // "vypni televizi" = turn_off
+  if (!VIDEO_TARGET.test(s)) return false;
+  return VIDEO_ORDER.test(s) || VIDEO_CONTROL_ORDER.test(s);
 }
 
 module.exports = {

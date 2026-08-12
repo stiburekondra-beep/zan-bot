@@ -63,9 +63,11 @@ const RESTART_DONE = /\brestartoval[ao]?\s+jsem\b|\b(?:home\s*assistant|ha)\s+(?
 // (1'') Uživatel právě žádá přehrání nebo ovládání přehrávání.
 // Jen ROZKAZ („pusť", „zapni"), ne 3. osoba — jinak by dotaz „co hraje na
 // televizi?" spustil guard nad legitimní odpovědí z get_state.
-const USER_MEDIA_INTENT = /(?<![\p{L}])(pusť|pust|spusť|spust|zapni|přehraj|prehraj|zesil|ztlum|pauzni|stopni)\p{L}*/iu;
-// (2''') Odpověď tvrdí, že média HRAJÍ / byla puštěna.
-const MEDIA_DONE = /(?<![\p{L}])(pouštím|poustim|spustil\w*\s+jsem|pustil\w*\s+jsem|zapnul\w*\s+jsem|hraje|hrají|hraji|běží|bezi|already\s+playing)/iu;
+const USER_MEDIA_INTENT = /(?<![\p{L}])(pusť|pust|spusť|spust|zapni|přehraj|prehraj|zesil|ztlum|ztiš|ztis|zeslab|pauzni|zapauzuj|zastav|stopni|hlasitost)\p{L}*/iu;
+// (2''') Odpověď tvrdí, že média HRAJÍ / byla puštěna — nebo že se povedlo
+// ovládnutí (ztlumení, zastavení, změna hlasitosti). Doplněno 2026-08-12:
+// „Televize je ztlumená" bez nástroje je stejná lež jako „traktory hrají".
+const MEDIA_DONE = /(?<![\p{L}])(pouštím|poustim|spustil\w*\s+jsem|pustil\w*\s+jsem|zapnul\w*\s+jsem|ztlumil\w*\s+jsem|zastavil\w*\s+jsem|hraje|hrají|hraji|běží|bezi|ztlumen\w*|zastaven\w*|pauznut\w*|zapauzov\w*|already\s+playing)|na\s+\d+\s*(?:procent\w*|%)/iu;
 // Objekt přehrávání — bez něj obecné „hraje" neguardujeme (např. „venku hraje kapela").
 const MEDIA_NOUN = /(televiz|telce|telka|youtube|video|hudb|píseň|pisen|skladb|rádi|radi|pohádk|pohadk|traktor|film)/i;
 

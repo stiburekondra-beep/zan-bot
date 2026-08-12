@@ -216,10 +216,10 @@ assert.strictEqual(parseSearchHtml('nic tady není'), null, 'rozbité HTML nevra
 
   // ── vynucení nástroje u jednoznačného povelu ─────────────────────────
   const { requiresVideoTool } = require('../play-video');
-  for (const order of ['pusť na youtube traktory v blátě', 'pusť dětem pohádku na televizi', 'pusť video s traktory', 'hoď to na tv']) {
+  for (const order of ['pusť na youtube traktory v blátě', 'pusť dětem pohádku na televizi', 'pusť video s traktory', 'hoď to na tv', 'ztlum televizi', 'zastav video na televizi', 'dej hlasitost na televizi na 30 procent']) {
     assert.strictEqual(requiresVideoTool(order), true, `povel "${order}" musí vynutit play_video`);
   }
-  for (const other of ['pusť Coldplay', 'co hraje na televizi?', 'zapni televizi', 'jaké video běží na youtube?']) {
+  for (const other of ['pusť Coldplay', 'co hraje na televizi?', 'zapni televizi', 'jaké video běží na youtube?', 'vypni televizi', 'zhasni v obýváku']) {
     assert.strictEqual(requiresVideoTool(other), false, `"${other}" nesmí vynutit play_video`);
   }
 

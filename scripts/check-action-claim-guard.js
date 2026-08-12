@@ -100,4 +100,18 @@ assert.strictEqual(
   '16: přiznání neúspěchu není tvrzení o hraní',
 );
 
-console.log('check-action-claim-guard: OK (16 scénářů)');
+// ── 17) Ovládání televize bez nástroje je taky lež ───────────────────────────
+const muteLie = guardActionClaim('Hotovo! Televize je ztlumená.', 'ztlum televizi', NONE);
+assert.strictEqual(muteLie.changed, true, '17a: tvrzení o ztlumení bez nástroje = fabrikace');
+assert.strictEqual(
+  guardActionClaim('Hotovo! Televize je ztlumená.', 'ztlum televizi', [{ name: 'play_video', ok: true }]).changed,
+  false,
+  '17b: po úspěšném nástroji je tvrzení legitimní',
+);
+assert.strictEqual(
+  guardActionClaim('Video na televizi je zastavené.', 'zastav video na televizi', NONE).changed,
+  true,
+  '17c: tvrzení o zastavení bez nástroje = fabrikace',
+);
+
+console.log('check-action-claim-guard: OK (17 scénářů)');
