@@ -39,6 +39,7 @@ COPY repair-inbox.js ./
 COPY COOKBOOK.md ./
 COPY technology-inventory.js ./
 COPY house-map.js ./
+COPY device-layout.js ./
 COPY tool-profiles.js ./
 COPY voice-channel.js ./
 COPY voice-response.js ./

@@ -47,6 +47,7 @@ const { guardActionClaim } = require('./action-claim-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
+const { buildDeviceLayoutSnapshot, formatDeviceLayout } = require('./device-layout');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
@@ -1399,6 +1400,18 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'device_layout',
+      description: 'Read-only diagnostika layoutu zařízení: zkombinuje HA device/entity/area registry, aktuální stavy a house_map. Použij na dotazy "co mi vypadlo", "proč nejede garáž", "kde mám slabý Zigbee". Vrací místnost/oblast, transport (zigbee/wifi/matter/unknown), jak dlouho je zařízení unavailable a doporučení. Nikdy sám nespouští re-pair, restart bridge, párování ani ovládání zařízení.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          scope: { type: 'string', enum: ['summary', 'unavailable', 'all'], description: 'summary/unavailable = jen problémy a doporučení; all = i dostupná zařízení.' },
+          min_age_minutes: { type: 'number', description: 'Prahový věk výpadku. Výchozí 60 min, minimum 5 min.' },
+        },
+        required: [],
+      },
+    },
+    {
       name: 'get_new_entities',
       description: 'Najde entity které Žán ještě nezná — nově přidaná zařízení. U každé vrátí i konzervativní návrh kategorie pro onboarding (plug/tv/climate/camera), ale finální typ vždy potvrzuje uživatel.',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -2282,6 +2295,31 @@ async function executeTool(name, input, chatId) {
           result: applyHouseMapAction(HOUSE_MAP_FILE, input),
           data_file: HOUSE_MAP_FILE,
           safety: 'Zápis do house_map ukládej jen z potvrzeného půdorysu nebo výslovné věty uživatele; area_id ověř přes HA.',
+        };
+      }
+
+      case 'device_layout': {
+        const minAgeMinutes = Math.max(5, Number(input.min_age_minutes || 60));
+        const [states, entityReg, deviceReg, areaReg] = await Promise.all([
+          haGet('states'),
+          haRegistry('entity_registry').catch(() => []),
+          haRegistry('device_registry').catch(() => []),
+          haRegistry('area_registry').catch(() => []),
+        ]);
+        const houseMap = readHouseMap(HOUSE_MAP_FILE);
+        const snapshot = buildDeviceLayoutSnapshot({
+          states,
+          entityRegistry: entityReg,
+          deviceRegistry: deviceReg,
+          areaRegistry: areaReg,
+          houseMap,
+          minAgeMs: minAgeMinutes * 60 * 1000,
+        });
+        return {
+          action: 'device_layout',
+          text: formatDeviceLayout(snapshot, { scope: input.scope || 'unavailable' }),
+          snapshot,
+          safety: snapshot.safety,
         };
       }
 
@@ -3510,6 +3548,7 @@ NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_ne
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
+LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
