@@ -7,6 +7,7 @@ const { VOICE_CONTROL_TOOLS } = require('../tool-profiles');
 
 const states = [
   { entity_id: 'media_player.zan_media_player', state: 'idle', attributes: { friendly_name: 'Žán media player' } },
+  { entity_id: 'media_player.hrajici', state: 'playing', attributes: { media_title: 'Numb', media_artist: 'Linkin Park' } },
   { entity_id: 'media_player.vypnuty', state: 'unavailable', attributes: {} },
   { entity_id: 'light.kuchyn', state: 'on', attributes: {} },
 ];
@@ -40,6 +41,19 @@ assert.deepStrictEqual(
     },
   },
   'payload pro Music Assistant je úzký a kontrolovaný',
+);
+assert.deepStrictEqual(
+  buildMusicServiceData({ query: 'dechovka', mediaType: 'radio', playerEntityId: 'media_player.hrajici' }),
+  {
+    ok: true,
+    data: {
+      entity_id: 'media_player.hrajici',
+      media_id: 'dechovka',
+      media_type: 'radio',
+      enqueue: 'replace',
+    },
+  },
+  'nový hudební povel na už hrajícím přehrávači nahrazuje aktuální hudbu',
 );
 assert.strictEqual(
   buildMusicServiceData({ query: 'Coldplay', mediaType: 'service', playerEntityId: 'media_player.zan_media_player' }).data.media_type,
@@ -83,6 +97,26 @@ assert.strictEqual(
   assert.strictEqual(noPlayer.success, false, 'bez playeru nevolá HA službu');
   assert.strictEqual(noPlayer.reason, 'player_missing', 'bez playeru je konkrétní gap');
   assert(noPlayer.next_step.includes('ZAN_MUSIC_PLAYER_ENTITY_ID'), 'bez playeru neskončí holým neumím');
+
+  const switchCalls = [];
+  const switched = await playMusic({
+    input: { query: 'dechovka', media_type: 'radio', player_entity_id: 'media_player.hrajici' },
+    haGet: async (path) => {
+      switchCalls.push(['get', path]);
+      if (path === 'states') return states;
+      if (path === 'states/media_player.hrajici') return { entity_id: 'media_player.hrajici', state: 'playing', attributes: { media_title: 'Dechovka' } };
+      throw new Error(`unexpected get ${path}`);
+    },
+    haPost: async (path, data) => {
+      switchCalls.push(['post', path, data]);
+      assert.strictEqual(path, 'services/music_assistant/play_media');
+      assert.strictEqual(data.entity_id, 'media_player.hrajici');
+      assert.strictEqual(data.media_id, 'dechovka');
+      assert.strictEqual(data.enqueue, 'replace');
+    },
+  });
+  assert.strictEqual(switched.success, true, 'přepnutí už hrajícího přehrávače volá Music Assistant');
+  assert(switchCalls.some(c => c[0] === 'post'), 'nová žádost o jiný obsah není považovaná za už splněnou');
 
   console.log('check-play-music: OK');
 })().catch((e) => {
