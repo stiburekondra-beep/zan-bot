@@ -33,6 +33,7 @@ options:
   ZAN_HARNESS_ENABLED: false
   ZAN_HARNESS_CHAT_ID: 0
   ZAN_VOICE_TOKEN: ""
+  ZAN_APP_TOKEN: ""
   ZAN_VOICE_HTTP_HOST: "0.0.0.0"
   ZAN_VOICE_CHAT_ID: 0
   ZAN_MUSIC_PLAYER_ENTITY_ID: "media_player.zan_media_player"
@@ -50,6 +51,7 @@ schema:
   ZAN_HARNESS_ENABLED: bool?
   ZAN_HARNESS_CHAT_ID: int?
   ZAN_VOICE_TOKEN: str?
+  ZAN_APP_TOKEN: str?
   ZAN_VOICE_HTTP_HOST: str?
   ZAN_VOICE_CHAT_ID: int?
   ZAN_MUSIC_PLAYER_ENTITY_ID: str?

@@ -18,6 +18,7 @@ export PLANTID_API_KEY=$(jq --raw-output '.PLANTID_API_KEY // ""' /data/options.
 # host loopback, který Core nevidí). Bezpečnost drží bearer token, NE izolace
 # sítě — s host_network je port dosažitelný i na LAN, proto NIKDY bez tokenu.
 export ZAN_VOICE_TOKEN=$(jq --raw-output '.ZAN_VOICE_TOKEN // ""' /data/options.json)
+export ZAN_APP_TOKEN=$(jq --raw-output '.ZAN_APP_TOKEN // ""' /data/options.json)
 export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"' /data/options.json)
 export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
 export ZAN_MUSIC_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_MUSIC_PLAYER_ENTITY_ID // "media_player.zan_media_player"' /data/options.json)

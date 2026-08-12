@@ -53,6 +53,7 @@ const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { handleCapabilityGap } = require('./capability-gap-repair');
+const { handleOnboardingRequest } = require('./service-onboarding');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -157,6 +158,7 @@ const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
 const SCHEDULED_ACTIONS_FILE = path.join(DATA_DIR, 'zan_scheduled_actions.json');
 const REPAIRS_FILE      = path.join(DATA_DIR, 'zan_repairs.json');
+const SERVICE_ONBOARDING_FILE = path.join(DATA_DIR, 'service_onboarding.json');
 const TECHNOLOGIES_FILE  = path.join(DATA_DIR, 'technologies.json');
 const TECHNOLOGY_DOCS_DIR = path.join(DATA_DIR, 'docs');
 const HOUSE_MAP_FILE    = path.join(DATA_DIR, 'house_map.json');
@@ -4164,19 +4166,23 @@ startHarnessInbox();
 function startVoiceChannel() {
   if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál
   const token = process.env.ZAN_VOICE_TOKEN;
-  if (!token) return; // fail-closed: bez tokenu kanál neexistuje
+  const appToken = process.env.ZAN_APP_TOKEN || token;
+  if (!token && !appToken) return; // fail-closed: bez tokenu kanál ani appka neexistují
   const port = parseInt(process.env.ZAN_VOICE_HTTP_PORT || '8099', 10);
   const host = process.env.ZAN_VOICE_HTTP_HOST || '127.0.0.1';
   const defaultChatId = parseInt(process.env.ZAN_VOICE_CHAT_ID || '', 10) || CHAT_ONDRA;
-  const handle = createVoiceHandler({
-    token,
-    allowedChats: ALLOWED_CHATS,
-    defaultChatId,
-    dispatch: (chatId, text) =>
-      enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
-  });
+  const handle = token
+    ? createVoiceHandler({
+      token,
+      allowedChats: ALLOWED_CHATS,
+      defaultChatId,
+      dispatch: (chatId, text) =>
+        enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
+    })
+    : null;
   const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
+    if (!handle || req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
     req.on('end', async () => {
@@ -4193,7 +4199,7 @@ function startVoiceChannel() {
     });
   });
   server.on('error', (e) => console.error('Voice kanál error:', e.message));
-  server.listen(port, host, () => console.log(`🎙️ Voice kanál: http://${host}:${port}/voice (profil ovladani, bearer token)`));
+  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /onboarding (bearer token)`));
 }
 startVoiceChannel();
 
