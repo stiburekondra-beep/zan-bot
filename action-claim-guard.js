@@ -33,6 +33,11 @@
 // legitimní i „smazal jsem" i „vrátil jsem", proto stačí jeden společný kbelík.
 const CONFIG_TOOLS = ['write_package', 'delete_package', 'undo_last_change', 'write_dashboard'];
 const RESTART_TOOLS = ['restart_ha'];
+// Přehrávání médií. Doplněno 2026-08-12 po živém nálezu v labu: Ondra dvakrát
+// za sebou požádal „pusť na youtube traktory v blátě" a Žán podruhé odpověděl
+// „Hotovo! Traktory teď hrají na televizi", aniž by zavolal jediný nástroj —
+// v historii totiž viděl, že už to jednou pustil. Televize přitom byla vypnutá.
+const MEDIA_TOOLS = ['play_video', 'play_music', 'call_service'];
 
 // (1) Uživatel v aktuální zprávě žádá o zásah do configu (vrácení/zápis/mazání).
 // Pozn.: v JS je `\b` ASCII → za slovem končícím diakritikou („vrať") selže;
@@ -55,43 +60,56 @@ const CONFIG_PHRASE = /(balíč\w*|automatiz\w*|package|dashboard)\s+(?:už\s+)?
 // (2'') Dokončený restart HA (first-person nebo jasné dokončení).
 const RESTART_DONE = /\brestartoval[ao]?\s+jsem\b|\b(?:home\s*assistant|ha)\s+(?:se\s+)?(?:právě\s+|už\s+)?(?:byl\s+)?restartov\w+/i;
 
+// (1'') Uživatel právě žádá přehrání nebo ovládání přehrávání.
+// Jen ROZKAZ („pusť", „zapni"), ne 3. osoba — jinak by dotaz „co hraje na
+// televizi?" spustil guard nad legitimní odpovědí z get_state.
+const USER_MEDIA_INTENT = /(?<![\p{L}])(pusť|pust|spusť|spust|zapni|přehraj|prehraj|zesil|ztlum|pauzni|stopni)\p{L}*/iu;
+// (2''') Odpověď tvrdí, že média HRAJÍ / byla puštěna.
+const MEDIA_DONE = /(?<![\p{L}])(pouštím|poustim|spustil\w*\s+jsem|pustil\w*\s+jsem|zapnul\w*\s+jsem|hraje|hrají|hraji|běží|bezi|already\s+playing)/iu;
+// Objekt přehrávání — bez něj obecné „hraje" neguardujeme (např. „venku hraje kapela").
+const MEDIA_NOUN = /(televiz|telce|telka|youtube|video|hudb|píseň|pisen|skladb|rádi|radi|pohádk|pohadk|traktor|film)/i;
+
 // text: hotová odpověď Žána.
 // userMessage: text aktuální uživatelovy zprávy (gate 1 — o co si právě řekl).
 // actionCalls: pole { name, ok } — nástroje volané v TOMTO kole a jestli
 //   doběhly úspěšně (ok === true). Bot.js ho plní během agentické smyčky.
 // Vrací { text, changed, fabricatedConfig, fabricatedRestart }.
 function guardActionClaim(text, userMessage, actionCalls) {
-  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false };
+  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false, fabricatedMedia: false };
   if (!text || typeof text !== 'string') return noop;
 
   const um = typeof userMessage === 'string' ? userMessage : '';
   const calls = Array.isArray(actionCalls) ? actionCalls : [];
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
+  const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
   const configClaim = (VERB_DONE.test(text) && CONFIG_NOUN.test(text)) || CONFIG_PHRASE.test(text);
   const restartClaim = RESTART_DONE.test(text);
+  const mediaClaim = MEDIA_DONE.test(text) && MEDIA_NOUN.test(text);
 
   // (1) požádal o něj uživatel v tomhle kole? + (3) neproběhl nástroj?
   const fabricatedConfig = configClaim && USER_CONFIG_INTENT.test(um) && !configSatisfied;
   const fabricatedRestart = restartClaim && USER_RESTART_INTENT.test(um) && !restartSatisfied;
+  const fabricatedMedia = mediaClaim && USER_MEDIA_INTENT.test(um) && !mediaSatisfied;
 
-  if (!fabricatedConfig && !fabricatedRestart) return noop;
+  if (!fabricatedConfig && !fabricatedRestart && !fabricatedMedia) return noop;
 
   const parts = [];
   if (fabricatedConfig) parts.push('zásah do konfigurace (vrácení / zápis / smazání balíčku)');
   if (fabricatedRestart) parts.push('restart Home Assistanta');
+  if (fabricatedMedia) parts.push('puštění hudby nebo videa');
   const what = parts.join(' ani ');
 
   const replacement =
     `⚠️ Musím se hned opravit: napsal jsem, že jsem provedl ${what}, ale ve ` +
     `skutečnosti se to nestalo — žádný takový nástroj v tomhle kroku úspěšně ` +
-    `neproběhl, takže v konfiguraci se nic nezměnilo. Nechci ti tvrdit něco, co ` +
+    `neproběhl, takže se doopravdy nic nestalo. Nechci ti tvrdit něco, co ` +
     `jsem neudělal. Napiš mi prosím ještě jednou, co přesně mám udělat, a provedu ` +
     `to doopravdy — potvrdím ti to až podle skutečného výsledku nástroje.`;
 
-  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart };
+  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedMedia };
 }
 
-module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS };
+module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, MEDIA_TOOLS };

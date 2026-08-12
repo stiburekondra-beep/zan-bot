@@ -70,4 +70,34 @@ assert.strictEqual(guardActionClaim('', 'cokoli', NONE).changed, false, '12a: pr
 assert.strictEqual(guardActionClaim(null, 'cokoli', NONE).changed, false, '12b: null text');
 assert.strictEqual(guardActionClaim(bug1, 'vrať to', null).changed, true, '12c: chybějící actionCalls = žádný tool = fabrikace');
 
-console.log('check-action-claim-guard: OK (12 scénářů)');
+// ── 13) ŽIVÝ BUG 2026-08-12: „Hotovo, traktory hrají na televizi" bez nástroje ─
+const mediaLie = 'Hotovo! "Traktory v blátě" teď hrají na televizi v pokoji.';
+const r13 = guardActionClaim(mediaLie, 'pusť na youtube traktory v blátě', NONE);
+assert.strictEqual(r13.changed, true, '13a: tvrzení o puštěném videu bez nástroje = fabrikace');
+assert.strictEqual(r13.fabricatedMedia, true, '13b: označeno jako fabrikace média');
+assert(r13.text.includes('puštění hudby nebo videa'), '13c: přiznání pojmenuje, co se nestalo');
+
+// ── 14) Legitimní: nástroj proběhl → věta o hraní projde beze změny ──────────
+const mediaOk = guardActionClaim(mediaLie, 'pusť na youtube traktory v blátě', [{ name: 'play_video', ok: true }]);
+assert.strictEqual(mediaOk.changed, false, '14: po úspěšném play_video je tvrzení legitimní');
+assert.strictEqual(
+  guardActionClaim('Pouštím ti Coldplay do obýváku.', 'pusť coldplay', [{ name: 'play_music', ok: true }]).changed,
+  false,
+  '14b: play_music legitimizuje hudební tvrzení',
+);
+
+// ── 15) FALSE-POSITIVE OBRANA: dotaz „co hraje" není rozkaz ──────────────────
+assert.strictEqual(
+  guardActionClaim('Na televizi teď hraje YouTube — TRAKTORY V BAHNĚ.', 'co hraje na televizi?', [{ name: 'get_state', ok: true }]).changed,
+  false,
+  '15: odpověď na dotaz o stavu se nesmí přepsat na přiznání',
+);
+
+// ── 16) FALSE-POSITIVE OBRANA: poctivé přiznání neúspěchu projde ─────────────
+assert.strictEqual(
+  guardActionClaim('Video se mi pustit nepodařilo, televize je vypnutá.', 'pusť na youtube traktory', [{ name: 'play_video', ok: false }]).changed,
+  false,
+  '16: přiznání neúspěchu není tvrzení o hraní',
+);
+
+console.log('check-action-claim-guard: OK (16 scénářů)');
