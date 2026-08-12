@@ -34,7 +34,8 @@
     "test:capability-gap-repair": "node scripts/check-capability-gap-repair.js",
     "test:house-map-guard": "node scripts/check-house-map-guard.js",
     "test:guest-privacy": "node scripts/check-guest-privacy.js",
-    "test:play-video": "node scripts/check-play-video.js"
+    "test:play-video": "node scripts/check-play-video.js",
+    "test:dockerfile-modules": "node scripts/check-dockerfile-modules.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
