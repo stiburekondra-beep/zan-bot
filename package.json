@@ -29,6 +29,7 @@
     "test:device-layout": "node scripts/check-device-layout.js",
     "test:tool-profiles": "node scripts/check-tool-profiles.js",
     "test:voice-channel": "node scripts/check-voice-channel.js",
+    "test:service-onboarding": "node scripts/check-service-onboarding.js",
     "test:voice-response": "node scripts/check-voice-response.js",
     "test:play-music": "node scripts/check-play-music.js",
     "test:conversation-quality": "node scripts/check-conversation-quality.js",
