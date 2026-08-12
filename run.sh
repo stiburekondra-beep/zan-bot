@@ -22,6 +22,12 @@ export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"'
 export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
 export ZAN_MUSIC_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_MUSIC_PLAYER_ENTITY_ID // "media_player.zan_media_player"' /data/options.json)
 
+# Video na TV přes Google Cast (nástroj play_video). Prázdný YOUTUBE_API_KEY
+# = hledání přes veřejnou stránku výsledků YouTube; s klíčem jde oficiální
+# Data API. Prázdné ZAN_VIDEO_PLAYER_ENTITY_ID = autodetekce cast obrazovky.
+export ZAN_VIDEO_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_VIDEO_PLAYER_ENTITY_ID // ""' /data/options.json)
+export YOUTUBE_API_KEY=$(jq --raw-output '.YOUTUBE_API_KEY // ""' /data/options.json)
+
 # HA přístup přes supervisor
 # s6-overlay v3 ukládá env vars jako soubory v /var/run/s6/container_environment/
 export SUPERVISOR_TOKEN=$(cat /var/run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || cat /run/s6/container_environment/SUPERVISOR_TOKEN 2>/dev/null || echo "")

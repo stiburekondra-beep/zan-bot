@@ -29,6 +29,7 @@ const VOICE_CONTROL_TOOLS = [
   'schedule_action',
   'announce_home',
   'play_music',
+  'play_video',
   'read_cookbook',
 ];
 

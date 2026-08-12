@@ -52,6 +52,7 @@ const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
+const { playVideo } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
@@ -89,6 +90,8 @@ const POLLING_WATCHDOG_CHECK_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_CHEC
 const POLLING_WATCHDOG_COOLDOWN_MS = parseInt(process.env.ZAN_POLLING_WATCHDOG_COOLDOWN_MS || String(2 * 60 * 1000), 10);
 const CONFIG_GIT_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.ZAN_CONFIG_GIT_ENABLED || 'true'));
 const ZAN_MUSIC_PLAYER_ENTITY_ID = String(process.env.ZAN_MUSIC_PLAYER_ENTITY_ID || '').trim();
+const ZAN_VIDEO_PLAYER_ENTITY_ID = String(process.env.ZAN_VIDEO_PLAYER_ENTITY_ID || '').trim();
+const YOUTUBE_API_KEY = String(process.env.YOUTUBE_API_KEY || '').trim();
 
 function localDateParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('cs-CZ', {
@@ -1324,6 +1327,18 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'play_video',
+      description: 'Pustí video z YouTube na televizi přes Google Cast. Použij na povely typu "pusť na youtube traktory v blátě", "pusť dětem pohádku na telku". Sám najde video podle názvu a pošle ho na obrazovku; hudbu bez obrazu řeš přes play_music.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Co pustit — název videa, např. traktory v blátě. Může to být i odkaz na YouTube.' },
+          player_entity_id: { type: 'string', description: 'Volitelná cílová obrazovka media_player.*. Když chybí, použije se ZAN_VIDEO_PLAYER_ENTITY_ID nebo jediná nalezená cast televize.' },
+        },
+        required: ['query'],
+      },
+    },
+    {
       name: 'remember',
       description: 'Uloží informaci do paměti.',
       input_schema: {
@@ -2199,6 +2214,18 @@ async function executeTool(name, input, chatId) {
       case 'play_music': {
         const result = await playMusic({ input, haGet, haPost, defaultPlayer: ZAN_MUSIC_PLAYER_ENTITY_ID });
         logAction(chatId, user.name, 'play_music', `${input.query || ''}->${result.player_entity_id || '?'}`, result.success ? 'ok' : `fail:${result.reason || result.error || '?'}`);
+        return result;
+      }
+
+      case 'play_video': {
+        const result = await playVideo({
+          input,
+          haGet,
+          haPost,
+          defaultPlayer: ZAN_VIDEO_PLAYER_ENTITY_ID,
+          apiKey: YOUTUBE_API_KEY,
+        });
+        logAction(chatId, user.name, 'play_video', `${input.query || ''}->${result.player_entity_id || '?'}`, result.success ? 'ok' : `fail:${result.reason || result.error || '?'}`);
         return result;
       }
 
@@ -3501,6 +3528,7 @@ RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé pozn
 PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
 OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
 HUDBA DOMA: když uživatel řekne „pusť Coldplay", „pusť Linkin Park" nebo podobný hudební povel, použij play_music přes Music Assistant. Nezkoušej otevřít music_assistant přes call_service a neodpovídej holým „nemám přehrávač" bez ověření nástrojem. Když play_music vrátí player_missing/player_unavailable, řekni krátce proč a dej další krok (nastavit nebo zapnout přehrávač); pokud je to capability gap, zapiš ho do repair_inbox, jakmile máš k dispozici admin profil.
+VIDEO NA TELEVIZI: když uživatel chce něco pustit na YouTube nebo na televizi („pusť na youtube traktory v blátě", „pusť dětem pohádku na telku"), použij play_video — ten video sám najde a pošle na Chromecast. Hudba bez obrazu zůstává na play_music. Netvrď, že video hraje, dokud to nástroj nepotvrdí; když vrátí nepotvrzený stav, řekni, ať se zkontroluje zapnutá televize a správný vstup. Účet a předplatné YouTube drží televize, ne ty — nikdy nechtěj po nikom heslo, cookie ani přihlašovací kód ke Google účtu.
 LIMITY A MEZERY SCHOPNOSTÍ: nikdy nekonči holým "neumím", "nemůžu", "nesmím" nebo "nemám přístup". Nejdřív zkus vlastní dostupné nástroje, playbooky a jinou bezpečnou cestu. Když to opravdu nejde, řekni poctivě proč, přidej konkrétní další krok pro člověka nebo firmu a zapiš anonymní mezeru do repair inboxu; raw věty rodiny ani citace do repair záznamu neukládej. Poctivost zůstává: limit přiznej, jen k němu vždy dej cestu dál.
 
 ÚKLID DASHBOARDU („udělej pořádek", „bordel"): list_dashboards → validate_dashboard → navrhni CO smažeš a přidáš → ČEKEJ na souhlas → write_dashboard → validate_dashboard znovu → teprve pak „hotovo". Nikdy nemaž bez souhlasu.

@@ -5,7 +5,7 @@ const { PROFILES, VOICE_CONTROL_TOOLS, resolveProfile, filterToolsByProfile } = 
 // Syntetické pole nástrojů (jména stačí — filtr pracuje nad .name).
 const fullTools = [
   'get_states', 'get_state', 'get_areas', 'turn_on', 'turn_off', 'toggle',
-  'call_service', 'schedule_action', 'announce_home', 'play_music',
+  'call_service', 'schedule_action', 'announce_home', 'play_music', 'play_video',
   'read_cookbook',
   'garden_map', 'remember', 'recall', 'house_map', 'rodina_update',
   // admin-only:
