@@ -214,6 +214,15 @@ assert.strictEqual(parseSearchHtml('nic tady není'), null, 'rozbité HTML nevra
   assert.deepStrictEqual(volCalls[0], ['services/media_player/volume_set', { entity_id: 'media_player.tv_obyvak_cast', volume_level: 0.5 }], 'zesílení počítá z aktuální hlasitosti');
   assert.strictEqual(volResult.volume_percent, 50, 'výsledek hlásí ověřenou hlasitost');
 
+  // ── vynucení nástroje u jednoznačného povelu ─────────────────────────
+  const { requiresVideoTool } = require('../play-video');
+  for (const order of ['pusť na youtube traktory v blátě', 'pusť dětem pohádku na televizi', 'pusť video s traktory', 'hoď to na tv']) {
+    assert.strictEqual(requiresVideoTool(order), true, `povel "${order}" musí vynutit play_video`);
+  }
+  for (const other of ['pusť Coldplay', 'co hraje na televizi?', 'zapni televizi', 'jaké video běží na youtube?']) {
+    assert.strictEqual(requiresVideoTool(other), false, `"${other}" nesmí vynutit play_video`);
+  }
+
   // profil hlasu
   assert(VOICE_CONTROL_TOOLS.includes('play_video'), 'play_video je dostupný hlasem u satelitu');
 

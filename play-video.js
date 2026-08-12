@@ -351,7 +351,20 @@ async function controlVideo({ input = {}, haGet, haPost, defaultPlayer, sleepImp
   };
 }
 
+// Jednoznačný povel "pusť tohle na televizi / na youtube / video" — rozkaz
+// (ne dotaz) + cíl obrazovka. Používá bot.js k vynucení nástroje v prvním
+// kole agentické smyčky, aby model nemohl odpovědět "hotovo" bez akce.
+const VIDEO_ORDER = /(?<![\p{L}])(pusť|pust|spusť|spust|přehraj|prehraj|hoď|hod|dej)\p{L}*/iu;
+const VIDEO_TARGET = /(youtube|youtub|na\s+telev|na\s+telc|na\s+telk|na\s+tv\b|video|videj?ko)/i;
+
+function requiresVideoTool(text) {
+  const s = String(text || '');
+  if (/\?\s*$/.test(s.trim())) return false; // otázka není rozkaz
+  return VIDEO_ORDER.test(s) && VIDEO_TARGET.test(s);
+}
+
 module.exports = {
+  requiresVideoTool,
   isYouTubeApp,
   buildControlCall,
   controlVideo,

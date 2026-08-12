@@ -52,7 +52,7 @@ const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
-const { playVideo, controlVideo } = require('./play-video');
+const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
@@ -3626,6 +3626,11 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   // a jestli doběhly úspěšně — vstup pro action-claim-guard (fabrikace akce).
   const actionCalls = [];
 
+  // Deterministické rozpoznání povelu "pusť mi tohle na televizi/youtube" →
+  // v prvním kole se nástroj vynutí (viz tool_choice níže). Bez fotky a jen
+  // pro jasný rozkaz, ne pro dotaz typu "co hraje na televizi?".
+  const forcedTool = !imageBase64 && requiresVideoTool(userMessage) ? 'play_video' : null;
+
   // Agentic loop — s limitem iterací (ochrana proti nekonečnému točení)
   for (let iter = 0; iter < MAX_AGENT_ITERATIONS; iter++) {
     const reqOptions = claudeRequestOptionsForModel(model);
@@ -3641,6 +3646,14 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
         { type: 'text', text: dynamicContext + `\nBěžíš na modelu ${model} (${model === MODEL_FAST ? 'FAST — běžný provoz' : model === MODEL_SMART ? 'SMART — YAML a tvorba' : 'SERVIS — údržba'}) — kdyby se někdo ptal, proč něco trvá déle nebo stojí víc.` + (opts.voice ? '\n\nHLASOVÝ REŽIM: odpovídáš mluvenou řečí přes reproduktor. Buď stručný — nejvýš 2 krátké věty. Piš jen čistý mluvený text: žádné markdown značky, tučné písmo, nadpisy, odrážky, tabulky, emoji ani seznamy. Když je toho víc, řekni nejdůležitější věc a nabídni pokračování.' : '') },
       ],
       ...(tools.length ? { tools } : {}),
+      // Vynucení nástroje u jednoznačného povelu "video na televizi" (2026-08-12):
+      // Haiku na opakovaný povel klidně jen zopakuje "Hotovo" z historie, aniž by
+      // nástroj zavolal (guard to pak přepíše na přiznání, ale video pořád nehraje).
+      // Mantinel patří do kódu, ne do promptu — první iterace tedy MUSÍ sáhnout
+      // po play_video. Dál už smyčka rozhoduje sama (jinak by nešlo odpovědět).
+      ...(iter === 0 && forcedTool && tools.some(t => t.name === forcedTool)
+        ? { tool_choice: { type: 'tool', name: forcedTool } }
+        : {}),
       messages,
     });
 
