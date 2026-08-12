@@ -59,8 +59,8 @@ function buildRepairInput(userMessage, finalText, options = {}) {
 
 function appendNextStep(finalText, capability) {
   const suffix = capability === 'unknown_capability'
-    ? 'Zapsal jsem to jako mezeru pro firmu; další krok je, že firma rozhodne, jestli doplnit schopnost, data nebo test.'
-    : 'Zapsal jsem to jako mezeru pro firmu; další krok je doplnit konkrétní schopnost nebo data a ověřit to testem.';
+    ? 'Poznamenal jsem si to, aby se to dalo doplnit.'
+    : 'Poznamenal jsem si to a zatím ti řeknu jen to, co vím jistě.';
   const trimmed = String(finalText || '').trim();
   if (!trimmed) return suffix;
   return /[.!?…]$/.test(trimmed) ? `${trimmed} ${suffix}` : `${trimmed}. ${suffix}`;
