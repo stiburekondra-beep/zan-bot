@@ -1,3 +1,7 @@
+'use strict';
+
+const { buildPairingNotification } = require('./pairing-followup');
+
 const CATEGORY_HINTS = {
   camera: {
     domains: ['camera'],
@@ -446,6 +450,11 @@ function buildOnboardDeviceRequest(input = {}) {
           : climateOnboarding
             ? climateOnboarding.after_pairing
             : undefined,
+      proactive_notification: buildPairingNotification({
+        phase: 'handler_selection',
+        category,
+        instruction: 'Oznam uživateli doporučené integrace a konkrétně si vyžádej potvrzení výrobce/modelu; neukončuj flow pasivním "napiš mi".',
+      }),
       message: plugOnboarding && plugOnboarding.recommended_handlers[0].handler
         ? 'Vyber konkrétní HA integraci podle doporučení a potvrzení uživatele. Žán nesmí dokončit párování ani automatizaci naslepo.'
         : tvOnboarding && tvOnboarding.recommended_handlers[0].handler
@@ -470,6 +479,12 @@ function buildOnboardDeviceRequest(input = {}) {
         : climateOnboarding
           ? climateOnboarding.after_pairing
           : undefined,
+    proactive_notification: buildPairingNotification({
+      phase: 'config_flow',
+      category,
+      handler,
+      instruction: 'Po každém kroku flow oznam výsledek aktivně a řekni, čím ho ověříš; hotovo až po create_entry nebo nové ověřené entitě.',
+    }),
   };
 }
 
