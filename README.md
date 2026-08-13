@@ -25,6 +25,7 @@ AI správce domu pro Home Assistant ovládaný přes Telegram.
 | OPENAI_API_KEY | Klíč z platform.openai.com |
 | PLANTID_API_KEY | Klíč z plant.id (volitelné) |
 | ZAN_VOICE_TOKEN | Sdílený secret hlasového mostu — musí sedět s tokenem v HA integraci `zan_conversation` (volitelné; bez něj je hlas vypnutý) |
+| ZAN_APP_TOKEN | Secret zákaznické onboarding stránky `/onboarding`; když je prázdný, použije se `ZAN_VOICE_TOKEN` (volitelné; bez tokenu je stránka vypnutá) |
 | ZAN_VOICE_HTTP_HOST | Bind adresa voice kanálu (default `0.0.0.0` kvůli dosažitelnosti z HA Core; volitelné) |
 | ZAN_VOICE_CHAT_ID | Telegram Chat ID, na které hlas mapuje (default = admin/Ondra; volitelné) |
 
@@ -38,6 +39,14 @@ add-onu i v HA integraci `zan_conversation`. Add-on jede `host_network:true`,
 takže se kanál bindne na `0.0.0.0` (aby ho HA Core dosáhl na
 `172.30.32.1:8099`); ochranu drží bearer token, ne izolace sítě, proto kanál
 **nikdy neprovozuj bez tokenu**.
+
+### Zákaznická onboarding stránka
+
+Add-on umí na stejném HTTP portu zobrazit `/onboarding?t=<token>`: dlaždice
+služeb, které si zákazník připojí sám. Stránka je prototyp bez reálných OAuth
+volání: nikde nemá pole na heslo, mock návrat jen uloží stav dlaždice do
+`/config/zan_data/service_onboarding.json`. Slouží jako základ Žánovy zákaznické
+apky v Home Assistantu, ne jako součást Baklažán cockpitu.
 
 Pro cizí dům nepřenášej `/config/zan_data/` z jiné instalace. Prázdná
 instalace si vytvoří vlastní `rodina.md` a `home_memory.json` podle hodnot

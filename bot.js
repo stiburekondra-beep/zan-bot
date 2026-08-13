@@ -47,6 +47,7 @@ const { guardActionClaim } = require('./action-claim-guard');
 const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
+const { buildDeviceLayoutSnapshot, formatDeviceLayout } = require('./device-layout');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
@@ -54,6 +55,7 @@ const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
+const { handleOnboardingRequest } = require('./service-onboarding');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -160,6 +162,7 @@ const HARNESS_OUT_DIR   = path.join(HARNESS_DIR, 'out');
 const REMINDERS_FILE    = path.join(DATA_DIR, 'zan_reminders.json');
 const SCHEDULED_ACTIONS_FILE = path.join(DATA_DIR, 'zan_scheduled_actions.json');
 const REPAIRS_FILE      = path.join(DATA_DIR, 'zan_repairs.json');
+const SERVICE_ONBOARDING_FILE = path.join(DATA_DIR, 'service_onboarding.json');
 const TECHNOLOGIES_FILE  = path.join(DATA_DIR, 'technologies.json');
 const TECHNOLOGY_DOCS_DIR = path.join(DATA_DIR, 'docs');
 const HOUSE_MAP_FILE    = path.join(DATA_DIR, 'house_map.json');
@@ -1315,7 +1318,7 @@ function buildTools(chatId, profil) {
     },
     {
       name: 'play_music',
-      description: 'Pustí hudbu přes Home Assistant Music Assistant. Použij na povely typu "pusť Coldplay" nebo "pusť Linkin Park". Neotevírá obecný call_service; volá jen music_assistant.play_media na ověřený media_player. Když není známý nebo dostupný přehrávač, vrať konkrétní další krok, ne holé "neumím".',
+      description: 'Pustí nebo přepne hudbu přes Home Assistant Music Assistant. Použij na povely typu "pusť Coldplay", "pusť Linkin Park" nebo "pusť dechovku" i když už na přehrávači něco hraje; nová žádost o jiný obsah znamená zavolat play_music znovu, ne odpovědět "už hraju". Neotevírá obecný call_service; volá jen music_assistant.play_media na ověřený media_player a nahrazuje aktuální frontu. Když není známý nebo dostupný přehrávač, vrať konkrétní další krok, ne holé "neumím".',
       input_schema: {
         type: 'object',
         properties: {
@@ -1396,6 +1399,18 @@ function buildTools(chatId, profil) {
           notes: { type: 'string', description: 'Krátká poznámka' },
         },
         required: ['action'],
+      },
+    },
+    {
+      name: 'device_layout',
+      description: 'Read-only diagnostika layoutu zařízení: zkombinuje HA device/entity/area registry, aktuální stavy a house_map. Použij na dotazy "co mi vypadlo", "proč nejede garáž", "kde mám slabý Zigbee". Vrací místnost/oblast, transport (zigbee/wifi/matter/unknown), jak dlouho je zařízení unavailable a doporučení. Nikdy sám nespouští re-pair, restart bridge, párování ani ovládání zařízení.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          scope: { type: 'string', enum: ['summary', 'unavailable', 'all'], description: 'summary/unavailable = jen problémy a doporučení; all = i dostupná zařízení.' },
+          min_age_minutes: { type: 'number', description: 'Prahový věk výpadku. Výchozí 60 min, minimum 5 min.' },
+        },
+        required: [],
       },
     },
     {
@@ -2282,6 +2297,31 @@ async function executeTool(name, input, chatId) {
           result: applyHouseMapAction(HOUSE_MAP_FILE, input),
           data_file: HOUSE_MAP_FILE,
           safety: 'Zápis do house_map ukládej jen z potvrzeného půdorysu nebo výslovné věty uživatele; area_id ověř přes HA.',
+        };
+      }
+
+      case 'device_layout': {
+        const minAgeMinutes = Math.max(5, Number(input.min_age_minutes || 60));
+        const [states, entityReg, deviceReg, areaReg] = await Promise.all([
+          haGet('states'),
+          haRegistry('entity_registry').catch(() => []),
+          haRegistry('device_registry').catch(() => []),
+          haRegistry('area_registry').catch(() => []),
+        ]);
+        const houseMap = readHouseMap(HOUSE_MAP_FILE);
+        const snapshot = buildDeviceLayoutSnapshot({
+          states,
+          entityRegistry: entityReg,
+          deviceRegistry: deviceReg,
+          areaRegistry: areaReg,
+          houseMap,
+          minAgeMs: minAgeMinutes * 60 * 1000,
+        });
+        return {
+          action: 'device_layout',
+          text: formatDeviceLayout(snapshot, { scope: input.scope || 'unavailable' }),
+          snapshot,
+          safety: snapshot.safety,
         };
       }
 
@@ -3510,6 +3550,7 @@ NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_ne
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
+LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
@@ -3529,7 +3570,7 @@ RODINA.MD (profil domácnosti — dostáváš ho celý v kontextu): trvalé pozn
 
 PŘIPOMÍNKY: když uživatel chce "připomeň mi..." nebo "ozvi se v...", použij nástroj reminder(add). Nepotvrzuj připomínku jen textem bez nástroje. Čas musí být konkrétní ISO s časovou zónou; relativní časy dopočítej z AKTUÁLNÍHO KONTEXTU, a když chybí den nebo hodina, krátce se doptej. Seznam/zrušení řeš přes reminder(list/cancel).
 OZNÁMENÍ DO DOMU: když uživatel výslovně chce něco říct nahlas doma, použij announce_home. Nejdřív přes get_states ověř tts.* a media_player.* entity; entity_id netipuj. Oznámení drž krátké a rodinně srozumitelné.
-HUDBA DOMA: když uživatel řekne „pusť Coldplay", „pusť Linkin Park" nebo podobný hudební povel, použij play_music přes Music Assistant. Nezkoušej otevřít music_assistant přes call_service a neodpovídej holým „nemám přehrávač" bez ověření nástrojem. Když play_music vrátí player_missing/player_unavailable, řekni krátce proč a dej další krok (nastavit nebo zapnout přehrávač); pokud je to capability gap, zapiš ho do repair_inbox, jakmile máš k dispozici admin profil.
+HUDBA DOMA: když uživatel řekne „pusť Coldplay", „pusť Linkin Park", „pusť dechovku" nebo podobný hudební povel, použij play_music přes Music Assistant. Když už něco hraje a uživatel chce jiného interpreta, žánr, rádio, playlist nebo skladbu, znamená to PŘEPNOUT hudbu přes play_music; nikdy neodpovídej „už hraju" jen proto, že přehrávač už je ve stavu playing. Nezkoušej otevřít music_assistant přes call_service a neodpovídej holým „nemám přehrávač" bez ověření nástrojem. Když play_music vrátí player_missing/player_unavailable, řekni krátce proč a dej další krok (nastavit nebo zapnout přehrávač); pokud je to capability gap, zapiš ho do repair_inbox, jakmile máš k dispozici admin profil.
 OPAKOVANÝ POVEL: když si uživatel řekne o přehrání znovu, VŽDY zavolej nástroj znovu — i kdyby z historie vypadalo, že to už hraje. Nikdy neodpovídej „hotovo" jen proto, že jsi totéž říkal před chvílí; hraje jen to, co potvrdil nástroj v TOMHLE kole.
 VIDEO NA TELEVIZI: slova „na televizi", „na telce", „na youtube(u)" nebo „video" ZNAMENAJÍ video z YouTube na Chromecast — vždy play_video, nikdy play_music, i kdyby šlo o písničku nebo pohádku. play_music je jen pro hudbu bez obrazu (reproduktor). Cílovou obrazovku play_video nevyplňuj, vybere se sama z nastavení; entity Music Assistantu (např. living_room_tv) NEJSOU obrazovka pro video. Pauzu, stop a hlasitost televize řeš stejným nástrojem přes action (volume_up/volume_down/volume + volume_percent). Netvrď, že video hraje, dokud to nástroj nepotvrdí — potvrzením je běžící YouTube na obrazovce, ne pouhé „playing"; když nástroj vrátí wrong_app nebo nepotvrzený stav, řekni to poctivě i s dalším krokem. Účet a předplatné YouTube drží televize, ne ty — nikdy nechtěj po nikom heslo, cookie ani přihlašovací kód ke Google účtu.
 LIMITY A MEZERY SCHOPNOSTÍ: nikdy nekonči holým "neumím", "nemůžu", "nesmím" nebo "nemám přístup". Nejdřív zkus vlastní dostupné nástroje, playbooky a jinou bezpečnou cestu. Když to opravdu nejde, řekni poctivě proč, přidej konkrétní další krok pro člověka nebo firmu a zapiš anonymní mezeru do repair inboxu; raw věty rodiny ani citace do repair záznamu neukládej. Poctivost zůstává: limit přiznej, jen k němu vždy dej cestu dál.
@@ -4208,19 +4249,23 @@ startHarnessInbox();
 function startVoiceChannel() {
   if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál
   const token = process.env.ZAN_VOICE_TOKEN;
-  if (!token) return; // fail-closed: bez tokenu kanál neexistuje
+  const appToken = process.env.ZAN_APP_TOKEN || token;
+  if (!token && !appToken) return; // fail-closed: bez tokenu kanál ani appka neexistují
   const port = parseInt(process.env.ZAN_VOICE_HTTP_PORT || '8099', 10);
   const host = process.env.ZAN_VOICE_HTTP_HOST || '127.0.0.1';
   const defaultChatId = parseInt(process.env.ZAN_VOICE_CHAT_ID || '', 10) || CHAT_ONDRA;
-  const handle = createVoiceHandler({
-    token,
-    allowedChats: ALLOWED_CHATS,
-    defaultChatId,
-    dispatch: (chatId, text) =>
-      enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
-  });
+  const handle = token
+    ? createVoiceHandler({
+      token,
+      allowedChats: ALLOWED_CHATS,
+      defaultChatId,
+      dispatch: (chatId, text) =>
+        enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
+    })
+    : null;
   const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
+    if (!handle || req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
     req.on('end', async () => {
@@ -4237,7 +4282,7 @@ function startVoiceChannel() {
     });
   });
   server.on('error', (e) => console.error('Voice kanál error:', e.message));
-  server.listen(port, host, () => console.log(`🎙️ Voice kanál: http://${host}:${port}/voice (profil ovladani, bearer token)`));
+  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /onboarding (bearer token)`));
 }
 startVoiceChannel();
 

@@ -119,6 +119,12 @@
       "skills_required": true
     },
     {
+      "name": "device_layout",
+      "scope": "ha-read",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
       "name": "get_new_entities",
       "scope": "ha-read",
       "admin_only": false,
