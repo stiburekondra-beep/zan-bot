@@ -37,7 +37,8 @@
     "test:house-map-guard": "node scripts/check-house-map-guard.js",
     "test:guest-privacy": "node scripts/check-guest-privacy.js",
     "test:play-video": "node scripts/check-play-video.js",
-    "test:dockerfile-modules": "node scripts/check-dockerfile-modules.js"
+    "test:dockerfile-modules": "node scripts/check-dockerfile-modules.js",
+    "test:model-request-options": "node scripts/check-model-request-options.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
