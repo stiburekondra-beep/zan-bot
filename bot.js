@@ -1396,7 +1396,7 @@ function buildTools(chatId, profil) {
       input_schema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['get', 'set_room', 'set_adjacency', 'add_item', 'remove_item'] },
+          action: { type: 'string', enum: ['get', 'set_room', 'set_adjacency', 'add_item', 'remove_item', 'prepare_seed', 'apply_seed'] },
           room_id: { type: 'string', description: 'ID místnosti v house_map nebo HA area_id, např. kuchyn' },
           name: { type: 'string', description: 'Název místnosti nebo věci' },
           area_id: { type: 'string', description: 'HA area_id pro set_room; ověř přes get_areas/ha_setup_list, netipuj' },
@@ -1407,6 +1407,10 @@ function buildTools(chatId, profil) {
           type: { type: 'string', enum: ['dveře', 'průchod', 'schody', 'sousedí'] },
           item_id: { type: 'string', description: 'ID věci pro remove_item' },
           notes: { type: 'string', description: 'Krátká poznámka' },
+          seed: { type: 'object', description: 'Polycam/import seed pro prepare_seed/apply_seed. Názvy ze seedu nejsou autorita.' },
+          customer_rooms: { type: 'array', description: 'Autoritativní místnosti zákazníka/HA area registry: area_id, name, aliases, floor_id.', items: { type: 'object' } },
+          threshold: { type: 'number', description: 'Volitelný práh jistoty párování; výchozí 0.72.' },
+          confirmed: { type: 'boolean', description: 'apply_seed smí zapsat až po lidské kontrole návrhu a jen bez nevyřešených místností.' },
         },
         required: ['action'],
       },
@@ -3559,7 +3563,7 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
-MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
+MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
 LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
