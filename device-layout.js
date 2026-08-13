@@ -1,6 +1,6 @@
 'use strict';
 
-const ZIGBEE_RE = /zigbee|zha|z2m|zigbee2mqtt|aqara|lumi|ikea|tradfri|sonoff.*zb|zbbridge|\bzb[-_\s]?\w*/i;
+const ZIGBEE_RE = /zigbee|zha|z2m|zigbee2mqtt|aqara|lumi|ikea|tradfri|sonoff.*zb|zbbridge|conbee|skyconnect|silicon labs|silabs|ezsp|\bzb[-_\s]?\w*/i;
 const WIFI_RE = /wifi|wi-fi|wlan|tapo|shelly|esphome|tuya|ewelink|sonoff|yeelight|wiz/i;
 const MATTER_RE = /matter|thread/i;
 const BRIDGE_RE = /bridge|coordinator|hub|gateway|zbbridge|zigbee2mqtt|zha/i;
@@ -60,7 +60,7 @@ function makeAreaMaps(areaRegistry = [], houseMap = {}) {
   return { areaNameById, roomByArea };
 }
 
-function summarizeDevice({ device, entities, statesById, areaNameById, roomByArea, now, minAgeMs }) {
+function summarizeDevice({ device, entities, statesById, areaNameById, roomByArea, now, minAgeMs, bridgeDeviceIds }) {
   const entityStates = entities
     .map(entity => {
       const state = statesById.get(entity.entity_id);
@@ -84,7 +84,7 @@ function summarizeDevice({ device, entities, statesById, areaNameById, roomByAre
   const room = areaId ? roomByArea.get(areaId) : null;
   const transport = inferTransport(device, entities);
   const name = device.name_by_user || device.name || entities[0]?.name || entities[0]?.original_name || device.id || 'Neznámé zařízení';
-  const bridgeLike = BRIDGE_RE.test(words(name, device.manufacturer, device.model));
+  const bridgeLike = bridgeDeviceIds?.has(device.id) || BRIDGE_RE.test(words(name, device.manufacturer, device.model));
 
   return {
     device_id: device.id || null,
@@ -92,6 +92,7 @@ function summarizeDevice({ device, entities, statesById, areaNameById, roomByAre
     manufacturer: device.manufacturer || '',
     model: device.model || '',
     integration: integrationNames(device).join(', '),
+    via_device_id: device.via_device_id || '',
     area_id: areaId,
     area_name: areaId ? (areaNameById.get(areaId) || areaId) : 'Bez místnosti',
     room_id: room?.id || '',
@@ -208,6 +209,12 @@ function buildDeviceLayoutSnapshot(input = {}) {
       if (!entityByDevice.has(e.device_id)) entityByDevice.set(e.device_id, []);
       entityByDevice.get(e.device_id).push(e);
     }
+    const bridgeDeviceIds = new Set();
+    for (const device of deviceRegistry) {
+      if (!device.via_device_id) continue;
+      const entities = entityByDevice.get(device.id) || [];
+      if (inferTransport(device, entities) === 'zigbee') bridgeDeviceIds.add(device.via_device_id);
+    }
     devices = deviceRegistry
       .map(device => summarizeDevice({
         device,
@@ -217,6 +224,7 @@ function buildDeviceLayoutSnapshot(input = {}) {
         roomByArea,
         now,
         minAgeMs,
+        bridgeDeviceIds,
       }))
       .filter(d => d.entity_count > 0 || d.area_id || d.name !== 'Neznámé zařízení');
   } else {

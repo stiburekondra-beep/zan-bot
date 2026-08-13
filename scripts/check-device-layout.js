@@ -97,5 +97,60 @@ assert.ok(formatDeviceLayout(snapshot).includes('Layout zařízení'), 'formatte
 assert.strictEqual(inferTransport({ manufacturer: 'Aqara', model: 'Lumi sensor' }, []), 'zigbee');
 assert.strictEqual(inferTransport({ manufacturer: 'Shelly', model: 'Plug S' }, []), 'wifi');
 assert.strictEqual(inferTransport({ manufacturer: 'Eve', model: 'Matter plug' }, []), 'matter');
+assert.strictEqual(inferTransport({ manufacturer: 'dresden elektronik', model: 'ConBee II' }, []), 'zigbee');
+assert.strictEqual(inferTransport({ manufacturer: 'Nabu Casa', model: 'HA SkyConnect' }, []), 'zigbee');
+
+function assertCoordinatorViaDevice(name, manufacturer, model) {
+  const coordinator = {
+    id: 'dev_usb_coord',
+    name,
+    manufacturer,
+    model,
+    area_id: 'garaz',
+    identifiers: [['zha', 'coord']],
+  };
+  const door = {
+    ...garageDoor,
+    via_device_id: 'dev_usb_coord',
+  };
+  const valve = {
+    ...waterValve,
+    via_device_id: 'dev_usb_coord',
+  };
+  const usbEntityRegistry = [
+    { entity_id: 'sensor.usb_coord_state', device_id: 'dev_usb_coord', name, area_id: 'garaz' },
+    { entity_id: 'binary_sensor.usb_garaz_dvere', device_id: 'dev_door', name: 'Dveře garáže', area_id: 'garaz' },
+    { entity_id: 'switch.usb_ventil_garaz', device_id: 'dev_valve', name: 'Ventil voda garáž', area_id: 'garaz' },
+  ];
+  const usbStates = [
+    { entity_id: 'sensor.usb_coord_state', state: 'unavailable', last_changed: old, attributes: { friendly_name: name } },
+    { entity_id: 'binary_sensor.usb_garaz_dvere', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Dveře garáže' } },
+    { entity_id: 'switch.usb_ventil_garaz', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Ventil voda garáž' } },
+  ];
+  const usbSnapshot = buildDeviceLayoutSnapshot({
+    states: usbStates,
+    entityRegistry: usbEntityRegistry,
+    deviceRegistry: [coordinator, door, valve],
+    areaRegistry,
+    houseMap,
+    now,
+    minAgeMs: 60 * 60 * 1000,
+  });
+
+  assert.strictEqual(usbSnapshot.counts.bridge_down, 1, `${name} must be detected as bridge via via_device_id`);
+  assert.strictEqual(
+    usbSnapshot.diagnosis.recommendations[0].type,
+    'bridge_down_first',
+    `${name} outage must check coordinator before mesh`,
+  );
+  assert.ok(
+    !usbSnapshot.diagnosis.recommendations.some(r => r.type === 'zigbee_mesh_candidate'),
+    `${name} outage must not suggest buying router before coordinator is checked`,
+  );
+}
+
+assertCoordinatorViaDevice('Sonoff Zigbee 3.0 USB Dongle Plus', 'Sonoff', 'ZBDongle-P');
+assertCoordinatorViaDevice('ConBee II', 'dresden elektronik', 'ConBee II');
+assertCoordinatorViaDevice('HA SkyConnect', 'Nabu Casa', 'SkyConnect');
 
 console.log('device layout contract OK');
