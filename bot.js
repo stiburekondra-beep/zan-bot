@@ -269,8 +269,10 @@ function updateRodinaSection(section, content) {
   return saveRodina(c);
 }
 
-// Model: Haiku 4.5 pro běžný provoz (cca 3× levnější než Sonnet).
-// Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
+// Model: Haiku 4.5 jako historický základ (cca 3× levnější než Sonnet).
+// Od 5.12.7 se FAST větev nastavuje z HA UI (option ZAN_MODEL_FAST) — tenhle
+// default drží už jen pomocná volání níže (zahradní analýzy) a zpětnou
+// kompatibilitu. Přepnutí bez zásahu do kódu: env ZAN_MODEL=claude-sonnet-5
 const MODEL             = process.env.ZAN_MODEL || 'claude-haiku-4-5';
 
 // ── MODEL ROUTING (audit 2026-07-05, sekce 5 — Ondrův návrh) ──
@@ -280,6 +282,8 @@ const MODEL             = process.env.ZAN_MODEL || 'claude-haiku-4-5';
 //   SERVIS = údržbář a sebereflexe: běží ~12×/měsíc, rozhoduje o zásazích
 //            do živého domu a evoluci ústavy → nejvyšší model se vyplatí
 // MODEL (ZAN_MODEL) zůstává jako výchozí pro FAST kvůli zpětné kompatibilitě.
+// Prázdná hodnota z HA options ("") je v JS falsy → propadne na MODEL, takže
+// vymazání pole v add-on UI vrátí původní chování bez deploye.
 const MODEL_FAST   = process.env.ZAN_MODEL_FAST   || MODEL;
 const MODEL_SMART  = process.env.ZAN_MODEL_SMART  || 'claude-sonnet-5';
 const MODEL_SERVIS = process.env.ZAN_MODEL_SERVIS || 'claude-opus-4-8';

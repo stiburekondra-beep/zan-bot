@@ -23,6 +23,13 @@ export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"'
 export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
 export ZAN_MUSIC_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_MUSIC_PLAYER_ENTITY_ID // "media_player.zan_media_player"' /data/options.json)
 
+# Model routing z HA UI (5.12.7). Prázdná hodnota = fallback na default v bot.js
+# (JS bere "" jako falsy), takže smazáním pole v UI se vrátí původní chování
+# bez deploye. FAST jede sonnet-5 od 13.8.2026 — viz commit message.
+export ZAN_MODEL_FAST=$(jq --raw-output '.ZAN_MODEL_FAST // ""' /data/options.json)
+export ZAN_MODEL_SMART=$(jq --raw-output '.ZAN_MODEL_SMART // ""' /data/options.json)
+export ZAN_MODEL_SERVIS=$(jq --raw-output '.ZAN_MODEL_SERVIS // ""' /data/options.json)
+
 # Video na TV přes Google Cast (nástroj play_video). Prázdný YOUTUBE_API_KEY
 # = hledání přes veřejnou stránku výsledků YouTube; s klíčem jde oficiální
 # Data API. Prázdné ZAN_VIDEO_PLAYER_ENTITY_ID = autodetekce cast obrazovky.
