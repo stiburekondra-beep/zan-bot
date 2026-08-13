@@ -321,9 +321,15 @@ function maxTokensForModel(model) {
   return SMART_MAX_TOKENS;
 }
 
+function modelSupportsTemperature(model) {
+  // Nové Sonnet/Opus modely vrací 400 na `temperature`; posílej ho jen
+  // modelům, u kterých to máme v Žánovi ověřené.
+  return /^claude-haiku-/i.test(String(model || ''));
+}
+
 function claudeRequestOptionsForModel(model) {
   const options = { max_tokens: maxTokensForModel(model) };
-  if (model === MODEL_FAST) options.temperature = 0.35;
+  if (modelSupportsTemperature(model)) options.temperature = 0.35;
   return options;
 }
 
@@ -5256,5 +5262,7 @@ if (TEST_EXPORTS) {
     renderPametMessage,
     resolveOnboardingTarget,
     renderOnboardingIntro,
+    modelSupportsTemperature,
+    claudeRequestOptionsForModel,
   };
 }
