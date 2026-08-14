@@ -8,6 +8,9 @@ const UNDO_FAIL = [{ name: 'undo_last_change', ok: false }];
 const WRITE_OK = [{ name: 'write_package', ok: true }];
 const DELETE_OK = [{ name: 'delete_package', ok: true }];
 const RESTART_OK = [{ name: 'restart_ha', ok: true }];
+const TURN_ON_OK = [{ name: 'turn_on', ok: true }];
+const TURN_ON_FAIL = [{ name: 'turn_on', ok: false }];
+const CALL_SERVICE_OK = [{ name: 'call_service', ok: true }];
 
 // ── 1) PŘESNÁ repro věta z bugu (msg #3): undo bez tool callu → FIRE ──────────
 const bug1 = 'Vrátil jsem poslední zápis — balíček je smazaný a HA ho už nezná.';
@@ -114,4 +117,42 @@ assert.strictEqual(
   '17c: tvrzení o zastavení bez nástroje = fabrikace',
 );
 
-console.log('check-action-claim-guard: OK (17 scénářů)');
+// ── 18) HLASOVÝ BUG 2026-08-14: „rozsvítil jsem" bez aktuace → FIRE ─────────
+const lightLie = 'Hotovo, světla v obýváku jsou rozsvícená.';
+const r18 = guardActionClaim(lightLie, 'rozsviť světla v obýváku', NONE);
+assert.strictEqual(r18.changed, true, '18a: tvrzení o rozsvícení bez toolu = fabrikace');
+assert.strictEqual(r18.fabricatedDevice, true, '18b: označeno jako fabrikace ovládání zařízení');
+assert(r18.text.includes('ovládání zařízení v domě'), '18c: přiznání pojmenuje ovládání zařízení');
+
+// ── 19) Neúspěšný aktuační tool + hotovo tvrzení → FIRE; úspěšný → SILENT ───
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem LED pásek.', 'zapni LED pásek', TURN_ON_FAIL).changed,
+  true,
+  '19a: neúspěšný turn_on nelegitimizuje „rozsvítil jsem"',
+);
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem LED pásek.', 'zapni LED pásek', TURN_ON_OK).changed,
+  false,
+  '19b: úspěšný turn_on legitimizuje tvrzení o světle',
+);
+assert.strictEqual(
+  guardActionClaim('Hotovo, zásuvka je zapnutá.', 'zapni zásuvku u kávovaru', CALL_SERVICE_OK).changed,
+  false,
+  '19c: úspěšný call_service legitimizuje jedno-entitovou aktuaci',
+);
+
+// ── 20) FALSE-POSITIVE OBRANA: dotaz na stav světel není povel ──────────────
+assert.strictEqual(
+  guardActionClaim('Světlo v obýváku svítí.', 'svítí v obýváku světlo?', NONE).changed,
+  false,
+  '20: odpověď na dotaz o stavu se nesmí přepsat na přiznání',
+);
+
+// ── 21) Poctivé přiznání selhání aktuace projde ─────────────────────────────
+assert.strictEqual(
+  guardActionClaim('Světlo se mi rozsvítit nepodařilo, je nedostupné.', 'rozsviť světlo', TURN_ON_FAIL).changed,
+  false,
+  '21: přiznání neúspěchu aktuace není tvrzení hotovo',
+);
+
+console.log('check-action-claim-guard: OK (21 scénářů)');
