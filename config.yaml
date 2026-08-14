@@ -39,7 +39,7 @@ options:
   ZAN_MUSIC_PLAYER_ENTITY_ID: "media_player.zan_media_player"
   # Model routing — přepínatelné z HA UI bez deploye (prázdné = default z bot.js).
   # FAST = běžný chat/hlas/ovládání, SMART = YAML a tvorba, SERVIS = údržba.
-  ZAN_MODEL_FAST: "claude-sonnet-5"
+  ZAN_MODEL_FAST: ""
   ZAN_MODEL_SMART: ""
   ZAN_MODEL_SERVIS: ""
 schema:
