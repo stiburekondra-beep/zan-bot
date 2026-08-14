@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const VALID_EDGE_TYPES = new Set(['dveře', 'průchod', 'schody', 'sousedí']);
+const DEFAULT_SEED_MATCH_THRESHOLD = 0.72;
 
 function emptyHouseMap() {
   return {
@@ -24,6 +25,224 @@ function slugify(value, fallback = 'item') {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 72) || fallback;
+}
+
+function normalizedText(value) {
+  return String(value || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function textTokens(value) {
+  const stop = new Set(['polycam', 'other', 'room', 'mistnost', 'patro', 'velka', 'mala']);
+  return normalizedText(value).split(/\s+/).filter(t => t.length >= 3 && !stop.has(t));
+}
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeCustomerRoom(room = {}) {
+  const areaId = String(room.area_id || room.id || '').trim();
+  const name = String(room.name || room.area_name || areaId).trim();
+  const aliases = Array.isArray(room.aliases) ? room.aliases.map(a => String(a || '').trim()).filter(Boolean) : [];
+  return {
+    id: slugify(room.id || areaId || name, 'room'),
+    name,
+    area_id: areaId || slugify(name, 'room'),
+    floor_id: room.floor_id ? String(room.floor_id) : '',
+    floor_name: room.floor_name ? String(room.floor_name) : '',
+    aliases,
+  };
+}
+
+function customerRoomLabels(room) {
+  return unique([room.id, room.area_id, room.name, ...(room.aliases || [])]);
+}
+
+function seedRoomLabels(room = {}) {
+  return unique([
+    room.id,
+    room.area_id,
+    room.name,
+    room.polycam_label,
+    ...(Array.isArray(room.aliases) ? room.aliases : []),
+    room.notes,
+  ].map(v => String(v || '')));
+}
+
+function tokenOverlapScore(seedLabels, customerLabels) {
+  const seedTokens = new Set(seedLabels.flatMap(textTokens));
+  const customerTokens = new Set(customerLabels.flatMap(textTokens));
+  if (!seedTokens.size || !customerTokens.size) return 0;
+  let overlap = 0;
+  for (const token of seedTokens) if (customerTokens.has(token)) overlap += 1;
+  return overlap / Math.max(seedTokens.size, customerTokens.size);
+}
+
+function scoreSeedRoomMatch(seedRoom, customerRoom) {
+  const seedLabels = seedRoomLabels(seedRoom);
+  const customerLabels = customerRoomLabels(customerRoom);
+  const seedIds = seedLabels.map(v => slugify(v, ''));
+  const customerIds = customerLabels.map(v => slugify(v, ''));
+
+  if (seedRoom.area_id && customerRoom.area_id && String(seedRoom.area_id) === String(customerRoom.area_id)) {
+    return { score: 1, reason: 'area_id exact' };
+  }
+  if (seedRoom.id && customerRoom.id && slugify(seedRoom.id, '') === slugify(customerRoom.id, '')) {
+    return { score: 0.98, reason: 'room id exact' };
+  }
+  if (seedIds.some(id => id && customerIds.includes(id))) {
+    return { score: 0.94, reason: 'name/alias exact' };
+  }
+
+  const overlap = tokenOverlapScore(seedLabels, customerLabels);
+  if (overlap > 0) return { score: Math.min(0.88, overlap), reason: 'name/alias token overlap' };
+  return { score: 0, reason: 'no match' };
+}
+
+function bestSeedRoomMatch(seedRoom, customerRooms) {
+  let best = null;
+  for (const candidate of customerRooms) {
+    const scored = scoreSeedRoomMatch(seedRoom, candidate);
+    if (!best || scored.score > best.score) best = { ...candidate, ...scored };
+  }
+  return best || { score: 0, reason: 'no customer rooms' };
+}
+
+function prepareHouseMapSeed(seed = {}, customerRooms = [], opts = {}) {
+  const threshold = Number.isFinite(Number(opts.threshold)) ? Number(opts.threshold) : DEFAULT_SEED_MATCH_THRESHOLD;
+  const sourceRooms = Array.isArray(seed.rooms) ? seed.rooms : [];
+  const customers = customerRooms.map(normalizeCustomerRoom).filter(r => r.area_id && r.name);
+  const floors = Array.isArray(seed.floors) ? seed.floors.map(f => ({ id: String(f.id || f.floor_id || ''), name: String(f.name || f.id || '') })).filter(f => f.id) : [];
+  const matchBySeedId = new Map();
+  const matchedAreaIds = new Set();
+  const unresolved = [];
+  const rooms = [];
+
+  for (const room of sourceRooms) {
+    const match = bestSeedRoomMatch(room, customers);
+    if (match.score >= threshold && !matchedAreaIds.has(match.area_id)) {
+      const roomId = slugify(match.area_id, 'room');
+      matchedAreaIds.add(match.area_id);
+      matchBySeedId.set(slugify(room.id || room.area_id || room.name, ''), roomId);
+      rooms.push({
+        id: roomId,
+        name: match.name,
+        area_id: match.area_id,
+        floor_id: match.floor_id || room.floor_id || '',
+        notes: unique([
+          `Zdroj: zákazníkův/HA název místnosti. Polycam byl použit jen jako fallback (${match.reason}, jistota ${match.score.toFixed(2)}).`,
+          room.notes ? `Polycam poznámka: ${room.notes}` : '',
+        ]).join(' '),
+      });
+    } else {
+      unresolved.push({
+        polycam_id: room.id || '',
+        polycam_name: room.name || '',
+        polycam_area_id: room.area_id || '',
+        best_customer_room: match.area_id ? { area_id: match.area_id, name: match.name, score: Number(match.score.toFixed(2)), reason: match.reason } : null,
+        reason: matchedAreaIds.has(match.area_id) ? 'customer room already used' : 'below confidence threshold',
+      });
+    }
+  }
+
+  const adjacency = [];
+  const droppedAdjacency = [];
+  for (const edge of Array.isArray(seed.adjacency) ? seed.adjacency : []) {
+    const normalized = normalizeEdge(edge);
+    if (!normalized) continue;
+    const from = matchBySeedId.get(normalized.from);
+    const to = matchBySeedId.get(normalized.to);
+    if (from && to && from !== to) {
+      const sorted = [from, to].sort();
+      const next = { from: sorted[0], to: sorted[1], type: normalized.type, notes: normalized.notes };
+      if (!adjacency.some(e => e.from === next.from && e.to === next.to)) adjacency.push(next);
+    } else {
+      droppedAdjacency.push({ ...normalized, reason: 'unmatched room' });
+    }
+  }
+
+  const items = [];
+  const droppedItems = [];
+  for (const item of Array.isArray(seed.items) ? seed.items : []) {
+    const normalized = normalizeItem(item);
+    const roomId = matchBySeedId.get(normalized.room_id);
+    if (roomId) items.push({ ...normalized, id: slugify(`${roomId}_${normalized.name}`, 'item'), room_id: roomId });
+    else droppedItems.push({ ...normalized, reason: 'unmatched room' });
+  }
+
+  return {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    note: 'Připraveno z Polycam seedu. Autoritou pro názvy a area_id jsou zákazníkovy/HA místnosti; Polycam názvy jsou jen fallback a poznámka.',
+    floors,
+    rooms,
+    adjacency,
+    items,
+    review: {
+      threshold,
+      customer_rooms: customers.length,
+      source_rooms: sourceRooms.length,
+      matched_rooms: rooms.length,
+      unresolved,
+      dropped_adjacency: droppedAdjacency,
+      dropped_items: droppedItems,
+      ready_to_apply: unresolved.length === 0 && rooms.length > 0,
+    },
+  };
+}
+
+function mergeNotes(a, b) {
+  return unique([a, b].map(v => String(v || '').trim())).join(' ');
+}
+
+function mergePreparedHouseMap(currentMap, prepared) {
+  const next = {
+    ...currentMap,
+    floors: Array.isArray(currentMap.floors) ? [...currentMap.floors] : [],
+    rooms: Array.isArray(currentMap.rooms) ? [...currentMap.rooms] : [],
+    adjacency: Array.isArray(currentMap.adjacency) ? [...currentMap.adjacency] : [],
+    items: Array.isArray(currentMap.items) ? [...currentMap.items] : [],
+  };
+
+  for (const floor of prepared.floors || []) {
+    if (!next.floors.some(f => f.id === floor.id)) next.floors.push(floor);
+  }
+
+  for (const room of prepared.rooms || []) {
+    const idx = next.rooms.findIndex(r => r.id === room.id || r.area_id === room.area_id);
+    if (idx >= 0) {
+      next.rooms[idx] = {
+        ...next.rooms[idx],
+        ...room,
+        notes: mergeNotes(next.rooms[idx].notes, room.notes),
+      };
+    } else {
+      next.rooms.push(room);
+    }
+  }
+
+  for (const edge of prepared.adjacency || []) {
+    if (!next.adjacency.some(e => e.from === edge.from && e.to === edge.to)) next.adjacency.push(edge);
+  }
+
+  for (const item of prepared.items || []) {
+    const idx = next.items.findIndex(i => i.id === item.id);
+    if (idx >= 0) {
+      next.items[idx] = {
+        ...next.items[idx],
+        ...item,
+        notes: mergeNotes(next.items[idx].notes, item.notes),
+      };
+    } else {
+      next.items.push(item);
+    }
+  }
+
+  return next;
 }
 
 function readMap(file) {
@@ -103,6 +322,18 @@ function roomExists(map, roomId) {
 function applyHouseMapAction(file, input = {}) {
   const action = String(input.action || 'get');
   const map = readMap(file);
+
+  if (action === 'prepare_seed' || action === 'apply_seed') {
+    const prepared = prepareHouseMapSeed(input.seed || {}, input.customer_rooms || [], { threshold: input.threshold });
+    if (action === 'prepare_seed') return { success: true, proposal: prepared };
+    if (!input.confirmed) {
+      return { error: 'apply_seed vyžaduje confirmed:true po lidské kontrole návrhu.', proposal: prepared };
+    }
+    if (!prepared.review.ready_to_apply) {
+      return { error: 'Seed nelze bezpečně zapsat: návrh má nevyřešené místnosti nebo žádný match.', proposal: prepared };
+    }
+    return { success: true, map: saveMap(file, mergePreparedHouseMap(map, prepared)), review: prepared.review };
+  }
 
   if (action === 'get') {
     const roomId = input.room_id ? slugify(input.room_id, '') : '';
@@ -194,5 +425,7 @@ function formatHouseMap(file, input = {}) {
 module.exports = {
   applyHouseMapAction,
   formatHouseMap,
+  mergePreparedHouseMap,
+  prepareHouseMapSeed,
   readMap,
 };

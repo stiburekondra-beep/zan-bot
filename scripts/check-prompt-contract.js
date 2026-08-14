@@ -48,6 +48,11 @@ assertRegex(/clauderequestoptionsformodel\s*\(\s*model\s*\)/, 'agent loop comput
 assertRegex(/\.\.\.(clauderequestoptionsformodel\s*\(\s*model\s*\)|reqoptions)/, 'agent loop spreads model request options into request');
 assertRegex(/model\s*===\s*model_servis[\s\S]*servis/, 'service/admin route still exists');
 
+assertIncludes('PROAKTIVITA PRI PAROVANI', 'pairing proactivity section exists');
+assertIncludes('nikdy nekonci pasivne', 'pairing must not end passively');
+assertIncludes('dej mi vedet / napis mi', 'pairing names passive wait phrases');
+assertIncludes('kdy se sam ozvu / co sam zkontroluju', 'pairing must announce own follow-up');
+assertIncludes('Hotovo, pridal jsem" smis rict az po overeni nove entity nebo uspesneho create_entry', 'pairing success requires verification');
 assertIncludes('MISTNOST U NOVEHO ZARIZENI', 'new device area rule exists');
 assertIncludes('pouzivej presny nazev, ktery rekl', 'use user supplied area name');
 assertIncludes('Nesmis si ho potichu prelozit na jinou existujici mistnost', 'forbid silent area aliasing');

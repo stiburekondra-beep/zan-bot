@@ -53,6 +53,8 @@ assert.strictEqual(androidTv.needs_handler, true);
 assert.strictEqual(androidTv.suggested_handlers[0].handler, 'androidtv_remote');
 assert.strictEqual(androidTv.tv_pairing.requires_screen_confirmation, true);
 assert(androidTv.message.includes('media_player'));
+assert.strictEqual(androidTv.proactive_notification.proactive, true);
+assert.strictEqual(androidTv.proactive_notification.phase, 'handler_selection');
 
 const unknownTv = buildOnboardDeviceRequest({ category: 'tv' });
 assert.strictEqual(unknownTv.needs_handler, true);
@@ -68,6 +70,8 @@ const webosTv = buildOnboardDeviceRequest({
 assert.strictEqual(webosTv.handler, 'webostv');
 assert.deepStrictEqual(webosTv.userInput, { host: '192.168.0.44' });
 assert(webosTv.after_pairing.some(step => step.includes('ha_setup_assign_device')));
+assert.strictEqual(webosTv.proactive_notification.phase, 'config_flow');
+assert(webosTv.proactive_notification.instruction.includes('hotovo až po'));
 
 const unknownPlug = buildOnboardDeviceRequest({ category: 'plug' });
 assert.strictEqual(unknownPlug.needs_handler, true);

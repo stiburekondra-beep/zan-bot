@@ -56,6 +56,7 @@ const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
+const { buildPairingNotification, buildPairingReminderMessage } = require('./pairing-followup');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -806,6 +807,33 @@ function enrichHostsWithNeighborMacs(hosts, neighborMacs) {
   return hosts;
 }
 
+function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTool = 'get_new_entities' } = {}) {
+  const seconds = Math.max(20, Math.round(Number(duration) || 60) + 15);
+  const due = new Date(Date.now() + seconds * 1000);
+  const result = addScheduledAction(SCHEDULED_ACTIONS_FILE, {
+    due_at: due.toISOString(),
+    action_type: 'message',
+    description: `zkontrolovat párování ${backend || 'zařízení'}`,
+    message: buildPairingReminderMessage({ backend, duration, verifyTool }),
+    chat_id: chatId,
+    created_by: userName || 'Žán',
+  }, ALLOWED_DOMAINS);
+  if (result && result.success) {
+    logAction(chatId, userName || 'Žán', 'pairing_followup_scheduled', result.action.id, `${backend || 'device'} ${seconds}s`);
+    return {
+      scheduled: true,
+      action_id: result.action.id,
+      due_at: result.action.due_at,
+      check_after_seconds: seconds,
+    };
+  }
+  return {
+    scheduled: false,
+    error: result && result.error ? result.error : 'Nepodařilo se naplánovat kontrolní zprávu.',
+    check_after_seconds: seconds,
+  };
+}
+
 async function runOnboardDeviceFlow(input) {
   const request = buildOnboardDeviceRequest(input);
   if (request.error) return { error: request.error };
@@ -815,6 +843,7 @@ async function runOnboardDeviceFlow(input) {
       category: request.category,
       needs_handler: true,
       suggested_handlers: request.suggested_handlers,
+      proactive_notification: request.proactive_notification,
       message: request.message,
     };
   }
@@ -835,6 +864,7 @@ async function runOnboardDeviceFlow(input) {
       message: flow && flow.type === 'form'
         ? 'Config flow je založený. Dál potřebuje údaje uživatele nebo potvrzení podle formuláře; nedokončuji ho naslepo.'
         : 'Config flow založený.',
+      proactive_notification: request.proactive_notification,
       raw: flow,
     };
   }
@@ -854,6 +884,12 @@ async function runOnboardDeviceFlow(input) {
       category: request.category,
       handler: request.handler,
       message: `Zařízení kategorie ${request.category} bylo přidané přes HA integraci ${request.handler}.`,
+      proactive_notification: buildPairingNotification({
+        phase: 'created',
+        category: request.category,
+        handler: request.handler,
+        instruction: 'Oznam hotovo jen společně s ověřením nové entity nebo dalším krokem přiřazení do místnosti.',
+      }),
       raw: flow,
     };
   }
@@ -1396,7 +1432,7 @@ function buildTools(chatId, profil) {
       input_schema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['get', 'set_room', 'set_adjacency', 'add_item', 'remove_item'] },
+          action: { type: 'string', enum: ['get', 'set_room', 'set_adjacency', 'add_item', 'remove_item', 'prepare_seed', 'apply_seed'] },
           room_id: { type: 'string', description: 'ID místnosti v house_map nebo HA area_id, např. kuchyn' },
           name: { type: 'string', description: 'Název místnosti nebo věci' },
           area_id: { type: 'string', description: 'HA area_id pro set_room; ověř přes get_areas/ha_setup_list, netipuj' },
@@ -1407,6 +1443,10 @@ function buildTools(chatId, profil) {
           type: { type: 'string', enum: ['dveře', 'průchod', 'schody', 'sousedí'] },
           item_id: { type: 'string', description: 'ID věci pro remove_item' },
           notes: { type: 'string', description: 'Krátká poznámka' },
+          seed: { type: 'object', description: 'Polycam/import seed pro prepare_seed/apply_seed. Názvy ze seedu nejsou autorita.' },
+          customer_rooms: { type: 'array', description: 'Autoritativní místnosti zákazníka/HA area registry: area_id, name, aliases, floor_id.', items: { type: 'object' } },
+          threshold: { type: 'number', description: 'Volitelný práh jistoty párování; výchozí 0.72.' },
+          confirmed: { type: 'boolean', description: 'apply_seed smí zapsat až po lidské kontrole návrhu a jen bez nevyřešených místností.' },
         },
         required: ['action'],
       },
@@ -2364,7 +2404,13 @@ async function executeTool(name, input, chatId) {
           if (pj) {
             await haPost(`services/${pj.entity_id.split('.')[0]}/turn_on`, { entity_id: pj.entity_id });
             logAction(chatId, user.name, 'permit_join', pj.entity_id, 'ok');
-            return { success: true, backend: 'zigbee2mqtt', message: `✅ Párování zapnuto (Zigbee2MQTT). Aktivuj teď párování na zařízení a dej mi vědět — pak spustím sken.` };
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt', duration });
+            return {
+              success: true,
+              backend: 'zigbee2mqtt',
+              message: `✅ Párování zapnuto (Zigbee2MQTT) na ${duration} s. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              proactive_followup: followup,
+            };
           }
         } catch {}
         // 2) ZHA — služba zha.permit
@@ -2374,13 +2420,25 @@ async function executeTool(name, input, chatId) {
           if (domains.includes('zha')) {
             await haPost('services/zha/permit', { duration });
             logAction(chatId, user.name, 'permit_join', 'zha', 'ok');
-            return { success: true, backend: 'zha', message: `✅ Párování zapnuto na ${duration} s (ZHA). Aktivuj teď párování na zařízení a dej mi vědět — pak spustím sken.` };
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zha', duration });
+            return {
+              success: true,
+              backend: 'zha',
+              message: `✅ Párování zapnuto na ${duration} s (ZHA). Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              proactive_followup: followup,
+            };
           }
           // 3) Z2M přes MQTT bez bridge entity
           if (domains.includes('mqtt')) {
             await haPost('services/mqtt/publish', { topic: 'zigbee2mqtt/bridge/request/permit_join', payload: JSON.stringify({ time: duration }) });
             logAction(chatId, user.name, 'permit_join', 'mqtt', 'ok');
-            return { success: true, backend: 'zigbee2mqtt/mqtt', message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT. Aktivuj párování na zařízení a dej mi vědět.` };
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt/mqtt', duration });
+            return {
+              success: true,
+              backend: 'zigbee2mqtt/mqtt',
+              message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              proactive_followup: followup,
+            };
           }
         } catch (e) {
           return { error: `Spuštění párování selhalo: ${e.message}` };
@@ -2389,7 +2447,13 @@ async function executeTool(name, input, chatId) {
         return {
           success: false,
           backend: 'none',
-          user_instructions: 'Dálkové zapnutí párování tu není možné — Zigbee běží přes eWeLink most (nebo jde o Matter zařízení). Postup: Zigbee → otevři aplikaci eWeLink → vyber most ZBBridge-U → "Přidat podzařízení" a aktivuj párování na zásuvce. Matter → aplikace Home Assistant → Nastavení → Zařízení → Přidat zařízení → naskenuj QR kód. Až bude zařízení přidané, napiš mi a já ho pojmenuju, zařadím do místnosti a navrhnu automatizace.',
+          user_instructions: 'Dálkové zapnutí párování tu není možné — Zigbee běží přes eWeLink most (nebo jde o Matter zařízení). Postup: Zigbee → otevři aplikaci eWeLink → vyber most ZBBridge-U → "Přidat podzařízení" a aktivuj párování na zásuvce. Matter → aplikace Home Assistant → Nastavení → Zařízení → Přidat zařízení → naskenuj QR kód.',
+          proactive_notification: {
+            proactive: true,
+            phase: 'manual_pairing_required',
+            verify_tool: 'get_new_entities',
+            rule: 'Po ručním kroku Žán nemá pasivně čekat na obecné "napiš mi"; má dát konkrétní pokyn a po potvrzení hned sám spustit kontrolu nových entit.',
+          },
         };
       }
 
@@ -3556,10 +3620,11 @@ Entity_id do karet VŽDY z get_states (mívají sériová čísla uvnitř, např
 Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity oprav hned — nikdy „hotovo" s nefunkční kartou.
 
 ═══ 5. WORKFLOWY ═══
-NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli instrukce (user_instructions vlastními slovy) a čekej na potvrzení → scan_all_devices → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
+NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli konkrétní instrukce a když nástroj vrátí proactive_followup, řekni, že se sám ozveš a zkontroluješ nová zařízení; po potvrzení uživatele nebo po vlastní kontrolní zprávě spusť scan_all_devices/get_new_entities → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
+PROAKTIVITA PŘI PÁROVÁNÍ: nikdy nekonči pasivně „dej mi vědět / napiš mi". U každého párovacího kroku oznam stav aktivně: co jsem našel nebo spustil, co má člověk teď fyzicky udělat, kdy se sám ozvu / co sám zkontroluju, a čím ověřím výsledek. „Hotovo, přidal jsem" smíš říct až po ověření nové entity nebo úspěšného create_entry; jinak řekni další konkrétní krok.
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
-MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
+MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
 LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
