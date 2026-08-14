@@ -48,6 +48,13 @@ const { upsertRepairItem, formatRepairInbox } = require('./repair-inbox');
 const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 const { buildDeviceLayoutSnapshot, formatDeviceLayout } = require('./device-layout');
+const {
+  buildEntityArchiveCandidates,
+  archiveEntity,
+  restoreEntity,
+  listArchive,
+  formatEntityArchiveList,
+} = require('./entity-archive');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
@@ -167,6 +174,7 @@ const SERVICE_ONBOARDING_FILE = path.join(DATA_DIR, 'service_onboarding.json');
 const TECHNOLOGIES_FILE  = path.join(DATA_DIR, 'technologies.json');
 const TECHNOLOGY_DOCS_DIR = path.join(DATA_DIR, 'docs');
 const HOUSE_MAP_FILE    = path.join(DATA_DIR, 'house_map.json');
+const ENTITY_ARCHIVE_FILE = path.join(DATA_DIR, 'entity_archive.json');
 
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
@@ -1464,6 +1472,21 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'entity_archive',
+      description: 'Bezpečný úklid nepoužívaných entit v Home Assistantu. Kandidáty jen navrhne; archivace NIKDY nemaže, pouze skryje jednu potvrzenou entitu v HA entity registry (`hidden_by: user`) a uloží audit do /config/zan_data/entity_archive.json. Obnova vrátí skrytí podle archivu. Kritické entity (alarm, zámek, topení/klima, vrata, čerpadlo, ventil, person/device_tracker) jsou blokované. Hromadné schování bez konkrétního potvrzení je zakázané.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['candidates', 'list', 'archive', 'restore'], description: 'candidates = navrhne bezpečné kandidáty; list = archiv; archive/restore = jedna konkrétní potvrzená entita.' },
+          entity_id: { type: 'string', description: 'Přesné entity_id pro archive/restore. Netipuj ho z názvu, nejdřív ověř přes candidates/get_states/scan_all_devices.' },
+          reason: { type: 'string', description: 'Lidský důvod archivace, např. dlouho unavailable a už se nepoužívá.' },
+          min_age_minutes: { type: 'number', description: 'Prahové stáří unavailable kandidátů. Výchozí 10080 min = 7 dní.' },
+          confirmed: { type: 'boolean', description: 'Musí být true po výslovném lidském potvrzení přesné entity. Bez toho archive/restore odmítne.' },
+        },
+        required: ['action'],
+      },
+    },
+    {
       name: 'get_new_entities',
       description: 'Najde entity které Žán ještě nezná — nově přidaná zařízení. U každé vrátí i konzervativní návrh kategorie pro onboarding (plug/tv/climate/camera), ale finální typ vždy potvrzuje uživatel.',
       input_schema: { type: 'object', properties: {}, required: [] },
@@ -2373,6 +2396,70 @@ async function executeTool(name, input, chatId) {
           snapshot,
           safety: snapshot.safety,
         };
+      }
+
+      case 'entity_archive': {
+        if (input.action === 'list') {
+          const archive = listArchive(ENTITY_ARCHIVE_FILE);
+          return {
+            action: 'list',
+            text: formatEntityArchiveList(archive),
+            archive,
+            data_file: ENTITY_ARCHIVE_FILE,
+          };
+        }
+
+        if (input.action === 'candidates') {
+          const minAgeMinutes = Math.max(60, Number(input.min_age_minutes || (7 * 24 * 60)));
+          const [states, entityReg] = await Promise.all([
+            haGet('states'),
+            haRegistry('entity_registry').catch(() => []),
+          ]);
+          const candidates = buildEntityArchiveCandidates({
+            states,
+            entityRegistry: entityReg,
+            archiveFile: ENTITY_ARCHIVE_FILE,
+            minAgeMs: minAgeMinutes * 60 * 1000,
+          });
+          return {
+            action: 'candidates',
+            text: `Kandidáti na archiv: ${candidates.candidates.length}; blokované kritické entity: ${candidates.blocked.length}.`,
+            candidates,
+            data_file: ENTITY_ARCHIVE_FILE,
+          };
+        }
+
+        if (!isAdmin(chatId)) return { error: 'Archivace/obnova entit vyžaduje admin přístup.' };
+        const [states, entityReg] = await Promise.all([
+          haGet('states').catch(() => []),
+          haRegistry('entity_registry').catch(() => []),
+        ]);
+        if (input.action === 'archive') {
+          const result = await archiveEntity({
+            archiveFile: ENTITY_ARCHIVE_FILE,
+            entityId: input.entity_id,
+            reason: input.reason,
+            states,
+            entityRegistry: entityReg,
+            haWsCommand,
+            confirmed: input.confirmed === true,
+            actor: user.name,
+          });
+          logAction(chatId, user.name, 'entity_archive', input.entity_id, result.success ? 'archived' : `fail:${result.error || '?'}`);
+          return result;
+        }
+        if (input.action === 'restore') {
+          const result = await restoreEntity({
+            archiveFile: ENTITY_ARCHIVE_FILE,
+            entityId: input.entity_id,
+            haWsCommand,
+            confirmed: input.confirmed === true,
+            actor: user.name,
+          });
+          logAction(chatId, user.name, 'entity_archive_restore', input.entity_id, result.success ? 'restored' : `fail:${result.error || '?'}`);
+          return result;
+        }
+        return { error: `Neznámá akce entity_archive: ${input.action}` };
       }
 
       case 'get_new_entities': {
@@ -3626,6 +3713,7 @@ MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej p�
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
 LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
+ARCHIV ENTIT: když uživatel chce "smazat/uklidit/schovat" nepoužívané entity v HA, nepoužívej nevratné mazání. Použij entity_archive: nejdřív candidates nebo list, potom archive/restore jen pro jednu přesnou entity_id a jen s confirmed:true po lidském potvrzení. Říkej "schoval jsem do archivu", ne "smazal jsem". Kritické entity (alarm, zámek, topení/klima, vrata, čerpadla, ventily, osoby/tracker) nearchivuj automaticky nikdy.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
 
@@ -3860,7 +3948,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     const actionGuard = guardActionClaim(finalText, userMessage, actionCalls);
     if (actionGuard.changed) {
       finalText = actionGuard.text;
-      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, media=${actionGuard.fabricatedMedia}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
+      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, device=${actionGuard.fabricatedDevice}, media=${actionGuard.fabricatedMedia}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
     }
     // Holé „neumím/nemůžu" bez dalšího kroku boří služebnickou důvěru.
     // Zůstává poctivé přiznání limitu, ale přidá se cesta dál a anonymní

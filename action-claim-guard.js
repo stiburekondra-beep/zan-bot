@@ -31,8 +31,13 @@
 // undo_last_change je záměrně mezi nimi: po vrácení může být balíček buď
 // smazaný (undo write) nebo zpátky (undo delete) — po úspěšném undo je tedy
 // legitimní i „smazal jsem" i „vrátil jsem", proto stačí jeden společný kbelík.
-const CONFIG_TOOLS = ['write_package', 'delete_package', 'undo_last_change', 'write_dashboard'];
+const CONFIG_TOOLS = ['write_package', 'delete_package', 'undo_last_change', 'write_dashboard', 'entity_archive'];
 const RESTART_TOOLS = ['restart_ha'];
+// Ovládání zařízení v domě. Actuation-guard řeší případ, kdy tool proběhl, ale
+// cílová entita je unavailable/unknown. Tenhle guard doplňuje opačnou větev:
+// model tvrdí „rozsvítil jsem / hotovo", ale žádný aktuační tool se v kole
+// úspěšně neprovedl (typicky voice pipeline nebo model přeskočí tool call).
+const DEVICE_TOOLS = ['turn_on', 'turn_off', 'toggle', 'call_service'];
 // Přehrávání médií. Doplněno 2026-08-12 po živém nálezu v labu: Ondra dvakrát
 // za sebou požádal „pusť na youtube traktory v blátě" a Žán podruhé odpověděl
 // „Hotovo! Traktory teď hrají na televizi", aniž by zavolal jediný nástroj —
@@ -48,10 +53,10 @@ const USER_RESTART_INTENT = /\brestart\w*/i;
 
 // (2) First-person dokončené sloveso zásahu, ALE ne reflexivní/posesivní tvar
 // („vrátil jsem SE", „vytvořil jsem SI") — ten neznamená akci nad configem.
-const VERB_DONE = /\b(vrátil|vrátila|vrátilo|obnovil|obnovila|obnovilo|smazal|smazala|smazalo|odstranil|odstranila|odstranilo|vymazal|vymazala|zapsal|zapsala|zapsalo|vytvořil|vytvořila|vytvořilo|založil|založila|založilo|přepsal|přepsala)\s+jsem\b(?!\s+(?:se|si)\b)/i;
+const VERB_DONE = /\b(vrátil|vrátila|vrátilo|obnovil|obnovila|obnovilo|smazal|smazala|smazalo|odstranil|odstranila|odstranilo|vymazal|vymazala|schoval|schovala|schovalo|skryl|skryla|skrylo|zapsal|zapsala|zapsalo|vytvořil|vytvořila|vytvořilo|založil|založila|založilo|přepsal|přepsala)\s+jsem\b(?!\s+(?:se|si)\b)/i;
 
 // Konfigurační objekt v okolí — bez něj generické sloveso neguardujeme.
-const CONFIG_NOUN = /(balíč|automatiz|package|konfigurac|\byaml\b|zápis|změn|scénář|skript|dashboard)/i;
+const CONFIG_NOUN = /(balíč|automatiz|package|konfigurac|\byaml\b|zápis|změn|scénář|skript|dashboard|entit|entity)/i;
 
 // (2') Stavová fráze, která tvrdí dokončený stav configu i bez „<sloveso> jsem".
 // Chráněná gate (1), takže smí být volnější, ale i tak vázaná na objekt.
@@ -59,6 +64,14 @@ const CONFIG_PHRASE = /(balíč\w*|automatiz\w*|package|dashboard)\s+(?:už\s+)?
 
 // (2'') Dokončený restart HA (first-person nebo jasné dokončení).
 const RESTART_DONE = /\brestartoval[ao]?\s+jsem\b|\b(?:home\s*assistant|ha)\s+(?:se\s+)?(?:právě\s+|už\s+)?(?:byl\s+)?restartov\w+/i;
+
+// (1'') Uživatel právě žádá ovládání běžného zařízení v domě. Držíme rozkazové
+// tvary a běžné domácí formulace; dotazy na stav („svítí?") sem nepatří.
+const USER_DEVICE_INTENT = /(?<![\p{L}])(zapni|vypni|rozsviť|rozsvit|zhasni|přepni|prepn[ií]|sepni|vytáhni|vytahni|zatáhni|zatahni|otevři|otevri|zavři|zavri|nastav|dej|udělej|udelej)\p{L}*/iu;
+// (2'') Odpověď tvrdí hotovou aktuaci. Vyžadujeme zároveň DEVICE_NOUN, aby
+// běžné „hotovo" u ne-domácí akce nespouštělo false-positive.
+const DEVICE_DONE = /(?<![\p{L}])(hotovo|zapnul\w*\s+jsem|vypnul\w*\s+jsem|rozsvítil\w*\s+jsem|rozsvitil\w*\s+jsem|zhasl\w*\s+jsem|přepnul\w*\s+jsem|prepnul\w*\s+jsem|sepnul\w*\s+jsem|otevřel\w*\s+jsem|otevrel\w*\s+jsem|zavřel\w*\s+jsem|zavrel\w*\s+jsem|nastavil\w*\s+jsem|je\s+(?:teď\s+|ted\s+|už\s+|uz\s+)?(?:zapnut\w*|vypnut\w*|rozsvícen\w*|rozsvicen\w*|zhasnut\w*|otevřen\w*|otevren\w*|zavřen\w*|zavren\w*)|svítí|sviti|nesvítí|nesviti)/iu;
+const DEVICE_NOUN = /(svět|svet|svítidl|svitidl|lamp|žárovk|zarovk|led|zásuvk|zasuvk|switch|vypínač|vypinac|rolety|rolet|žaluzi|zaluzi|vrat|garáž|garaz|ventil|čerpadl|cerpadl|topen|klimatiz|climate|light|cover|fan)/i;
 
 // (1'') Uživatel právě žádá přehrání nebo ovládání přehrávání.
 // Jen ROZKAZ („pusť", „zapni"), ne 3. osoba — jinak by dotaz „co hraje na
@@ -75,32 +88,36 @@ const MEDIA_NOUN = /(televiz|telce|telka|youtube|video|hudb|píseň|pisen|skladb
 // userMessage: text aktuální uživatelovy zprávy (gate 1 — o co si právě řekl).
 // actionCalls: pole { name, ok } — nástroje volané v TOMTO kole a jestli
 //   doběhly úspěšně (ok === true). Bot.js ho plní během agentické smyčky.
-// Vrací { text, changed, fabricatedConfig, fabricatedRestart }.
+// Vrací { text, changed, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia }.
 function guardActionClaim(text, userMessage, actionCalls) {
-  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false, fabricatedMedia: false };
+  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false, fabricatedDevice: false, fabricatedMedia: false };
   if (!text || typeof text !== 'string') return noop;
 
   const um = typeof userMessage === 'string' ? userMessage : '';
   const calls = Array.isArray(actionCalls) ? actionCalls : [];
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
+  const deviceSatisfied = calls.some(c => c && c.ok && DEVICE_TOOLS.includes(c.name));
   const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
   const configClaim = (VERB_DONE.test(text) && CONFIG_NOUN.test(text)) || CONFIG_PHRASE.test(text);
   const restartClaim = RESTART_DONE.test(text);
+  const deviceClaim = DEVICE_DONE.test(text) && DEVICE_NOUN.test(text);
   const mediaClaim = MEDIA_DONE.test(text) && MEDIA_NOUN.test(text);
 
   // (1) požádal o něj uživatel v tomhle kole? + (3) neproběhl nástroj?
   const fabricatedConfig = configClaim && USER_CONFIG_INTENT.test(um) && !configSatisfied;
   const fabricatedRestart = restartClaim && USER_RESTART_INTENT.test(um) && !restartSatisfied;
+  const fabricatedDevice = deviceClaim && USER_DEVICE_INTENT.test(um) && !deviceSatisfied;
   const fabricatedMedia = mediaClaim && USER_MEDIA_INTENT.test(um) && !mediaSatisfied;
 
-  if (!fabricatedConfig && !fabricatedRestart && !fabricatedMedia) return noop;
+  if (!fabricatedConfig && !fabricatedRestart && !fabricatedDevice && !fabricatedMedia) return noop;
 
   const parts = [];
   if (fabricatedConfig) parts.push('zásah do konfigurace (vrácení / zápis / smazání balíčku)');
   if (fabricatedRestart) parts.push('restart Home Assistanta');
+  if (fabricatedDevice) parts.push('ovládání zařízení v domě');
   if (fabricatedMedia) parts.push('puštění hudby nebo videa');
   const what = parts.join(' ani ');
 
@@ -111,7 +128,7 @@ function guardActionClaim(text, userMessage, actionCalls) {
     `jsem neudělal. Napiš mi prosím ještě jednou, co přesně mám udělat, a provedu ` +
     `to doopravdy — potvrdím ti to až podle skutečného výsledku nástroje.`;
 
-  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedMedia };
+  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia };
 }
 
-module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, MEDIA_TOOLS };
+module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, MEDIA_TOOLS };
