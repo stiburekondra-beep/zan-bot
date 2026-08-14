@@ -3860,7 +3860,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
     const actionGuard = guardActionClaim(finalText, userMessage, actionCalls);
     if (actionGuard.changed) {
       finalText = actionGuard.text;
-      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, media=${actionGuard.fabricatedMedia}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
+      console.warn(`action-claim-guard: neutralizována fabrikace akce (config=${actionGuard.fabricatedConfig}, restart=${actionGuard.fabricatedRestart}, device=${actionGuard.fabricatedDevice}, media=${actionGuard.fabricatedMedia}, chat ${chatId}, tools=${JSON.stringify(actionCalls)})`);
     }
     // Holé „neumím/nemůžu" bez dalšího kroku boří služebnickou důvěru.
     // Zůstává poctivé přiznání limitu, ale přidá se cesta dál a anonymní
