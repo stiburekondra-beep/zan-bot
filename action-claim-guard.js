@@ -31,7 +31,7 @@
 // undo_last_change je záměrně mezi nimi: po vrácení může být balíček buď
 // smazaný (undo write) nebo zpátky (undo delete) — po úspěšném undo je tedy
 // legitimní i „smazal jsem" i „vrátil jsem", proto stačí jeden společný kbelík.
-const CONFIG_TOOLS = ['write_package', 'delete_package', 'undo_last_change', 'write_dashboard'];
+const CONFIG_TOOLS = ['write_package', 'delete_package', 'undo_last_change', 'write_dashboard', 'entity_archive'];
 const RESTART_TOOLS = ['restart_ha'];
 // Ovládání zařízení v domě. Actuation-guard řeší případ, kdy tool proběhl, ale
 // cílová entita je unavailable/unknown. Tenhle guard doplňuje opačnou větev:
@@ -53,10 +53,10 @@ const USER_RESTART_INTENT = /\brestart\w*/i;
 
 // (2) First-person dokončené sloveso zásahu, ALE ne reflexivní/posesivní tvar
 // („vrátil jsem SE", „vytvořil jsem SI") — ten neznamená akci nad configem.
-const VERB_DONE = /\b(vrátil|vrátila|vrátilo|obnovil|obnovila|obnovilo|smazal|smazala|smazalo|odstranil|odstranila|odstranilo|vymazal|vymazala|zapsal|zapsala|zapsalo|vytvořil|vytvořila|vytvořilo|založil|založila|založilo|přepsal|přepsala)\s+jsem\b(?!\s+(?:se|si)\b)/i;
+const VERB_DONE = /\b(vrátil|vrátila|vrátilo|obnovil|obnovila|obnovilo|smazal|smazala|smazalo|odstranil|odstranila|odstranilo|vymazal|vymazala|schoval|schovala|schovalo|skryl|skryla|skrylo|zapsal|zapsala|zapsalo|vytvořil|vytvořila|vytvořilo|založil|založila|založilo|přepsal|přepsala)\s+jsem\b(?!\s+(?:se|si)\b)/i;
 
 // Konfigurační objekt v okolí — bez něj generické sloveso neguardujeme.
-const CONFIG_NOUN = /(balíč|automatiz|package|konfigurac|\byaml\b|zápis|změn|scénář|skript|dashboard)/i;
+const CONFIG_NOUN = /(balíč|automatiz|package|konfigurac|\byaml\b|zápis|změn|scénář|skript|dashboard|entit|entity)/i;
 
 // (2') Stavová fráze, která tvrdí dokončený stav configu i bez „<sloveso> jsem".
 // Chráněná gate (1), takže smí být volnější, ale i tak vázaná na objekt.

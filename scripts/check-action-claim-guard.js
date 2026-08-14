@@ -11,6 +11,7 @@ const RESTART_OK = [{ name: 'restart_ha', ok: true }];
 const TURN_ON_OK = [{ name: 'turn_on', ok: true }];
 const TURN_ON_FAIL = [{ name: 'turn_on', ok: false }];
 const CALL_SERVICE_OK = [{ name: 'call_service', ok: true }];
+const ENTITY_ARCHIVE_OK = [{ name: 'entity_archive', ok: true }];
 
 // ── 1) PŘESNÁ repro věta z bugu (msg #3): undo bez tool callu → FIRE ──────────
 const bug1 = 'Vrátil jsem poslední zápis — balíček je smazaný a HA ho už nezná.';
@@ -155,4 +156,17 @@ assert.strictEqual(
   '21: přiznání neúspěchu aktuace není tvrzení hotovo',
 );
 
-console.log('check-action-claim-guard: OK (21 scénářů)');
+// ── 22) Archivace entity bez entity_archive toolu nesmí tvrdit hotovo ───────
+const archiveLie = 'Schoval jsem entitu sensor.stary_test do archivu.';
+assert.strictEqual(
+  guardActionClaim(archiveLie, 'ukliď/smaž entitu sensor.stary_test z aplikace', NONE).changed,
+  true,
+  '22a: tvrzení o archivaci entity bez toolu = fabrikace',
+);
+assert.strictEqual(
+  guardActionClaim(archiveLie, 'ukliď/smaž entitu sensor.stary_test z aplikace', ENTITY_ARCHIVE_OK).changed,
+  false,
+  '22b: úspěšný entity_archive legitimizuje tvrzení o archivaci',
+);
+
+console.log('check-action-claim-guard: OK (22 scénářů)');
