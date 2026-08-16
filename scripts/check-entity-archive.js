@@ -21,6 +21,13 @@ const states = [
   { entity_id: 'lock.vchod', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Zámek vchod' } },
   { entity_id: 'switch.ventil_voda', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Ventil voda' } },
   { entity_id: 'light.obyvak', state: 'on', last_changed: old, attributes: { friendly_name: 'Obývák' } },
+  // Bezpečnostní entity GENERICKÉHO jména (žádné klíčové slovo) — poznat je smí jen device_class.
+  { entity_id: 'binary_sensor.hall_01', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Hall 01', device_class: 'smoke' } },
+  { entity_id: 'binary_sensor.node_7', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Node 7', device_class: 'carbon_monoxide' } },
+  { entity_id: 'binary_sensor.zb_204', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'ZB 204', device_class: 'gas' } },
+  { entity_id: 'siren.outdoor', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Outdoor 3' } },
+  // Diskriminace: generický binary_sensor BEZ bezpečnostní device_class zůstává kandidát.
+  { entity_id: 'binary_sensor.dvere_spiz', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Špíž dveře', device_class: 'door' } },
 ];
 const entityRegistry = [
   { entity_id: 'sensor.stary_test', name: 'Starý test', platform: 'test' },
@@ -28,6 +35,11 @@ const entityRegistry = [
   { entity_id: 'switch.ventil_voda', name: 'Ventil voda', platform: 'test' },
   { entity_id: 'light.obyvak', name: 'Obývák', platform: 'test' },
   { entity_id: 'sensor.registry_missing', name: 'Registry missing', platform: 'test' },
+  { entity_id: 'binary_sensor.hall_01', name: 'Hall 01', platform: 'test' },
+  { entity_id: 'binary_sensor.node_7', name: 'Node 7', platform: 'test' },
+  { entity_id: 'binary_sensor.zb_204', name: 'ZB 204', platform: 'test' },
+  { entity_id: 'siren.outdoor', name: 'Outdoor 3', platform: 'test' },
+  { entity_id: 'binary_sensor.dvere_spiz', name: 'Špíž dveře', platform: 'test' },
 ];
 
 const candidates = buildEntityArchiveCandidates({
@@ -42,6 +54,18 @@ assert(!candidates.candidates.some(c => c.entity_id === 'light.obyvak'), 'dostup
 assert(candidates.blocked.some(c => c.entity_id === 'lock.vchod'), 'lock je blokovaný');
 assert(candidates.blocked.some(c => c.entity_id === 'switch.ventil_voda'), 'ventil podle názvu je blokovaný');
 assert(isCriticalEntity({ entity_id: 'climate.loznice', name: 'Klima' }), 'climate je kritická doména');
+
+// Scénář 63: bezpečnostní entita generického jména v ne-kritické doméně se NESMÍ navrhnout k archivaci.
+for (const id of ['binary_sensor.hall_01', 'binary_sensor.node_7', 'binary_sensor.zb_204', 'siren.outdoor']) {
+  assert(candidates.blocked.some(c => c.entity_id === id), `${id} je blokovaný (bezpečnostní entita)`);
+  assert(!candidates.candidates.some(c => c.entity_id === id), `${id} se nesmí navrhnout k archivaci`);
+}
+// Diskriminace: fix nesmí jen „všechno blokovat" — generický binary_sensor bez safety device_class je pořád kandidát.
+assert(candidates.candidates.some(c => c.entity_id === 'binary_sensor.dvere_spiz'), 'generický binary_sensor bez safety device_class je kandidát');
+// device_class má přednost před názvem (žádné klíčové slovo v entitě).
+assert(isCriticalEntity({ entity_id: 'binary_sensor.node_7', name: 'Node 7' }, { attributes: { device_class: 'carbon_monoxide' } }), 'CO detektor generického jména je kritický přes device_class');
+assert(isCriticalEntity({ entity_id: 'siren.outdoor', name: 'Outdoor 3' }), 'siren doména je kritická');
+assert(!isCriticalEntity({ entity_id: 'binary_sensor.dvere_spiz', name: 'Špíž dveře' }, { attributes: { device_class: 'door' } }), 'dveřní čidlo bez safety device_class není kritické');
 
 (async () => {
   const calls = [];
