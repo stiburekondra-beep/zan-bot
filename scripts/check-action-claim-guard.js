@@ -169,4 +169,53 @@ assert.strictEqual(
   '22b: úspěšný entity_archive legitimizuje tvrzení o archivaci',
 );
 
-console.log('check-action-claim-guard: OK (22 scénářů)');
+// ── 23) DÍRA 1 (tester 2026-08-15): krátká hlasová odpověď se silným device-verbem
+//        BEZ noun v odpovědi → musí FIRE (dřív noun-gate leakoval u voice) ──────
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem 👍', 'zhasni v obýváku', NONE).changed,
+  true,
+  '23a: „Zhasl jsem 👍" (silný verb, bez noun, žádný tool) = fabrikace',
+);
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem 💡', 'rozsviť v obýváku', NONE).changed,
+  true,
+  '23b: „Rozsvítil jsem 💡" bez noun = fabrikace',
+);
+assert.strictEqual(
+  guardActionClaim('Přepnul jsem.', 'přepni světlo', NONE).changed,
+  true,
+  '23c: „Přepnul jsem" bez noun = fabrikace',
+);
+// úspěšný tool silný verb legitimizuje i bez noun
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem 👍', 'zhasni v obýváku', TURN_ON_OK).changed,
+  false,
+  '23d: po úspěšném toolu je „Zhasl jsem" legitimní',
+);
+
+// ── 24) DÍRA 2 (tester 2026-08-15): infinitivní žádost uživatele → gate 1 chytne
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem světlo 💡', 'můžeš rozsvítit světlo?', NONE).changed,
+  true,
+  '24a: infinitiv „můžeš rozsvítit" + fabrikace = fire',
+);
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem světlo.', 'jde zhasnout v ložnici?', NONE).changed,
+  true,
+  '24b: infinitiv „jde zhasnout" + fabrikace = fire',
+);
+
+// ── 25) FALSE-POSITIVE OBRANA (díra 1): „hotovo" u ne-domácí akce zůstává gated
+//        na DEVICE_NOUN — bez noun a bez device intentu se nesmí měnit ──────────
+assert.strictEqual(
+  guardActionClaim('Hotovo, mám to zapsané.', 'poznamenej si, že jedu v pátek pryč', NONE).changed,
+  false,
+  '25: „Hotovo" bez device noun a bez device intentu se nesmí přepsat',
+);
+assert.strictEqual(
+  guardActionClaim('Vrátil jsem se k tomu a je to opravené.', 'zapni to zpátky', NONE).changed,
+  false,
+  '25b: „vrátil jsem se" (reflexivní) není device claim ani se silným kbelíkem',
+);
+
+console.log('check-action-claim-guard: OK (25 scénářů)');
