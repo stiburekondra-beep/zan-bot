@@ -13,6 +13,21 @@ const CRITICAL_DOMAINS = new Set([
   'person',
   'device_tracker',
   'zone',
+  'siren',
+  'water_heater',
+  'humidifier',
+]);
+
+// Bezpečnostní device_class z HA (kouř/CO/plyn/únik/přehřátí) — kritické i v ne-kritické
+// doméně (typicky binary_sensor). HA je nastavuje spolehlivě, takže je to robustnější
+// signál než klíčové slovo v názvu, které bezpečnostní entita generického jména mine.
+const CRITICAL_DEVICE_CLASSES = new Set([
+  'smoke',
+  'gas',
+  'carbon_monoxide',
+  'safety',
+  'moisture',
+  'heat',
 ]);
 
 const DEFAULT_SKIP_DOMAINS = new Set([
@@ -79,10 +94,22 @@ function textFor(entity = {}, state = {}) {
   ].filter(Boolean).join(' ');
 }
 
+function deviceClassOf(entity = {}, state = {}) {
+  return String(
+    state?.attributes?.device_class ||
+    entity.device_class ||
+    entity.original_device_class ||
+    '',
+  ).toLowerCase();
+}
+
 function isCriticalEntity(entity = {}, state = {}) {
   const entityId = entity.entity_id || state.entity_id || '';
   const domain = domainOf(entityId);
   if (CRITICAL_DOMAINS.has(domain)) return true;
+  // Strukturální signál (device_class) má přednost před jménem: kouřový/CO/plynový
+  // detektor generického jména (binary_sensor.hall_01) je pořád bezpečnostní entita.
+  if (CRITICAL_DEVICE_CLASSES.has(deviceClassOf(entity, state))) return true;
   return CRITICAL_TEXT_RE.test(textFor(entity, state));
 }
 
