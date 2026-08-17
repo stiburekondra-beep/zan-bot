@@ -58,7 +58,7 @@ const {
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
-const { getExpertiseLevel, setExpertiseLevel, renderCommunicationInstruction } = require('./communication-profile');
+const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
@@ -1426,6 +1426,18 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'set_communication_tone',
+      description: 'Nastaví REJSTŘÍK (tón), jakým Žán s touhle domácností mluví — ORTOGONÁLNÍ k úrovni odbornosti (ta řeší JAK SLOŽITĚ, tohle řeší JAKÝ TÓN). Tóny: butler (uctivý zdvořilý sluha, vykání), kamarad (pohodový, tykání), detsky (laskavý hravý pro dítě). Použij, když si člověk řekne „buď víc formální / uvolni se / mluv jako kamarád", nebo když víš, že mluví dítě (dite=true). Tón mění SLOVA, ne PRAVDU ani OPRÁVNĚNÍ — dětský tón NIKDY neodemkne citlivou akci (zámky, alarm, topení, nákup, mazání), ta pořád chce dospělé potvrzení. Identitu nefabuluj: když nevíš, kdo mluví, nenastavuj.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          ton: { type: 'string', enum: ['butler', 'kamarad', 'detsky'], description: 'butler = uctivý sluha, kamarad = pohodový, detsky = dětský' },
+          dite: { type: 'boolean', description: 'volitelně: true = aktuálně mluví dítě (aktivuje dětskou bezpečnostní hranu)' },
+        },
+        required: ['ton'],
+      },
+    },
+    {
       name: 'recall',
       description: 'Přečte paměť domu.',
       input_schema: {
@@ -2352,6 +2364,13 @@ async function executeTool(name, input, chatId) {
         if (!res.ok) return { error: res.error };
         saveMemory(memory);
         return { success: true, level: res.level, label: res.label };
+      }
+      case 'set_communication_tone': {
+        if (user.role === 'guest') return { error: 'Nastavení komunikace smí měnit jen rodina.' };
+        const res = setTon(memory, input.ton, input.dite);
+        if (!res.ok) return { error: res.error };
+        saveMemory(memory);
+        return { success: true, ton: res.ton, dite: res.dite, label: res.label };
       }
 
       case 'recall': {
