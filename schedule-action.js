@@ -100,6 +100,11 @@ function addScheduledAction(file, input, allowedDomains, now = new Date()) {
     data: input.data || null,
     message: input.message || null,
     media_player_entity_id: input.media_player_entity_id || null,
+    // Interní příznak pro pairing follow-up: exekutor u message-akce místo
+    // pouhého odeslání textu spustí reálnou kontrolu nových entit (viz
+    // schedulePairingFollowup / executeDueScheduledActions v bot.js).
+    pairing_check: input.pairing_check === true || null,
+    backend: input.backend || null,
     chat_id: input.chat_id,
     created_by: input.created_by || null,
     created_at: now.toISOString(),
