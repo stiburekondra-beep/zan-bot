@@ -1,21 +1,30 @@
 'use strict';
 // ═══════════════════════════════════════════════════════════════════════
 // KOMUNIKAČNÍ PROFIL DOMÁCNOSTI — jak Žán mluví k tomuhle zákazníkovi.
-// Karta 2026-08-16-programator-zana-07 (úrovně odbornosti).
+// Karta 2026-08-16-programator-zana-07 (úrovně odbornosti) + 2026-08-17-programator-zana-03 (tón).
 //
-// Ondrova definice = závazná (Telegram 16.8. 21:35): min. 3 úrovně:
-//   1 = laik (jeho 84letý děda), 2 = běžný člověk (kamarád, zvládá mobil),
-//   3 = technicky zdatný (AI nadšenec = dnešní default chování Žána na Ondru).
+// JEDNA persona vrstva, DVĚ ORTOGONÁLNÍ osy — obě žijí ve stejném
+// `memory.communication` objektu, jeden render, žádný druhý paralelní systém:
+//   • ODBORNOST (expertise_level 1–3) = JAK SLOŽITĚ/technicky Žán mluví (žargon
+//     vs. lidsky). Ondra 16.8.: 1 = laik/senior, 2 = běžný člověk, 3 = nadšenec.
+//   • TÓN (ton = butler | kamarad | detsky) = JAKÝ REJSTŘÍK má — uctivý sluha /
+//     pohodový kamarád / laskavý dětský. Ondra 17.8.: „nekdy britsky butler,
+//     nekdy kamos, k detem jinak nez k dospelim." Ortogonální: lze „prostě +
+//     kamarádsky" i „prostě + uctivě".
+//   • `dite` (bool) = aktuálně mluví dítě → dětský rejstřík + BEZPEČNOSTNÍ HRANA.
 //
-// Toto je JEDNA persona vrstva — záměrně strukturovaná tak, aby do stejného
-// `memory.communication` objektu později zapadl i TÓN (karta -03: butler /
-// kamarád / dětský) a příznak `dite`, BEZ druhého paralelního systému.
+// Úroveň ANI tón NEMĚNÍ PRAVDU: truth-guard a honesty guardy (actuation,
+// action-claim, house-map, area-alias) platí na VŠECH nastaveních beze změny.
+// Dětský tón NIKDY nezmírní oprávnění — citlivé akce (zámky, alarm, topení/HVAC,
+// nákup, mazání konfigurace) pořád vyžadují dospělé potvrzení. Hravost je
+// v JAZYCE, ne v OPRÁVNĚNÍCH.
 //
-// Úroveň mění TÓN a JAZYK, ne PRAVDU: truth-guard a honesty guardy (actuation,
-// action-claim, house-map, area-alias) platí na VŠECH úrovních beze změny.
-// Úroveň se drží per DOMÁCNOST v /config/zan_data/home_memory.json
-// (memory.communication.expertise_level), mimo git. Nastaví ji onboarding
-// nebo ruční přepnutí (tool set_communication_level / věta "mluv jednodušeji").
+// Profil se drží per DOMÁCNOST v /config/zan_data/home_memory.json
+// (memory.communication.{expertise_level, ton, dite}), mimo git. Nastaví ho
+// onboarding nebo ruční přepnutí (set_communication_level / set_communication_tone
+// / věta „mluv jednodušeji" / „buď víc formální"). Per-osoba volba tónu po hlase
+// je pozdější nadstavba nad speaker-ID (karta -07, zavřená koncept) — v1 jede
+// explicitní nastavení + fallback butler, identitu Žán nefabuluje.
 // ═══════════════════════════════════════════════════════════════════════
 
 // Bezpečný default pro cizí/neznámou domácnost = 2 (běžný člověk, bez žargonu,
@@ -50,17 +59,61 @@ const LEVELS = {
   },
 };
 
-// Věta, která JE u KAŽDÉ úrovně stejná — pojistka, že zjednodušení nikdy
-// nezamlčí problém. Contract test na ni asertuje pro všechny úrovně.
+// Bezpečný default tónu pro nový/neznámý profil = uctivý sluha (butler). Nikdy
+// nezačít „kamarádsky" (tykání neznámému může urazit) ani „dětsky" (fabulace
+// identity). Butler je zdvořilá jistota; teplý okruh si kamaráda nastaví sám.
+const DEFAULT_TON = 'butler';
+
+const TONES = {
+  butler: {
+    label: 'sluha / butler — uctivý, zdvořilý',
+    rule:
+      'Mluv jako zdvořilý sluha: vykej, klidně a uctivě, bez familiárnosti. ' +
+      'Oslovení zdvořilé, emoji střídmě nebo vůbec. Příklad rejstříku: „Rád ' +
+      'zařídím. Světla v obývaku jsou zhasnutá."',
+  },
+  kamarad: {
+    label: 'kamarád — pohodový, uvolněný',
+    rule:
+      'Mluv jako pohodový kamarád: uvolněně, tykání je v pořádku, klidně emoji, ' +
+      'ale pořád služebně a k věci. Příklad rejstříku: „Jasně, zhasínám. Hotovo 👍"',
+  },
+  detsky: {
+    label: 'dětský — laskavý, hravý, trpělivý',
+    rule:
+      'Mluv laskavě, jednoduše a hravě, trpělivě, povzbudivě. Žádná ironie, ' +
+      'sarkasmus ani nic nevhodného pro dítě. Příklad rejstříku: „Ahoj! Rozsvítím ' +
+      'ti v pokoji, ať vidíš. 🙂"',
+  },
+};
+
+// Věta, která JE u KAŽDÉHO nastavení stejná — pojistka, že zjednodušení ani tón
+// nikdy nezamlčí problém. Contract test na ni asertuje pro všechny úrovně i tóny.
 const TRUTH_INVARIANT =
-  'Úroveň mění TÓN a JAZYK, ne PRAVDU: železná pravidla, přiznání nejistoty ' +
-  'a honesty guardy platí na všech úrovních stejně — nikdy nezamlčuj problém ' +
-  'kvůli jednoduchosti a nefabuluj úspěch.';
+  'Úroveň ani tón mění TÓN a JAZYK, ne PRAVDU: železná pravidla, přiznání ' +
+  'nejistoty a honesty guardy platí na všech nastaveních stejně — nikdy ' +
+  'nezamlčuj problém kvůli jednoduchosti nebo hravosti a nefabuluj úspěch.';
+
+// Bezpečnostní hrana pro dětský tón / když mluví dítě. Přidává se do renderu JEN
+// při dite=true nebo ton=detsky — reinforcuje, NIKDY nezmírní, existující gate
+// (citlivé akce vyžadují výslovné potvrzení). Contract test asertuje, že dětské
+// nastavení oprávnění NEODEMYKÁ, jen jazyk.
+const CHILD_SAFETY_INVARIANT =
+  'DĚTSKÁ BEZPEČNOST: hravý/dětský tón nemění OPRÁVNĚNÍ. Citlivé akce — zámky, ' +
+  'alarm, zabezpečení, topení/klimatizace, nákup, mazání nebo psaní konfigurace ' +
+  '— pořád vyžadují potvrzení dospělého v této konverzaci. Dítěti je nikdy ' +
+  'neprováděj sám a nikdy je neusnadňuj kvůli tónu.';
 
 function normalizeLevel(value) {
   const n = Number(value);
   if (Number.isInteger(n) && n >= 1 && n <= 3) return n;
   return null;
+}
+
+function normalizeTon(value) {
+  if (typeof value !== 'string') return null;
+  const t = value.trim().toLowerCase();
+  return TONES[t] ? t : null;
 }
 
 // Přečti úroveň z paměti domácnosti; když není nastavená nebo je nevalidní,
@@ -70,34 +123,79 @@ function getExpertiseLevel(memory) {
   return normalizeLevel(raw) || DEFAULT_EXPERTISE_LEVEL;
 }
 
+// Přečti tón z paměti; nenastavený/nevalidní → bezpečný default (butler).
+// NIKDY nevyhazuj — čte se u každé zprávy.
+function getTon(memory) {
+  const raw = memory && memory.communication && memory.communication.ton;
+  return normalizeTon(raw) || DEFAULT_TON;
+}
+
+// Aktuálně mluví dítě? Explicitní `dite:true` NEBO ton=detsky (dětský rejstřík
+// implikuje dětskou bezpečnostní hranu). Fallback false — identitu nefabuluj.
+function isChild(memory) {
+  const c = memory && memory.communication;
+  if (!c) return false;
+  return c.dite === true || normalizeTon(c.ton) === 'detsky';
+}
+
+function ensureCommunication(memory) {
+  if (!memory.communication || typeof memory.communication !== 'object') memory.communication = {};
+  return memory.communication;
+}
+
 // Nastav úroveň per domácnost. Vytvoří memory.communication, když chybí, ale
 // NEPŘEPÍŠE ostatní klíče (forward-compat pro `ton`/`dite` z karty -03).
 function setExpertiseLevel(memory, level) {
   const n = normalizeLevel(level);
   if (!n) return { ok: false, error: 'Úroveň odbornosti musí být 1, 2 nebo 3.' };
-  if (!memory.communication || typeof memory.communication !== 'object') memory.communication = {};
-  memory.communication.expertise_level = n;
+  ensureCommunication(memory).expertise_level = n;
   return { ok: true, level: n, label: LEVELS[n].label };
 }
 
-// Blok do DYNAMICKÉHO (necachovaného) kontextu systémového promptu — úroveň se
+// Nastav TÓN (a volitelně příznak dítě) per domácnost. Píše do STEJNÉHO
+// `memory.communication` objektu vedle expertise_level — jedna persona vrstva,
+// NEPŘEPÍŠE úroveň odbornosti (contract test to asertuje).
+function setTon(memory, ton, dite) {
+  const t = normalizeTon(ton);
+  if (!t) return { ok: false, error: 'Tón musí být butler, kamarad nebo detsky.' };
+  const c = ensureCommunication(memory);
+  c.ton = t;
+  if (typeof dite === 'boolean') c.dite = dite;
+  else if (t === 'detsky') c.dite = true; // dětský rejstřík implikuje dětskou hranu
+  return { ok: true, ton: t, dite: c.dite === true, label: TONES[t].label };
+}
+
+// Blok do DYNAMICKÉHO (necachovaného) kontextu systémového promptu — profil se
 // liší per domácnost, proto NESMÍ jít do SYSTEM_STATIC (rozbil by prompt cache).
 function renderCommunicationInstruction(memory) {
   const level = getExpertiseLevel(memory);
+  const ton = getTon(memory);
   const info = LEVELS[level];
-  return [
+  const tone = TONES[ton];
+  const lines = [
     `ÚROVEŇ ODBORNOSTI ZÁKAZNÍKA: ${info.label}.`,
     info.rule,
+    `TÓN / REJSTŘÍK: ${tone.label}.`,
+    tone.rule,
     TRUTH_INVARIANT,
-  ].join('\n');
+  ];
+  if (isChild(memory)) lines.push(CHILD_SAFETY_INVARIANT);
+  return lines.join('\n');
 }
 
 module.exports = {
   LEVELS,
+  TONES,
   DEFAULT_EXPERTISE_LEVEL,
+  DEFAULT_TON,
   TRUTH_INVARIANT,
+  CHILD_SAFETY_INVARIANT,
   normalizeLevel,
+  normalizeTon,
   getExpertiseLevel,
+  getTon,
+  isChild,
   setExpertiseLevel,
+  setTon,
   renderCommunicationInstruction,
 };
