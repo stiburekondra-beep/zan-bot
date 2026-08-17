@@ -38,6 +38,15 @@ const RESTART_TOOLS = ['restart_ha'];
 // model tvrdí „rozsvítil jsem / hotovo", ale žádný aktuační tool se v kole
 // úspěšně neprovedl (typicky voice pipeline nebo model přeskočí tool call).
 const DEVICE_TOOLS = ['turn_on', 'turn_off', 'toggle', 'call_service'];
+// Párování / onboarding zařízení. Doplněno 2026-08-17 po živém incidentu
+// (karta -03, log 16.8. 08:58–09:00): Ondra opakovaně „zapni párování zigbee
+// dongle", zigbee_permit_join proběhl 5× ÚSPĚŠNĚ (result=ok, followup naplánován),
+// ALE guard ho neznal → deviceSatisfied=false → 4× po sobě přepsal Žánovo
+// legitimní „zapnul jsem párování" na „nic jsem neudělal". To je OPAČNÝ
+// false-positive (guard fabuluje NEúspěch reálně provedené akce) — přesně ta
+// „divná zpráva", co Ondra viděl. `zigbee_permit_join` je zásah do zařízení
+// (zapnutí párovacího režimu) a jeho úspěch legitimizuje „zapnul jsem párování".
+const PAIRING_TOOLS = ['zigbee_permit_join'];
 // Přehrávání médií. Doplněno 2026-08-12 po živém nálezu v labu: Ondra dvakrát
 // za sebou požádal „pusť na youtube traktory v blátě" a Žán podruhé odpověděl
 // „Hotovo! Traktory teď hrají na televizi", aniž by zavolal jediný nástroj —
@@ -97,7 +106,7 @@ function guardActionClaim(text, userMessage, actionCalls) {
   const calls = Array.isArray(actionCalls) ? actionCalls : [];
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
-  const deviceSatisfied = calls.some(c => c && c.ok && DEVICE_TOOLS.includes(c.name));
+  const deviceSatisfied = calls.some(c => c && c.ok && (DEVICE_TOOLS.includes(c.name) || PAIRING_TOOLS.includes(c.name)));
   const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
@@ -131,4 +140,4 @@ function guardActionClaim(text, userMessage, actionCalls) {
   return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia };
 }
 
-module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, MEDIA_TOOLS };
+module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, PAIRING_TOOLS, MEDIA_TOOLS };
