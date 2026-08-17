@@ -44,6 +44,7 @@ COPY entity-archive.js ./
 COPY tool-profiles.js ./
 COPY voice-channel.js ./
 COPY voice-response.js ./
+COPY communication-profile.js ./
 COPY service-onboarding.js ./
 COPY play-music.js ./
 COPY play-video.js ./

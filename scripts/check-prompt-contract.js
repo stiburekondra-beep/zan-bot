@@ -53,6 +53,11 @@ assertIncludes('nikdy nekonci pasivne', 'pairing must not end passively');
 assertIncludes('dej mi vedet / napis mi', 'pairing names passive wait phrases');
 assertIncludes('kdy se sam ozvu / co sam zkontroluju', 'pairing must announce own follow-up');
 assertIncludes('Hotovo, pridal jsem" smis rict az po overeni nove entity nebo uspesneho create_entry', 'pairing success requires verification');
+// Úroveň odbornosti zákazníka (karta 2026-08-16-programator-zana-07) se musí
+// dostat do promptu přes komunikační profil — jde do DYNAMICKÉHO bloku (per dům),
+// proto ji hlídáme jako wiring, ne jako statický text.
+assertRegex(/rendercommunicationinstruction\s*\(\s*memory\s*\)/, 'communication level instruction wired into dynamic context');
+
 assertIncludes('MISTNOST U NOVEHO ZARIZENI', 'new device area rule exists');
 assertIncludes('pouzivej presny nazev, ktery rekl', 'use user supplied area name');
 assertIncludes('Nesmis si ho potichu prelozit na jinou existujici mistnost', 'forbid silent area aliasing');
