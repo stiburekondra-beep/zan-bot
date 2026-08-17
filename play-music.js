@@ -64,7 +64,20 @@ function buildMusicServiceData({ query, mediaType, playerEntityId }) {
   };
 }
 
-async function playMusic({ input = {}, haGet, haPost, defaultPlayer }) {
+// Rozliší přechodnou chybu backendu (retryovat) od trvalé (neopakovat).
+// 5xx server error a 429 rate limit jsou přechodné; 4xx (špatný dotaz) ne,
+// aby se nezacyklila legitimní chyba typu „nenašel jsem skladbu". Žádná HTTP
+// odpověď (síť/timeout: ECONNABORTED, ETIMEDOUT, ECONNRESET…) = přechodné.
+function isTransientHaError(err) {
+  if (!err) return false;
+  const status = err.response && err.response.status;
+  if (typeof status === 'number') return status >= 500 || status === 429;
+  return true;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function playMusic({ input = {}, haGet, haPost, defaultPlayer, sleepMs = 400 }) {
   const query = normalizeQuery(input.query);
   if (!query) {
     return {
@@ -100,18 +113,65 @@ async function playMusic({ input = {}, haGet, haPost, defaultPlayer }) {
     return { success: false, error: payload.error };
   }
 
-  await haPost('services/music_assistant/play_media', payload.data);
+  // Odeslání povelu s 1 řízeným retry POUZE na přechodnou chybu backendu (500/timeout).
+  // haPost voláme s retries:0 (vypnutý vnitřní retry), opakování řídíme tady deterministicky;
+  // na 4xx neopakujeme, ať se nezacyklí legitimní „nenašel jsem skladbu".
+  let sendErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await haPost('services/music_assistant/play_media', payload.data, 0);
+      sendErr = null;
+      break;
+    } catch (e) {
+      sendErr = e;
+      if (!isTransientHaError(e) || attempt === 1) break;
+      await sleep(sleepMs);
+    }
+  }
+  if (sendErr) {
+    const transient = isTransientHaError(sendErr);
+    return {
+      success: false,
+      confirmed: false,
+      reason: transient ? 'backend_transient' : 'backend_error',
+      error: transient
+        ? 'Přehrávač teď nereaguje (dočasná chyba přehrávače).'
+        : 'Povel k přehrání se nepodařilo odeslat.',
+      query,
+      player_entity_id: player.entity_id,
+      next_step: transient
+        ? 'Zkus to prosím za chvíli znovu; pokud to bude přetrvávat, prověřím Music Assistant.'
+        : 'Prověřím nastavení Music Assistantu; zkus jiný dotaz nebo přehrávač.',
+    };
+  }
+
+  // Nefabulovat úspěch: „hraje" potvrdíme jen když to přehrávač po odeslání skutečně
+  // hlásí (playing/buffering). Krátká latence startu je normální (idle/paused/nečitelný
+  // stav) → povel odeslán, ale confirmed:false, žádné falešné selhání. Mrtvý přehrávač
+  // (unavailable/unknown/off) → poctivá výhrada místo holého „Pouštím".
   const postState = await haGet(`states/${player.entity_id}`).catch(() => null);
+  const rawState = postState ? String(postState.state || '') : '';
+  const s = rawState.toLowerCase();
+  const started = s === 'playing' || s === 'buffering';
+  const dead = s === 'unavailable' || s === 'unknown' || s === 'off';
+  let message;
+  if (started) {
+    message = `Pouštím ${query}.`;
+  } else if (dead) {
+    message = `Poslal jsem povel pustit ${query}, ale přehrávač je teď ${rawState} — nemusí hrát. Řekni, jestli se ozval zvuk.`;
+  } else {
+    message = `Pustil jsem ${query}.`;
+  }
   return {
     success: true,
-    confirmed: true,
+    confirmed: started,
     service: 'music_assistant.play_media',
     query,
     media_type: payload.data.media_type,
     player_entity_id: player.entity_id,
     player_source: player.source,
     player_state: postState ? postState.state : 'neověřeno',
-    message: `Pouštím ${query}.`,
+    message,
   };
 }
 

@@ -38,6 +38,15 @@ const RESTART_TOOLS = ['restart_ha'];
 // model tvrdí „rozsvítil jsem / hotovo", ale žádný aktuační tool se v kole
 // úspěšně neprovedl (typicky voice pipeline nebo model přeskočí tool call).
 const DEVICE_TOOLS = ['turn_on', 'turn_off', 'toggle', 'call_service'];
+// Párování / onboarding zařízení. Doplněno 2026-08-17 po živém incidentu
+// (karta -03, log 16.8. 08:58–09:00): Ondra opakovaně „zapni párování zigbee
+// dongle", zigbee_permit_join proběhl 5× ÚSPĚŠNĚ (result=ok, followup naplánován),
+// ALE guard ho neznal → deviceSatisfied=false → 4× po sobě přepsal Žánovo
+// legitimní „zapnul jsem párování" na „nic jsem neudělal". To je OPAČNÝ
+// false-positive (guard fabuluje NEúspěch reálně provedené akce) — přesně ta
+// „divná zpráva", co Ondra viděl. `zigbee_permit_join` je zásah do zařízení
+// (zapnutí párovacího režimu) a jeho úspěch legitimizuje „zapnul jsem párování".
+const PAIRING_TOOLS = ['zigbee_permit_join'];
 // Přehrávání médií. Doplněno 2026-08-12 po živém nálezu v labu: Ondra dvakrát
 // za sebou požádal „pusť na youtube traktory v blátě" a Žán podruhé odpověděl
 // „Hotovo! Traktory teď hrají na televizi", aniž by zavolal jediný nástroj —
@@ -66,11 +75,19 @@ const CONFIG_PHRASE = /(balíč\w*|automatiz\w*|package|dashboard)\s+(?:už\s+)?
 const RESTART_DONE = /\brestartoval[ao]?\s+jsem\b|\b(?:home\s*assistant|ha)\s+(?:se\s+)?(?:právě\s+|už\s+)?(?:byl\s+)?restartov\w+/i;
 
 // (1'') Uživatel právě žádá ovládání běžného zařízení v domě. Držíme rozkazové
-// tvary a běžné domácí formulace; dotazy na stav („svítí?") sem nepatří.
-const USER_DEVICE_INTENT = /(?<![\p{L}])(zapni|vypni|rozsviť|rozsvit|zhasni|přepni|prepn[ií]|sepni|vytáhni|vytahni|zatáhni|zatahni|otevři|otevri|zavři|zavri|nastav|dej|udělej|udelej)\p{L}*/iu;
-// (2'') Odpověď tvrdí hotovou aktuaci. Vyžadujeme zároveň DEVICE_NOUN, aby
-// běžné „hotovo" u ne-domácí akce nespouštělo false-positive.
-const DEVICE_DONE = /(?<![\p{L}])(hotovo|zapnul\w*\s+jsem|vypnul\w*\s+jsem|rozsvítil\w*\s+jsem|rozsvitil\w*\s+jsem|zhasl\w*\s+jsem|přepnul\w*\s+jsem|prepnul\w*\s+jsem|sepnul\w*\s+jsem|otevřel\w*\s+jsem|otevrel\w*\s+jsem|zavřel\w*\s+jsem|zavrel\w*\s+jsem|nastavil\w*\s+jsem|je\s+(?:teď\s+|ted\s+|už\s+|uz\s+)?(?:zapnut\w*|vypnut\w*|rozsvícen\w*|rozsvicen\w*|zhasnut\w*|otevřen\w*|otevren\w*|zavřen\w*|zavren\w*)|svítí|sviti|nesvítí|nesviti)/iu;
+// I infinitivní tvary (přes hlas je běžná zdvořilá žádost „můžeš rozsvítit?")
+// a běžné domácí formulace; dotazy na stav („svítí?") sem nepatří. Pozn.:
+// infinitiv se nedá odvodit z rozkazu (í≠i, „zapnout"≠„zapni") → vypsat zvlášť.
+const USER_DEVICE_INTENT = /(?<![\p{L}])(zapni|zapnout|vypni|vypnout|rozsviť|rozsvit|rozsvítit|rozsvitit|zhasni|zhasnout|přepni|prepn[ií]|přepnout|prepnout|sepni|sepnout|vytáhni|vytahni|vytáhnout|vytahnout|zatáhni|zatahni|zatáhnout|zatahnout|otevři|otevri|otevřít|otevrit|zavři|zavri|zavřít|zavrit|nastav|nastavit|dej|udělej|udelej)\p{L}*/iu;
+// (2'') Odpověď tvrdí hotovou aktuaci. Dva kbelíky (díra 1, tester 2026-08-15):
+//   STRONG = inherentně device-verby (rozsvítil/zhasl/přepnul/sepnul/vytáhl/
+//     zatáhl jsem) — noun v ODPOVĚDI NEPOTŘEBUJÍ. Krátká hlasová odpověď
+//     „Zhasl jsem 👍" noun běžně vynechá; guard jinak leakoval přesně u voice.
+//   AMBIG = nejednoznačné tokeny (hotovo / zapnul-vypnul-otevřel-zavřel jsem /
+//     stavové fráze / svítí) — vyžadují DEVICE_NOUN, aby „hotovo" u ne-domácí
+//     akce nespustilo false-positive.
+const DEVICE_DONE_STRONG = /(?<![\p{L}])(rozsvítil\w*\s+jsem|rozsvitil\w*\s+jsem|zhasl\w*\s+jsem|zhasnul\w*\s+jsem|přepnul\w*\s+jsem|prepnul\w*\s+jsem|sepnul\w*\s+jsem|vytáhl\w*\s+jsem|vytahl\w*\s+jsem|zatáhl\w*\s+jsem|zatahl\w*\s+jsem)/iu;
+const DEVICE_DONE_AMBIG = /(?<![\p{L}])(hotovo|zapnul\w*\s+jsem|vypnul\w*\s+jsem|otevřel\w*\s+jsem|otevrel\w*\s+jsem|zavřel\w*\s+jsem|zavrel\w*\s+jsem|nastavil\w*\s+jsem|je\s+(?:teď\s+|ted\s+|už\s+|uz\s+)?(?:zapnut\w*|vypnut\w*|rozsvícen\w*|rozsvicen\w*|zhasnut\w*|otevřen\w*|otevren\w*|zavřen\w*|zavren\w*)|svítí|sviti|nesvítí|nesviti)/iu;
 const DEVICE_NOUN = /(svět|svet|svítidl|svitidl|lamp|žárovk|zarovk|led|zásuvk|zasuvk|switch|vypínač|vypinac|rolety|rolet|žaluzi|zaluzi|vrat|garáž|garaz|ventil|čerpadl|cerpadl|topen|klimatiz|climate|light|cover|fan)/i;
 
 // (1'') Uživatel právě žádá přehrání nebo ovládání přehrávání.
@@ -97,13 +114,13 @@ function guardActionClaim(text, userMessage, actionCalls) {
   const calls = Array.isArray(actionCalls) ? actionCalls : [];
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
-  const deviceSatisfied = calls.some(c => c && c.ok && DEVICE_TOOLS.includes(c.name));
+  const deviceSatisfied = calls.some(c => c && c.ok && (DEVICE_TOOLS.includes(c.name) || PAIRING_TOOLS.includes(c.name)));
   const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
   const configClaim = (VERB_DONE.test(text) && CONFIG_NOUN.test(text)) || CONFIG_PHRASE.test(text);
   const restartClaim = RESTART_DONE.test(text);
-  const deviceClaim = DEVICE_DONE.test(text) && DEVICE_NOUN.test(text);
+  const deviceClaim = DEVICE_DONE_STRONG.test(text) || (DEVICE_DONE_AMBIG.test(text) && DEVICE_NOUN.test(text));
   const mediaClaim = MEDIA_DONE.test(text) && MEDIA_NOUN.test(text);
 
   // (1) požádal o něj uživatel v tomhle kole? + (3) neproběhl nástroj?
@@ -131,4 +148,4 @@ function guardActionClaim(text, userMessage, actionCalls) {
   return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia };
 }
 
-module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, MEDIA_TOOLS };
+module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, PAIRING_TOOLS, MEDIA_TOOLS };

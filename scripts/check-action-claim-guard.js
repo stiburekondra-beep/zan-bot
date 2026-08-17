@@ -12,6 +12,8 @@ const TURN_ON_OK = [{ name: 'turn_on', ok: true }];
 const TURN_ON_FAIL = [{ name: 'turn_on', ok: false }];
 const CALL_SERVICE_OK = [{ name: 'call_service', ok: true }];
 const ENTITY_ARCHIVE_OK = [{ name: 'entity_archive', ok: true }];
+const PERMIT_JOIN_OK = [{ name: 'zigbee_permit_join', ok: true }];
+const PERMIT_JOIN_FAIL = [{ name: 'zigbee_permit_join', ok: false }];
 
 // ── 1) PŘESNÁ repro věta z bugu (msg #3): undo bez tool callu → FIRE ──────────
 const bug1 = 'Vrátil jsem poslední zápis — balíček je smazaný a HA ho už nezná.';
@@ -169,4 +171,75 @@ assert.strictEqual(
   '22b: úspěšný entity_archive legitimizuje tvrzení o archivaci',
 );
 
-console.log('check-action-claim-guard: OK (22 scénářů)');
+// ── 23) DÍRA 1 (tester 2026-08-15): krátká hlasová odpověď se silným device-verbem
+//        BEZ noun v odpovědi → musí FIRE (dřív noun-gate leakoval u voice) ──────
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem 👍', 'zhasni v obýváku', NONE).changed,
+  true,
+  '23a: „Zhasl jsem 👍" (silný verb, bez noun, žádný tool) = fabrikace',
+);
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem 💡', 'rozsviť v obýváku', NONE).changed,
+  true,
+  '23b: „Rozsvítil jsem 💡" bez noun = fabrikace',
+);
+assert.strictEqual(
+  guardActionClaim('Přepnul jsem.', 'přepni světlo', NONE).changed,
+  true,
+  '23c: „Přepnul jsem" bez noun = fabrikace',
+);
+// úspěšný tool silný verb legitimizuje i bez noun
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem 👍', 'zhasni v obýváku', TURN_ON_OK).changed,
+  false,
+  '23d: po úspěšném toolu je „Zhasl jsem" legitimní',
+);
+
+// ── 24) DÍRA 2 (tester 2026-08-15): infinitivní žádost uživatele → gate 1 chytne
+assert.strictEqual(
+  guardActionClaim('Rozsvítil jsem světlo 💡', 'můžeš rozsvítit světlo?', NONE).changed,
+  true,
+  '24a: infinitiv „můžeš rozsvítit" + fabrikace = fire',
+);
+assert.strictEqual(
+  guardActionClaim('Zhasl jsem světlo.', 'jde zhasnout v ložnici?', NONE).changed,
+  true,
+  '24b: infinitiv „jde zhasnout" + fabrikace = fire',
+);
+
+// ── 25) FALSE-POSITIVE OBRANA (díra 1): „hotovo" u ne-domácí akce zůstává gated
+//        na DEVICE_NOUN — bez noun a bez device intentu se nesmí měnit ──────────
+assert.strictEqual(
+  guardActionClaim('Hotovo, mám to zapsané.', 'poznamenej si, že jedu v pátek pryč', NONE).changed,
+  false,
+  '25: „Hotovo" bez device noun a bez device intentu se nesmí přepsat',
+);
+assert.strictEqual(
+  guardActionClaim('Vrátil jsem se k tomu a je to opravené.', 'zapni to zpátky', NONE).changed,
+  false,
+  '25b: „vrátil jsem se" (reflexivní) není device claim ani se silným kbelíkem',
+);
+
+// ── 26) Živý incident 16.8. (karta -03): „zapni párování" + úspěšný ──────────
+//        zigbee_permit_join → guard NEsmí přepsat na „nic jsem neudělal".
+//        Před fixem 4× po sobě false-positive (permit_join ok, ale neuznaný).
+const pairText = 'Zapnul jsem párování na 60 sekund. Teď na tom switchi v obýváku stiskni reset tlačítko.';
+assert.strictEqual(
+  guardActionClaim(pairText, 'ty světla musíme napárovat znovu, zapni párování', PERMIT_JOIN_OK).changed,
+  false,
+  '26a: úspěšný zigbee_permit_join legitimizuje „zapnul jsem párování" (repro incidentu 16.8.)',
+);
+// Kontrola, že fixtura diskriminuje: BEZ toolu je to reálná fabrikace párování.
+assert.strictEqual(
+  guardActionClaim(pairText, 'ty světla musíme napárovat znovu, zapni párování', NONE).changed,
+  true,
+  '26b: tvrzení „zapnul jsem párování" bez proběhlého permit_join = fabrikace',
+);
+// Kontrola case (b): permit_join zavolán, ale SELHAL (offline bridge) → fabrikace.
+assert.strictEqual(
+  guardActionClaim(pairText, 'zapni párování zigbee dongle', PERMIT_JOIN_FAIL).changed,
+  true,
+  '26c: neúspěšný permit_join + tvrzení „zapnul jsem" = fabrikace (bridge offline)',
+);
+
+console.log('check-action-claim-guard: OK (28 scénářů)');
