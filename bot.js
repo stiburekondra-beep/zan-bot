@@ -58,6 +58,7 @@ const {
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
+const { getExpertiseLevel, setExpertiseLevel, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
@@ -1414,6 +1415,17 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'set_communication_level',
+      description: 'Nastaví, jak odborně má Žán s touhle domácností mluvit (per dům, uloží se do paměti). Úroveň 1 = laik / senior (žádný technický žargon), 2 = běžný člověk (přátelsky, bez balastu), 3 = technicky zdatný (entity, verze, ID). Použij, když si člověk řekne „mluv se mnou jednodušeji / víc technicky" nebo to vyjde z onboardingu. Úroveň mění jen TÓN a JAZYK, ne pravdu.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          level: { type: 'number', enum: [1, 2, 3], description: '1 = laik, 2 = běžný člověk, 3 = technicky zdatný' },
+        },
+        required: ['level'],
+      },
+    },
+    {
       name: 'recall',
       description: 'Přečte paměť domu.',
       input_schema: {
@@ -2333,6 +2345,13 @@ async function executeTool(name, input, chatId) {
         }
         saveMemory(memory);
         return { success: true };
+      }
+      case 'set_communication_level': {
+        if (user.role === 'guest') return { error: 'Nastavení komunikace smí měnit jen rodina.' };
+        const res = setExpertiseLevel(memory, input.level);
+        if (!res.ok) return { error: res.error };
+        saveMemory(memory);
+        return { success: true, level: res.level, label: res.label };
       }
 
       case 'recall': {
@@ -3788,8 +3807,10 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
     .slice(0, 8)
     .map(r => `${r.id}: ${r.text} @ ${r.due_at_input || r.due_at}`)
     .join(' | ');
+  const communicationInstruction = renderCommunicationInstruction(memory);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${displayHomeName}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
+${communicationInstruction}
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : user.role === 'guest' ? 'host — rodinná data a nástroje domu skryté' : 'uživatel — může ovládat zařízení, ne YAML'})
 ${householdContext}
