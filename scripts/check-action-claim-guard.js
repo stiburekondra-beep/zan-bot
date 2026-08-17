@@ -12,6 +12,8 @@ const TURN_ON_OK = [{ name: 'turn_on', ok: true }];
 const TURN_ON_FAIL = [{ name: 'turn_on', ok: false }];
 const CALL_SERVICE_OK = [{ name: 'call_service', ok: true }];
 const ENTITY_ARCHIVE_OK = [{ name: 'entity_archive', ok: true }];
+const PERMIT_JOIN_OK = [{ name: 'zigbee_permit_join', ok: true }];
+const PERMIT_JOIN_FAIL = [{ name: 'zigbee_permit_join', ok: false }];
 
 // ── 1) PŘESNÁ repro věta z bugu (msg #3): undo bez tool callu → FIRE ──────────
 const bug1 = 'Vrátil jsem poslední zápis — balíček je smazaný a HA ho už nezná.';
@@ -218,4 +220,26 @@ assert.strictEqual(
   '25b: „vrátil jsem se" (reflexivní) není device claim ani se silným kbelíkem',
 );
 
-console.log('check-action-claim-guard: OK (25 scénářů)');
+// ── 26) Živý incident 16.8. (karta -03): „zapni párování" + úspěšný ──────────
+//        zigbee_permit_join → guard NEsmí přepsat na „nic jsem neudělal".
+//        Před fixem 4× po sobě false-positive (permit_join ok, ale neuznaný).
+const pairText = 'Zapnul jsem párování na 60 sekund. Teď na tom switchi v obýváku stiskni reset tlačítko.';
+assert.strictEqual(
+  guardActionClaim(pairText, 'ty světla musíme napárovat znovu, zapni párování', PERMIT_JOIN_OK).changed,
+  false,
+  '26a: úspěšný zigbee_permit_join legitimizuje „zapnul jsem párování" (repro incidentu 16.8.)',
+);
+// Kontrola, že fixtura diskriminuje: BEZ toolu je to reálná fabrikace párování.
+assert.strictEqual(
+  guardActionClaim(pairText, 'ty světla musíme napárovat znovu, zapni párování', NONE).changed,
+  true,
+  '26b: tvrzení „zapnul jsem párování" bez proběhlého permit_join = fabrikace',
+);
+// Kontrola case (b): permit_join zavolán, ale SELHAL (offline bridge) → fabrikace.
+assert.strictEqual(
+  guardActionClaim(pairText, 'zapni párování zigbee dongle', PERMIT_JOIN_FAIL).changed,
+  true,
+  '26c: neúspěšný permit_join + tvrzení „zapnul jsem" = fabrikace (bridge offline)',
+);
+
+console.log('check-action-claim-guard: OK (28 scénářů)');
