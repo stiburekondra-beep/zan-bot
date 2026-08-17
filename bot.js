@@ -64,7 +64,7 @@ const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
-const { buildPairingNotification, buildPairingReminderMessage } = require('./pairing-followup');
+const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, buildPairingCheckMessage } = require('./pairing-followup');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -823,7 +823,12 @@ function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTo
     due_at: due.toISOString(),
     action_type: 'message',
     description: `zkontrolovat párování ${backend || 'zařízení'}`,
-    message: buildPairingReminderMessage({ backend, duration, verifyTool }),
+    // Fallback text (použije se, jen když reálná kontrola při doběhnutí selže);
+    // pairing_check říká exekutoru, ať místo pouhého odeslání textu skutečně
+    // zavolá kontrolu nových entit a pošle VÝSLEDEK.
+    message: buildPairingReminderMessage({ backend, duration }),
+    pairing_check: true,
+    backend: backend || null,
     chat_id: chatId,
     created_by: userName || 'Žán',
   }, ALLOWED_DOMAINS);
@@ -2533,7 +2538,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zigbee2mqtt',
-              message: `✅ Párování zapnuto (Zigbee2MQTT) na ${duration} s. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Párování zapnuto (Zigbee2MQTT) na ${duration} s.${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -2549,7 +2554,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zha',
-              message: `✅ Párování zapnuto na ${duration} s (ZHA). Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Párování zapnuto na ${duration} s (ZHA).${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -2561,7 +2566,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zigbee2mqtt/mqtt',
-              message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT.${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -5280,7 +5285,21 @@ async function executeDueScheduledActions() {
         if (!ALLOWED_DOMAINS.includes(action.domain)) throw new Error(`Doména ${action.domain} už není povolena.`);
         await haPost(`services/${action.domain}/${action.service}`, action.data || {});
       } else if (action.action_type === 'message') {
-        await sendSafe(action.chat_id, `🕐 ${action.message}`);
+        let text = action.message;
+        if (action.pairing_check) {
+          // Reálná kontrola nových entit místo pouhého slibu — splní to, co
+          // reminder říká. Selhání kontroly = poctivý fallback text (pobídka),
+          // NIKDY fabulovaný „hotovo".
+          try {
+            const res = await runPairingCheck({
+              haGet,
+              getKnown: () => memory.known_entities,
+              setKnown: (v) => { memory.known_entities = v; saveMemory(memory); },
+            });
+            text = buildPairingCheckMessage({ backend: action.backend, count: res.count, entities: res.entities });
+          } catch { text = action.message; }
+        }
+        await sendSafe(action.chat_id, `🕐 ${text}`);
       } else if (action.action_type === 'announce') {
         const result = await announceHome(haPost, {
           message: action.message,
