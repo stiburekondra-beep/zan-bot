@@ -4,7 +4,7 @@ const { PROFILES, VOICE_CONTROL_TOOLS, resolveProfile, filterToolsByProfile } = 
 
 // Syntetické pole nástrojů (jména stačí — filtr pracuje nad .name).
 const fullTools = [
-  'get_states', 'get_state', 'get_areas', 'turn_on', 'turn_off', 'toggle',
+  'get_states', 'get_state', 'get_areas', 'check_temperature', 'turn_on', 'turn_off', 'toggle',
   'call_service', 'schedule_action', 'announce_home', 'play_music', 'play_video',
   'read_cookbook',
   'garden_map', 'remember', 'recall', 'house_map', 'rodina_update',
@@ -35,7 +35,7 @@ assert.deepStrictEqual(
 for (const forbidden of ['write_package', 'delete_package', 'write_dashboard', 'restart_ha', 'onboard_device', 'rodina_update', 'remember']) {
   assert.ok(!voiceNames.includes(forbidden), `hlasový profil NESMÍ obsahovat ${forbidden}`);
 }
-assert.ok(voiceNames.length <= 12, 'hlasový profil je malý (≤12 nástrojů)');
+assert.ok(voiceNames.length <= 13, 'hlasový profil je malý (≤13 nástrojů)');
 
 // ── 4) STABILITA per kanál (prompt cache): dvě volání = identické pole ──
 const a = filterToolsByProfile(fullTools, 'ovladani').map((t) => t.name);

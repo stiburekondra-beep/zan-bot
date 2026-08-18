@@ -40,7 +40,8 @@
     "test:play-video": "node scripts/check-play-video.js",
     "test:dockerfile-modules": "node scripts/check-dockerfile-modules.js",
     "test:model-request-options": "node scripts/check-model-request-options.js",
-    "test:pairing-followup": "node scripts/check-pairing-followup.js"
+    "test:pairing-followup": "node scripts/check-pairing-followup.js",
+    "test:temperature-sense": "node scripts/check-temperature-sense.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

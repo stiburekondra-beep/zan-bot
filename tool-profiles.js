@@ -22,6 +22,7 @@ const VOICE_CONTROL_TOOLS = [
   'get_states',
   'get_state',
   'get_areas',
+  'check_temperature',
   'turn_on',
   'turn_off',
   'toggle',
