@@ -5,6 +5,35 @@ const WIFI_RE = /wifi|wi-fi|wlan|tapo|shelly|esphome|tuya|ewelink|sonoff|yeeligh
 const MATTER_RE = /matter|thread/i;
 const BRIDGE_RE = /bridge|coordinator|hub|gateway|zbbridge|zigbee2mqtt|zha/i;
 
+// Zigbee LQI je 0–255 (Z2M `linkquality`, ZHA LQI diagnostika). Pod prahem = slabý spoj.
+// Konzervativně 50: nižší číslo hlásíme jako slabý signál (kandidát na router), ať
+// nefalšujeme poplach u zařízení, které jen o kousek klesne. Neznámé LQI = mlčet.
+const WEAK_LQI_THRESHOLD = 50;
+const LQI_ATTR_KEYS = ['linkquality', 'link_quality', 'lqi'];
+const LQI_ENTITY_RE = /(_|\.)(lqi|linkquality|link_quality)$/i;
+
+// Přečti LQI (sílu Zigbee spoje) z atributů entit zařízení, případně z diagnostické
+// entity `*_lqi`/`*_linkquality`. Vrací celé číslo 0–255 nebo null (neznámé → nefabulovat).
+function extractLqi(entities = [], statesById) {
+  const values = [];
+  for (const entity of entities) {
+    const state = statesById?.get(entity.entity_id);
+    if (!state) continue;
+    const attrs = state.attributes || {};
+    for (const key of LQI_ATTR_KEYS) {
+      const n = Number(attrs[key]);
+      if (Number.isFinite(n) && n >= 0 && n <= 255) values.push(n);
+    }
+    if (LQI_ENTITY_RE.test(entity.entity_id) && !isUnavailableState(state)) {
+      const n = Number(state.state);
+      if (Number.isFinite(n) && n >= 0 && n <= 255) values.push(n);
+    }
+  }
+  if (!values.length) return null;
+  // Zařízení může mít víc entit se stejným LQI; vezmi nejnižší (nejhorší spoj).
+  return Math.min(...values);
+}
+
 function stateAgeMs(state, now = Date.now()) {
   const t = Date.parse(state?.last_changed || state?.last_updated || '');
   return Number.isFinite(t) ? Math.max(0, now - t) : Infinity;
@@ -85,6 +114,8 @@ function summarizeDevice({ device, entities, statesById, areaNameById, roomByAre
   const transport = inferTransport(device, entities);
   const name = device.name_by_user || device.name || entities[0]?.name || entities[0]?.original_name || device.id || 'Neznámé zařízení';
   const bridgeLike = bridgeDeviceIds?.has(device.id) || BRIDGE_RE.test(words(name, device.manufacturer, device.model));
+  // LQI čteme jen u Zigbee zařízení, která nejsou sama bridge/koordinátor.
+  const lqi = transport === 'zigbee' && !bridgeLike ? extractLqi(entities, statesById) : null;
 
   return {
     device_id: device.id || null,
@@ -99,6 +130,8 @@ function summarizeDevice({ device, entities, statesById, areaNameById, roomByAre
     room_name: room?.name || '',
     transport,
     bridge_like: bridgeLike,
+    lqi,
+    lqi_weak: Number.isFinite(lqi) && lqi < WEAK_LQI_THRESHOLD,
     entity_count: entityStates.length,
     unavailable_count: unavailableEntities.length,
     unavailable_entities: unavailableEntities.map(e => ({
@@ -118,6 +151,12 @@ function fallbackEntityDevices({ states = [], areaNameById, roomByArea, now, min
       const areaId = s.attributes?.area_id || null;
       const room = areaId ? roomByArea.get(areaId) : null;
       const ageMs = stateAgeMs(s, now);
+      const transport = inferTransport({}, [{ entity_id: s.entity_id, name: s.attributes?.friendly_name }]);
+      const bridgeLike = BRIDGE_RE.test(s.attributes?.friendly_name || s.entity_id);
+      const statesById = new Map([[s.entity_id, s]]);
+      const lqi = transport === 'zigbee' && !bridgeLike
+        ? extractLqi([{ entity_id: s.entity_id }], statesById)
+        : null;
       return {
         device_id: null,
         name: s.attributes?.friendly_name || s.entity_id,
@@ -128,8 +167,10 @@ function fallbackEntityDevices({ states = [], areaNameById, roomByArea, now, min
         area_name: areaId ? (areaNameById.get(areaId) || areaId) : 'Bez místnosti',
         room_id: room?.id || '',
         room_name: room?.name || '',
-        transport: inferTransport({}, [{ entity_id: s.entity_id, name: s.attributes?.friendly_name }]),
-        bridge_like: BRIDGE_RE.test(s.attributes?.friendly_name || s.entity_id),
+        transport,
+        bridge_like: bridgeLike,
+        lqi,
+        lqi_weak: Number.isFinite(lqi) && lqi < WEAK_LQI_THRESHOLD,
         entity_count: 1,
         unavailable_count: isUnavailableState(s) && ageMs >= minAgeMs ? 1 : 0,
         unavailable_entities: isUnavailableState(s) && ageMs >= minAgeMs ? [{
@@ -177,6 +218,29 @@ function diagnose(devices) {
     });
   }
 
+  // Slabý signál z MĚŘENÉHO LQI (ne z dead-device vzorce). Jen když bridge běží
+  // — u mrtvého bridge má přednost bridge_down_first (nekupovat router naslepo).
+  const weakSignal = devices.filter(d => d.transport === 'zigbee' && d.lqi_weak);
+  if (bridgeDown.length === 0 && weakSignal.length > 0) {
+    const weakByArea = new Map();
+    for (const d of weakSignal) {
+      const key = d.room_name || d.area_name || 'Bez místnosti';
+      if (!weakByArea.has(key)) weakByArea.set(key, []);
+      weakByArea.get(key).push(d);
+    }
+    for (const [areaName, areaDevices] of weakByArea.entries()) {
+      const worst = Math.min(...areaDevices.map(d => d.lqi));
+      recommendations.push({
+        type: 'zigbee_weak_signal',
+        severity: 'info',
+        title: `Slabý Zigbee signál v zóně ${areaName}`,
+        detail: `${areaDevices.length} Zigbee zařízení má slabý spoj (nejnižší LQI ${worst}/255, práh ${WEAK_LQI_THRESHOLD}). Zařízení odpovídá, ale spoj je na hraně.`,
+        next_step: `Zvážit Zigbee router/napájenou zásuvku mezi bridge a zónu ${areaName} pro posílení meshe. Read-only doporučení, nekupovat bez potvrzení.`,
+        devices: areaDevices.map(d => ({ name: d.name, lqi: d.lqi })),
+      });
+    }
+  }
+
   if (unavailable.length > 0 && recommendations.length === 0) {
     recommendations.push({
       type: 'check_device_or_integration',
@@ -187,7 +251,7 @@ function diagnose(devices) {
     });
   }
 
-  return { unavailable, bridge_down: bridgeDown, zigbee_unavailable: zigbeeUnavailable, recommendations };
+  return { unavailable, bridge_down: bridgeDown, zigbee_unavailable: zigbeeUnavailable, weak_signal: weakSignal, recommendations };
 }
 
 function buildDeviceLayoutSnapshot(input = {}) {
@@ -240,6 +304,7 @@ function buildDeviceLayoutSnapshot(input = {}) {
       unavailable_devices: diagnosis.unavailable.length,
       zigbee_unavailable: diagnosis.zigbee_unavailable.length,
       bridge_down: diagnosis.bridge_down.length,
+      zigbee_weak_signal: diagnosis.weak_signal.length,
       rooms_from_house_map: Array.isArray(houseMap.rooms) ? houseMap.rooms.length : 0,
     },
     devices,
@@ -263,7 +328,8 @@ function formatDeviceLayout(snapshot, opts = {}) {
     const place = d.room_name || d.area_name || 'bez místnosti';
     const hw = [d.manufacturer, d.model].filter(Boolean).join(' ');
     const un = d.unavailable_entities.map(e => `${e.name} ${e.age}`).join(', ');
-    lines.push(`- ${d.name} (${place}, ${d.transport}${hw ? `, ${hw}` : ''})${un ? `: nedostupné ${un}` : ''}`);
+    const sig = Number.isFinite(d.lqi) ? `, signál LQI ${d.lqi}/255${d.lqi_weak ? ' (slabý)' : ''}` : '';
+    lines.push(`- ${d.name} (${place}, ${d.transport}${hw ? `, ${hw}` : ''}${sig})${un ? `: nedostupné ${un}` : ''}`);
   }
 
   if (snapshot.diagnosis.recommendations.length > 0) {

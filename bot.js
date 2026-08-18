@@ -49,6 +49,13 @@ const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 const { buildDeviceLayoutSnapshot, formatDeviceLayout } = require('./device-layout');
 const {
+  resolveAreaId: senseResolveAreaId,
+  pickTemperatureSensors,
+  computeTrend: senseComputeTrend,
+  buildTemperatureVerdict,
+  historyToPoints,
+} = require('./temperature-sense');
+const {
   buildEntityArchiveCandidates,
   archiveEntity,
   restoreEntity,
@@ -58,12 +65,13 @@ const {
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler } = require('./voice-channel');
 const { sanitizeVoiceResponse } = require('./voice-response');
+const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
-const { buildPairingNotification, buildPairingReminderMessage } = require('./pairing-followup');
+const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, buildPairingCheckMessage } = require('./pairing-followup');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -822,7 +830,12 @@ function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTo
     due_at: due.toISOString(),
     action_type: 'message',
     description: `zkontrolovat párování ${backend || 'zařízení'}`,
-    message: buildPairingReminderMessage({ backend, duration, verifyTool }),
+    // Fallback text (použije se, jen když reálná kontrola při doběhnutí selže);
+    // pairing_check říká exekutoru, ať místo pouhého odeslání textu skutečně
+    // zavolá kontrolu nových entit a pošle VÝSLEDEK.
+    message: buildPairingReminderMessage({ backend, duration }),
+    pairing_check: true,
+    backend: backend || null,
     chat_id: chatId,
     created_by: userName || 'Žán',
   }, ALLOWED_DOMAINS);
@@ -1414,6 +1427,29 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'set_communication_level',
+      description: 'Nastaví, jak odborně má Žán s touhle domácností mluvit (per dům, uloží se do paměti). Úroveň 1 = laik / senior (žádný technický žargon), 2 = běžný člověk (přátelsky, bez balastu), 3 = technicky zdatný (entity, verze, ID). Použij, když si člověk řekne „mluv se mnou jednodušeji / víc technicky" nebo to vyjde z onboardingu. Úroveň mění jen TÓN a JAZYK, ne pravdu.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          level: { type: 'number', enum: [1, 2, 3], description: '1 = laik, 2 = běžný člověk, 3 = technicky zdatný' },
+        },
+        required: ['level'],
+      },
+    },
+    {
+      name: 'set_communication_tone',
+      description: 'Nastaví REJSTŘÍK (tón), jakým Žán s touhle domácností mluví — ORTOGONÁLNÍ k úrovni odbornosti (ta řeší JAK SLOŽITĚ, tohle řeší JAKÝ TÓN). Tóny: butler (uctivý zdvořilý sluha, vykání), kamarad (pohodový, tykání), detsky (laskavý hravý pro dítě). Použij, když si člověk řekne „buď víc formální / uvolni se / mluv jako kamarád", nebo když víš, že mluví dítě (dite=true). Tón mění SLOVA, ne PRAVDU ani OPRÁVNĚNÍ — dětský tón NIKDY neodemkne citlivou akci (zámky, alarm, topení, nákup, mazání), ta pořád chce dospělé potvrzení. Identitu nefabuluj: když nevíš, kdo mluví, nenastavuj.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          ton: { type: 'string', enum: ['butler', 'kamarad', 'detsky'], description: 'butler = uctivý sluha, kamarad = pohodový, detsky = dětský' },
+          dite: { type: 'boolean', description: 'volitelně: true = aktuálně mluví dítě (aktivuje dětskou bezpečnostní hranu)' },
+        },
+        required: ['ton'],
+      },
+    },
+    {
       name: 'recall',
       description: 'Přečte paměť domu.',
       input_schema: {
@@ -1461,7 +1497,7 @@ function buildTools(chatId, profil) {
     },
     {
       name: 'device_layout',
-      description: 'Read-only diagnostika layoutu zařízení: zkombinuje HA device/entity/area registry, aktuální stavy a house_map. Použij na dotazy "co mi vypadlo", "proč nejede garáž", "kde mám slabý Zigbee". Vrací místnost/oblast, transport (zigbee/wifi/matter/unknown), jak dlouho je zařízení unavailable a doporučení. Nikdy sám nespouští re-pair, restart bridge, párování ani ovládání zařízení.',
+      description: 'Read-only diagnostika layoutu zařízení: zkombinuje HA device/entity/area registry, aktuální stavy a house_map. Použij na dotazy "co mi vypadlo", "proč nejede garáž", "kde mám slabý Zigbee". Vrací místnost/oblast, transport (zigbee/wifi/matter/unknown), jak dlouho je zařízení unavailable, sílu Zigbee spoje (LQI 0-255, když ji zařízení hlásí) a doporučení. Slabý signál (nízké LQI) hlásí jen z reálně naměřené hodnoty, neznámé LQI nefabuluje. Nikdy sám nespouští re-pair, restart bridge, párování ani ovládání zařízení.',
       input_schema: {
         type: 'object',
         properties: {
@@ -1469,6 +1505,18 @@ function buildTools(chatId, profil) {
           min_age_minutes: { type: 'number', description: 'Prahový věk výpadku. Výchozí 60 min, minimum 5 min.' },
         },
         required: [],
+      },
+    },
+    {
+      name: 'check_temperature',
+      description: 'Read-only „druhý smysl" pro teplotu: v zadané místnosti najde teplotní čidlo, přečte aktuální hodnotu a z historie HA spočítá NAMĚŘENÝ trend (stoupá/klesá/drží se). Použij, když se máš přesvědčit, jestli teplota reálně reaguje ("je tepleji?", "zatopilo se?", "stoupá v obýváku teplota?") — místo slepé důvěry v akci. Když v místnosti čidlo není, řekne to a teplotu NEFABULUJE. Nikdy neřídí topení ani klima.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Název místnosti/oblasti (např. "obývák"). Musí sedět na HA area — ověř přes get_areas, nefabuluj.' },
+          window_minutes: { type: 'number', description: 'Jak dlouhé okno historie brát pro trend. Výchozí 60 min, minimum 10 min.' },
+        },
+        required: ['room'],
       },
     },
     {
@@ -2334,6 +2382,20 @@ async function executeTool(name, input, chatId) {
         saveMemory(memory);
         return { success: true };
       }
+      case 'set_communication_level': {
+        if (user.role === 'guest') return { error: 'Nastavení komunikace smí měnit jen rodina.' };
+        const res = setExpertiseLevel(memory, input.level);
+        if (!res.ok) return { error: res.error };
+        saveMemory(memory);
+        return { success: true, level: res.level, label: res.label };
+      }
+      case 'set_communication_tone': {
+        if (user.role === 'guest') return { error: 'Nastavení komunikace smí měnit jen rodina.' };
+        const res = setTon(memory, input.ton, input.dite);
+        if (!res.ok) return { error: res.error };
+        saveMemory(memory);
+        return { success: true, ton: res.ton, dite: res.dite, label: res.label };
+      }
 
       case 'recall': {
         if (input.category === 'all') {
@@ -2395,6 +2457,56 @@ async function executeTool(name, input, chatId) {
           text: formatDeviceLayout(snapshot, { scope: input.scope || 'unavailable' }),
           snapshot,
           safety: snapshot.safety,
+        };
+      }
+
+      case 'check_temperature': {
+        // Read-only „druhý smysl" — teplota z reálného čidla + naměřený trend.
+        const windowMinutes = Math.max(10, Number(input.window_minutes || 60));
+        const [states, entityReg, deviceReg, areaReg] = await Promise.all([
+          haGet('states'),
+          haRegistry('entity_registry').catch(() => []),
+          haRegistry('device_registry').catch(() => []),
+          haRegistry('area_registry').catch(() => []),
+        ]);
+        const houseMap = readHouseMap(HOUSE_MAP_FILE);
+        const area = senseResolveAreaId(input.room, areaReg, houseMap);
+        if (!area) {
+          return {
+            action: 'check_temperature',
+            ...buildTemperatureVerdict({ roomQuery: input.room, areaResolved: false }),
+          };
+        }
+        const sensors = pickTemperatureSensors(area.area_id, states, entityReg, deviceReg);
+        if (!sensors.length) {
+          return {
+            action: 'check_temperature',
+            ...buildTemperatureVerdict({ roomQuery: input.room, areaResolved: true, areaName: area.area_name, sensors: [] }),
+          };
+        }
+        const sensorId = sensors[0].entity_id;
+        const currentC = Number.isFinite(Number(String(sensors[0].state).replace(',', '.')))
+          ? Number(String(sensors[0].state).replace(',', '.'))
+          : null;
+        // Historie pro trend (read-only). Selhání = žádný trend, ne fabulace.
+        let trend = { trend: 'unknown', deltaC: null, spanMinutes: 0, reason: 'historie nedostupná' };
+        try {
+          const startIso = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+          const hist = await haGet(`history/period/${startIso}?filter_entity_id=${encodeURIComponent(sensorId)}&minimal_response`);
+          trend = senseComputeTrend(historyToPoints(hist), {});
+        } catch (e) {
+          console.warn(`check_temperature history failed: ${e.message}`);
+        }
+        return {
+          action: 'check_temperature',
+          ...buildTemperatureVerdict({
+            roomQuery: input.room,
+            areaResolved: true,
+            areaName: area.area_name,
+            sensors: sensors.map(s => s.entity_id),
+            currentC,
+            trend,
+          }),
         };
       }
 
@@ -2495,7 +2607,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zigbee2mqtt',
-              message: `✅ Párování zapnuto (Zigbee2MQTT) na ${duration} s. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Párování zapnuto (Zigbee2MQTT) na ${duration} s.${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -2511,7 +2623,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zha',
-              message: `✅ Párování zapnuto na ${duration} s (ZHA). Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Párování zapnuto na ${duration} s (ZHA).${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -2523,7 +2635,7 @@ async function executeTool(name, input, chatId) {
             return {
               success: true,
               backend: 'zigbee2mqtt/mqtt',
-              message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT. Aktivuj teď párování na zařízení; po doběhnutí okna se sám ozvu a zkontroluju nová zařízení.`,
+              message: `✅ Poslal jsem žádost o párování na ${duration} s přes MQTT.${pairingFollowupSuffix(followup && followup.scheduled)}`,
               proactive_followup: followup,
             };
           }
@@ -3712,7 +3824,8 @@ PROAKTIVITA PŘI PÁROVÁNÍ: nikdy nekonči pasivně „dej mi vědět / napiš
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
-LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
+DRUHÝ SMYSL (TEPLOTA): když se máš přesvědčit, jestli teplota reálně reaguje ("je tepleji?", "zatopilo se?", "stoupá teplota?"), nevěř slepě tomu, že akce zabrala — použij check_temperature(room=...). Vrátí aktuální hodnotu z čidla a NAMĚŘENÝ trend z historie. Řekni, co čidlo ukazuje ("v obýváku je 20,6 °C a stoupá o +0,4 °C za 30 min" / "drží se" / "zatím trend nezměřím"). Když v místnosti čidlo není, řekni to a teplotu NEFABULUJ. Tohle je jen měření a poctivá rada — nikdy z toho nedělej claim, že Žán řídí topení nebo klima (kanálové jednotky doma nejsou zapojené).
+LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Když bridge běží a zařízení hlásí slabý signál (nízké LQI z naměřených dat), můžeš navrhnout posílení meshe (router/napájená zásuvka) a klidně řekni konkrétní hodnotu LQI; slabý signál ale tvrď jen z reálného LQI, neznámou sílu spoje nefabuluj. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 ARCHIV ENTIT: když uživatel chce "smazat/uklidit/schovat" nepoužívané entity v HA, nepoužívej nevratné mazání. Použij entity_archive: nejdřív candidates nebo list, potom archive/restore jen pro jednu přesnou entity_id a jen s confirmed:true po lidském potvrzení. Říkej "schoval jsem do archivu", ne "smazal jsem". Kritické entity (alarm, zámek, topení/klima, vrata, čerpadla, ventily, osoby/tracker) nearchivuj automaticky nikdy.
 
 ZÁSUVKA: pro chytrou zásuvku použij onboard_device(category="plug", candidate=...). Shelly → handler shelly, TP-Link/Kasa/Tapo → handler tplink, Matter → handler matter; jiné výrobce netipuj. Po párování ověř novou switch entitu přes get_new_entities/ha_setup_list, místnost potvrď podle pravidla výše a přiřaď ji přes ha_setup_assign_device až po výslovném OK. Automatizaci jen nabídni a write_package volej až po jasném OK. Když název/model naznačuje čerpadlo, kotel, topení, vrata, zámek, mrazák nebo jiný fyzicky rizikový spotřebič, automatizaci nenabízej jako výchozí krok — řekni, že nejdřív musí člověk potvrdit, co je do zásuvky zapojené.
@@ -3788,8 +3901,10 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
     .slice(0, 8)
     .map(r => `${r.id}: ${r.text} @ ${r.due_at_input || r.due_at}`)
     .join(' | ');
+  const communicationInstruction = renderCommunicationInstruction(memory);
   const dynamicContext = `AKTUÁLNÍ KONTEXT:
 Dům: "${displayHomeName}" | Čas: ${formatLocalDateTime()} (${LOCAL_TIME_ZONE}, ${localDayPeriod()})
+${communicationInstruction}
 Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — použij při rozhodování, jestli je něco "hodně tokenů" (queue_task)
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : user.role === 'guest' ? 'host — rodinná data a nástroje domu skryté' : 'uživatel — může ovládat zařízení, ne YAML'})
 ${householdContext}
@@ -5240,7 +5355,21 @@ async function executeDueScheduledActions() {
         if (!ALLOWED_DOMAINS.includes(action.domain)) throw new Error(`Doména ${action.domain} už není povolena.`);
         await haPost(`services/${action.domain}/${action.service}`, action.data || {});
       } else if (action.action_type === 'message') {
-        await sendSafe(action.chat_id, `🕐 ${action.message}`);
+        let text = action.message;
+        if (action.pairing_check) {
+          // Reálná kontrola nových entit místo pouhého slibu — splní to, co
+          // reminder říká. Selhání kontroly = poctivý fallback text (pobídka),
+          // NIKDY fabulovaný „hotovo".
+          try {
+            const res = await runPairingCheck({
+              haGet,
+              getKnown: () => memory.known_entities,
+              setKnown: (v) => { memory.known_entities = v; saveMemory(memory); },
+            });
+            text = buildPairingCheckMessage({ backend: action.backend, count: res.count, entities: res.entities });
+          } catch { text = action.message; }
+        }
+        await sendSafe(action.chat_id, `🕐 ${text}`);
       } else if (action.action_type === 'announce') {
         const result = await announceHome(haPost, {
           message: action.message,

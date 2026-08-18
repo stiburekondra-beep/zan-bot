@@ -101,6 +101,18 @@
       "skills_required": true
     },
     {
+      "name": "set_communication_level",
+      "scope": "memory-write",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
+      "name": "set_communication_tone",
+      "scope": "memory-write",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
       "name": "recall",
       "scope": "memory-read",
       "admin_only": false,
@@ -120,6 +132,12 @@
     },
     {
       "name": "device_layout",
+      "scope": "ha-read",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
+      "name": "check_temperature",
       "scope": "ha-read",
       "admin_only": false,
       "skills_required": true
