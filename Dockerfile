@@ -40,6 +40,7 @@ COPY COOKBOOK.md ./
 COPY technology-inventory.js ./
 COPY house-map.js ./
 COPY device-layout.js ./
+COPY temperature-sense.js ./
 COPY entity-archive.js ./
 COPY tool-profiles.js ./
 COPY voice-channel.js ./

@@ -49,6 +49,13 @@ const { formatTechnologyInventory } = require('./technology-inventory');
 const { applyHouseMapAction, formatHouseMap, readMap: readHouseMap } = require('./house-map');
 const { buildDeviceLayoutSnapshot, formatDeviceLayout } = require('./device-layout');
 const {
+  resolveAreaId: senseResolveAreaId,
+  pickTemperatureSensors,
+  computeTrend: senseComputeTrend,
+  buildTemperatureVerdict,
+  historyToPoints,
+} = require('./temperature-sense');
+const {
   buildEntityArchiveCandidates,
   archiveEntity,
   restoreEntity,
@@ -1501,6 +1508,18 @@ function buildTools(chatId, profil) {
       },
     },
     {
+      name: 'check_temperature',
+      description: 'Read-only „druhý smysl" pro teplotu: v zadané místnosti najde teplotní čidlo, přečte aktuální hodnotu a z historie HA spočítá NAMĚŘENÝ trend (stoupá/klesá/drží se). Použij, když se máš přesvědčit, jestli teplota reálně reaguje ("je tepleji?", "zatopilo se?", "stoupá v obýváku teplota?") — místo slepé důvěry v akci. Když v místnosti čidlo není, řekne to a teplotu NEFABULUJE. Nikdy neřídí topení ani klima.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          room: { type: 'string', description: 'Název místnosti/oblasti (např. "obývák"). Musí sedět na HA area — ověř přes get_areas, nefabuluj.' },
+          window_minutes: { type: 'number', description: 'Jak dlouhé okno historie brát pro trend. Výchozí 60 min, minimum 10 min.' },
+        },
+        required: ['room'],
+      },
+    },
+    {
       name: 'entity_archive',
       description: 'Bezpečný úklid nepoužívaných entit v Home Assistantu. Kandidáty jen navrhne; archivace NIKDY nemaže, pouze skryje jednu potvrzenou entitu v HA entity registry (`hidden_by: user`) a uloží audit do /config/zan_data/entity_archive.json. Obnova vrátí skrytí podle archivu. Kritické entity (alarm, zámek, topení/klima, vrata, čerpadlo, ventil, person/device_tracker) jsou blokované. Hromadné schování bez konkrétního potvrzení je zakázané.',
       input_schema: {
@@ -2438,6 +2457,56 @@ async function executeTool(name, input, chatId) {
           text: formatDeviceLayout(snapshot, { scope: input.scope || 'unavailable' }),
           snapshot,
           safety: snapshot.safety,
+        };
+      }
+
+      case 'check_temperature': {
+        // Read-only „druhý smysl" — teplota z reálného čidla + naměřený trend.
+        const windowMinutes = Math.max(10, Number(input.window_minutes || 60));
+        const [states, entityReg, deviceReg, areaReg] = await Promise.all([
+          haGet('states'),
+          haRegistry('entity_registry').catch(() => []),
+          haRegistry('device_registry').catch(() => []),
+          haRegistry('area_registry').catch(() => []),
+        ]);
+        const houseMap = readHouseMap(HOUSE_MAP_FILE);
+        const area = senseResolveAreaId(input.room, areaReg, houseMap);
+        if (!area) {
+          return {
+            action: 'check_temperature',
+            ...buildTemperatureVerdict({ roomQuery: input.room, areaResolved: false }),
+          };
+        }
+        const sensors = pickTemperatureSensors(area.area_id, states, entityReg, deviceReg);
+        if (!sensors.length) {
+          return {
+            action: 'check_temperature',
+            ...buildTemperatureVerdict({ roomQuery: input.room, areaResolved: true, areaName: area.area_name, sensors: [] }),
+          };
+        }
+        const sensorId = sensors[0].entity_id;
+        const currentC = Number.isFinite(Number(String(sensors[0].state).replace(',', '.')))
+          ? Number(String(sensors[0].state).replace(',', '.'))
+          : null;
+        // Historie pro trend (read-only). Selhání = žádný trend, ne fabulace.
+        let trend = { trend: 'unknown', deltaC: null, spanMinutes: 0, reason: 'historie nedostupná' };
+        try {
+          const startIso = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+          const hist = await haGet(`history/period/${startIso}?filter_entity_id=${encodeURIComponent(sensorId)}&minimal_response`);
+          trend = senseComputeTrend(historyToPoints(hist), {});
+        } catch (e) {
+          console.warn(`check_temperature history failed: ${e.message}`);
+        }
+        return {
+          action: 'check_temperature',
+          ...buildTemperatureVerdict({
+            roomQuery: input.room,
+            areaResolved: true,
+            areaName: area.area_name,
+            sensors: sensors.map(s => s.entity_id),
+            currentC,
+            trend,
+          }),
         };
       }
 
@@ -3755,6 +3824,7 @@ PROAKTIVITA PŘI PÁROVÁNÍ: nikdy nekonči pasivně „dej mi vědět / napiš
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
+DRUHÝ SMYSL (TEPLOTA): když se máš přesvědčit, jestli teplota reálně reaguje ("je tepleji?", "zatopilo se?", "stoupá teplota?"), nevěř slepě tomu, že akce zabrala — použij check_temperature(room=...). Vrátí aktuální hodnotu z čidla a NAMĚŘENÝ trend z historie. Řekni, co čidlo ukazuje ("v obýváku je 20,6 °C a stoupá o +0,4 °C za 30 min" / "drží se" / "zatím trend nezměřím"). Když v místnosti čidlo není, řekni to a teplotu NEFABULUJ. Tohle je jen měření a poctivá rada — nikdy z toho nedělej claim, že Žán řídí topení nebo klima (kanálové jednotky doma nejsou zapojené).
 LAYOUT A DOHLED ZAŘÍZENÍ: když se uživatel ptá "co mi vypadlo", "proč nejede garáž", "kde je slabý Zigbee" nebo chce proaktivní návrh k nedostupným zařízením, použij device_layout. Stav dostupnosti čti z HA, místnost z HA area/house_map, transport ber jako konzervativní klasifikaci. Když je nedostupný bridge/koordinátor, nejdřív navrhni ověřit/restartovat bridge; nenavrhuj kupovat Zigbee router, dokud bridge sám nekomunikuje. Když bridge běží a zařízení hlásí slabý signál (nízké LQI z naměřených dat), můžeš navrhnout posílení meshe (router/napájená zásuvka) a klidně řekni konkrétní hodnotu LQI; slabý signál ale tvrď jen z reálného LQI, neznámou sílu spoje nefabuluj. Re-pair, permit join, fyzický reset, zámky, vrata, ventily a kotel nikdy nespouštěj sám — jen dej konkrétní další krok člověku.
 ARCHIV ENTIT: když uživatel chce "smazat/uklidit/schovat" nepoužívané entity v HA, nepoužívej nevratné mazání. Použij entity_archive: nejdřív candidates nebo list, potom archive/restore jen pro jednu přesnou entity_id a jen s confirmed:true po lidském potvrzení. Říkej "schoval jsem do archivu", ne "smazal jsem". Kritické entity (alarm, zámek, topení/klima, vrata, čerpadla, ventily, osoby/tracker) nearchivuj automaticky nikdy.
 
