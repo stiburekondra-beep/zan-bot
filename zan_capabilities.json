@@ -125,6 +125,12 @@
       "skills_required": true
     },
     {
+      "name": "check_temperature",
+      "scope": "ha-read",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
       "name": "entity_archive",
       "scope": "ha-write",
       "admin_only": true,
