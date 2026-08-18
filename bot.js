@@ -63,7 +63,8 @@ const {
   formatEntityArchiveList,
 } = require('./entity-archive');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
-const { createVoiceHandler } = require('./voice-channel');
+const { createVoiceHandler, createNarratorHandler } = require('./voice-channel');
+const { pickNarratorFiller } = require('./narrator');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
@@ -4541,16 +4542,22 @@ function startVoiceChannel() {
         enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
     })
     : null;
+  // /narrate: instant krycí fráze (vypravěč) BEZ mozku — pipeline ji promluví
+  // hned, zatímco /voice na pozadí počítá skutečnou odpověď. Zamluví latenci.
+  const narrate = token ? createNarratorHandler({ token, pickFiller: pickNarratorFiller }) : null;
   const server = http.createServer((req, res) => {
     if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
-    if (!handle || req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    const routeHandle = req.method === 'POST' && req.url === '/narrate' ? narrate
+      : req.method === 'POST' && req.url === '/voice' ? handle
+      : null;
+    if (!routeHandle) { res.writeHead(404); return res.end(); }
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
     req.on('end', async () => {
       let body = {};
       try { body = raw ? JSON.parse(raw) : {}; } catch { res.writeHead(400); return res.end(JSON.stringify({ error: 'bad json' })); }
       try {
-        const out = await handle({ authHeader: req.headers['authorization'], body });
+        const out = await routeHandle({ authHeader: req.headers['authorization'], body });
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.json));
       } catch (e) {
@@ -4560,7 +4567,7 @@ function startVoiceChannel() {
     });
   });
   server.on('error', (e) => console.error('Voice kanál error:', e.message));
-  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /onboarding (bearer token)`));
+  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /narrate + /onboarding (bearer token)`));
 }
 startVoiceChannel();
 

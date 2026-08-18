@@ -59,4 +59,29 @@ function createVoiceHandler({ token, allowedChats, defaultChatId, dispatch }) {
   };
 }
 
-module.exports = { tokenOk, resolveVoiceChat, createVoiceHandler };
+// ── NARRATOR (vypravěč) endpoint ────────────────────────────────────────
+// Instant krycí fráze BEZ volání mozku — HA hlasová pipeline ji zavolá HNED
+// po STT (a promluví ji), zatímco na pozadí běží /voice (Claude mozek).
+// Tím se ZAMLUVÍ latence přemýšlení (karta 2026-08-18-programator-zana-04
+// bod 1b, Ondrův směr 21:55). Šablona = ~0 ms, žádný druhý LLM call, žádný
+// HA/tool přístup → strukturálně NEMŮŽE fabulovat výsledek (honesty jádro).
+//
+// `pickFiller(text)` se injektuje (narrator.pickNarratorFiller) → modul
+// zůstává framework-agnostický a testovatelný bez závislostí. Fail-closed
+// bearer token stejně jako /voice: bez tokenu endpoint neexistuje (401).
+// Vrací { narrate, narrator } — `narrate:false` = triviální zpráva (mozek
+// odpoví hned), pipeline pak žádnou frázi nepřehrává.
+function createNarratorHandler({ token, pickFiller }) {
+  return async function handle({ authHeader, body }) {
+    if (!tokenOk(authHeader, token)) {
+      return { status: 401, json: { error: 'unauthorized' } };
+    }
+    const text = body && typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) return { status: 400, json: { error: 'missing text' } };
+    let filler = null;
+    try { filler = pickFiller(text); } catch { filler = null; }
+    return { status: 200, json: { narrate: !!filler, narrator: filler || '' } };
+  };
+}
+
+module.exports = { tokenOk, resolveVoiceChat, createVoiceHandler, createNarratorHandler };
