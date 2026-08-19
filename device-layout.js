@@ -18,13 +18,17 @@ function extractLqi(entities = [], statesById) {
   const values = [];
   for (const entity of entities) {
     const state = statesById?.get(entity.entity_id);
-    if (!state) continue;
+    // Stav unavailable/unknown nese ZASTARALÉ atributy — LQI z posledního spojení
+    // (typicky vybitá baterie). Nečíst ani atributovou cestu, jinak by mrtvé zařízení
+    // dostalo falešnou radu "kup Zigbee router" (asymetrie: entitní cesta gate měla,
+    // atributová ne — mrtvé zařízení řeší unavailable/bridge-down větev, ne slabý signál).
+    if (!state || isUnavailableState(state)) continue;
     const attrs = state.attributes || {};
     for (const key of LQI_ATTR_KEYS) {
       const n = Number(attrs[key]);
       if (Number.isFinite(n) && n >= 0 && n <= 255) values.push(n);
     }
-    if (LQI_ENTITY_RE.test(entity.entity_id) && !isUnavailableState(state)) {
+    if (LQI_ENTITY_RE.test(entity.entity_id)) {
       const n = Number(state.state);
       if (Number.isFinite(n) && n >= 0 && n <= 255) values.push(n);
     }
