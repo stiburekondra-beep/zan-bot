@@ -72,6 +72,7 @@ const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
 const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, buildPairingCheckMessage } = require('./pairing-followup');
+const { resolveAuthConfig, isLimitError, subscriptionClientOptions, SubscriptionRouter } = require('./subscription-auth');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -413,6 +414,30 @@ if (!HARNESS_ONLY && !BOT_USERNAME) {
     .catch((e) => console.error('getMe (bot username) selhalo:', e.message));
 }
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// ── Subscription-first auth (karta 2026-08-16-programator-zana-02, PROTOTYP,
+// feature-flag OFF by default). Když je subscription režim vědomě zapnutý
+// (ZAN_AUTH_MODE=subscription + proxy + token, na firemním účtu), Žán jede
+// přes komunitní OAuth proxy a na placené API padá jen při vyčerpaném tarifu
+// (429/limit), po cooldownu zpět. DEFAULT (prázdné env) → AUTH_CFG.active=false
+// → subscriptionAnthropic zůstane null → claudeCreate jede beze změny na API.
+// Poctivá hrana: OAuth proxy cesta NENÍ živě ověřená (gated na firemní-účet
+// test), proti ToS Anthropic — nezapínat bez Ondrova vědomého pokynu.
+const AUTH_CFG = resolveAuthConfig();
+const authRouter = new SubscriptionRouter(AUTH_CFG);
+let subscriptionAnthropic = null;
+if (AUTH_CFG.active) {
+  try {
+    const so = subscriptionClientOptions(AUTH_CFG);
+    subscriptionAnthropic = new Anthropic({ baseURL: so.baseURL, authToken: so.authToken });
+    console.log(`🔑 Auth režim: SUBSCRIPTION (proxy ${AUTH_CFG.proxyUrl}) — fallback na API při vyčerpání tarifu`);
+  } catch (e) {
+    console.error('🔑 subscription klient selhal, jedu na API:', e.message);
+    subscriptionAnthropic = null;
+  }
+} else if (AUTH_CFG.requested === 'subscription') {
+  console.warn(`🔑 Auth režim subscription požadován, ale nekompletní (${AUTH_CFG.reason}) → jedu na API`);
+}
 // Konverzace per chat — perzistentní na disku (fáze 1 auditu, slabina S7):
 // bez toho každý update/restart add-onu znamenal "o čem jsme to mluvili?".
 // Ukládají se jen texty (fotky se do historie stejně nedávají).
@@ -505,7 +530,25 @@ function trackUsage(usage, model = MODEL) {
 }
 
 async function claudeCreate(params) {
-  const response = await anthropic.messages.create(params);
+  let response;
+  // Když je subscription aktivní a nejsme v cooldownu, zkus předplatné;
+  // při vyčerpání tarifu (429/limit) přepni na API a spusť cooldown.
+  // Když je subscription OFF (default), tahle větev se přeskočí = beze změny.
+  if (subscriptionAnthropic && authRouter.currentMode() === 'subscription') {
+    try {
+      response = await subscriptionAnthropic.messages.create(params);
+    } catch (err) {
+      if (isLimitError(err)) {
+        authRouter.markLimited();
+        console.warn(`🔑 Předplatné vyčerpáno (tarif), přepínám na API na ~${Math.round(AUTH_CFG.cooldownMs / 60000)} min`);
+        response = await anthropic.messages.create(params);
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    response = await anthropic.messages.create(params);
+  }
   trackUsage(response.usage, params.model || MODEL);
   return response;
 }

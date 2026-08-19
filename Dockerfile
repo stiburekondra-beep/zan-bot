@@ -52,6 +52,7 @@ COPY play-video.js ./
 COPY conversation-quality.js ./
 COPY capability-gap-repair.js ./
 COPY pairing-followup.js ./
+COPY subscription-auth.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
