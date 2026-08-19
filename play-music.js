@@ -165,6 +165,13 @@ async function playMusic({ input = {}, haGet, haPost, defaultPlayer, sleepMs = 4
   return {
     success: true,
     confirmed: started,
+    // Mrtvý přehrávač (unavailable/unknown/off) po odeslání: tool sám přiznal
+    // v `message`, že „nemusí hrát" (confirmed:false), ALE strukturálně uspěl
+    // (success:true) → action-claim-guard by ho jinak bral za splněný media
+    // povel a propustil model claim „Pouštím X". Tenhle příznak mu řekne, že
+    // se efekt VERIFIKOVATELNĚ NEstal. Idle/latence startu (dead:false,
+    // confirmed:false) NEznačíme — povel byl odeslán na živý přehrávač.
+    unavailable: dead,
     service: 'music_assistant.play_media',
     query,
     media_type: payload.data.media_type,

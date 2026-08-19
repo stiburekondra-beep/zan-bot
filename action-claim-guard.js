@@ -115,7 +115,14 @@ function guardActionClaim(text, userMessage, actionCalls) {
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
   const deviceSatisfied = calls.some(c => c && c.ok && (DEVICE_TOOLS.includes(c.name) || PAIRING_TOOLS.includes(c.name)));
-  const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
+  // Media: strukturální úspěch (ok) NESTAČÍ. play_music u mrtvého přehrávače
+  // vrací success:true + confirmed:false → ok=true, ale efekt se neověřil
+  // (bot.js značí `effectUnverified`). Bez tohohle by guard mlčel u „Pouštím X"
+  // na mrtvém přehrávači (guard-disarm, tester reziduál karty -06, trust třída
+  // sc.24/57). Idle/latence startu má `effectUnverified=false` → dál splňuje
+  // (povel odeslán na živý přehrávač). Pozn.: DEVICE cesta tohle nepotřebuje —
+  // actuation-guard u mrtvého zařízení vrací success:false → ok už je false.
+  const mediaSatisfied = calls.some(c => c && c.ok && !c.effectUnverified && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
   const configClaim = (VERB_DONE.test(text) && CONFIG_NOUN.test(text)) || CONFIG_PHRASE.test(text);

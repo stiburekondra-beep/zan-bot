@@ -242,4 +242,37 @@ assert.strictEqual(
   '26c: neúspěšný permit_join + tvrzení „zapnul jsem" = fabrikace (bridge offline)',
 );
 
-console.log('check-action-claim-guard: OK (28 scénářů)');
+// ── 29) Guard-disarm reziduál karty -06 (tester): play_music u MRTVÉHO ────────
+//        přehrávače vrací success:true + confirmed:false + unavailable:true
+//        (ok=true, ale efekt se neověřil). Bot.js to nese jako effectUnverified.
+//        Model claim „Pouštím X" pak NESMÍ projít jen proto, že tool „uspěl".
+const PLAY_MUSIC_DEAD = [{ name: 'play_music', ok: true, effectUnverified: true }];
+const PLAY_MUSIC_IDLE = [{ name: 'play_music', ok: true, effectUnverified: false }];
+const musicClaim = 'Pouštím ti hudbu do obýváku — Coldplay.';
+// 29a: mrtvý přehrávač + model tvrdí „Pouštím" → FIRE (guard už není odzbrojen).
+assert.strictEqual(
+  guardActionClaim(musicClaim, 'pusť coldplay', PLAY_MUSIC_DEAD).changed,
+  true,
+  '29a: play_music u mrtvého přehrávače (effectUnverified) nelegitimizuje „Pouštím"',
+);
+assert.strictEqual(
+  guardActionClaim(musicClaim, 'pusť coldplay', PLAY_MUSIC_DEAD).fabricatedMedia,
+  true,
+  '29a2: označeno jako fabrikace média',
+);
+// 29b: idle/latence startu (effectUnverified=false) = povel odeslán na živý
+//       přehrávač → SILENT (žádný over-fire, precedent tester „idle je legit").
+assert.strictEqual(
+  guardActionClaim(musicClaim, 'pusť coldplay', PLAY_MUSIC_IDLE).changed,
+  false,
+  '29b: idle přehrávač (odesláno) NEspouští guard — žádný over-fire',
+);
+// 29c: kontrola diskriminace — starý tvar bez effectUnverified se chová jako
+//       předtím (ok=true → splněno), aby fix nerozbil legitimní potvrzené hraní.
+assert.strictEqual(
+  guardActionClaim(musicClaim, 'pusť coldplay', [{ name: 'play_music', ok: true }]).changed,
+  false,
+  '29c: potvrzené hraní (ok, bez effectUnverified) zůstává legitimní',
+);
+
+console.log('check-action-claim-guard: OK (29 scénářů)');
