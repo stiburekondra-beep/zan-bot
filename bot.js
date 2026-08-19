@@ -4896,6 +4896,35 @@ async function announceObchuzka() {
   saveUdrzba(u);
 }
 
+// ═══════════════════════════════════════════════
+// SUPERVISOR přes WEBSOCKET (ne REST proxy!)
+// REST /api/hassio/* vrací 401 i s admin tokenem — programově se Supervisor
+// volá WS příkazem supervisor/api. Zjištěno 23.7.2026 při instalaci Music
+// Assistantu (CHoS-: docs/learnings/2026-07-23_supervisor-api-z-windows.md).
+// Kvůli téhle pasti obchůzka měsíce nesměla restartovat add-ony.
+// ═══════════════════════════════════════════════
+async function supervisorApi(endpoint, method = 'get', timeoutMs = 20000) {
+  const r = await haWsCommand('supervisor/api', { endpoint, method }, timeoutMs);
+  return r && r.data ? r.data : r;
+}
+
+// Seznam nainstalovaných add-onů — slouží zároveň jako ALLOWLIST pro restart:
+// restartovat jde jen slug, který Supervisor skutečně zná.
+async function listAddons() {
+  try {
+    const d = await supervisorApi('/addons', 'get');
+    const list = Array.isArray(d && d.addons) ? d.addons : (Array.isArray(d) ? d : []);
+    return list.map(a => ({ slug: a.slug, name: a.name, state: a.state, version: a.version }));
+  } catch (e) {
+    console.error('Supervisor /addons nedostupné:', e.message);
+    return [];
+  }
+}
+
+async function restartAddon(slug) {
+  return supervisorApi(`/addons/${slug}/restart`, 'post', 90000);
+}
+
 async function runObchuzka() {
   const u = loadUdrzba();
   const today = todayStr();
@@ -4911,17 +4940,18 @@ async function runObchuzka() {
   try {
     console.log('🔧 Spouštím servisní obchůzku...');
     if (!(await isHaOnline())) {
-      await sendSafe(CHAT_ONDRA, '🔧 Servisní obchůzka: HA momentálně neodpovídá, zkusím to příště.');
+      // HA neodpovídá JE problém — tohle se hlásí vždycky
+      await sendSafe(CHAT_ONDRA, '🔧 Obchůzka: Home Assistant neodpovídá, nedostal jsem se k domu.');
       return;
     }
 
     const states = await haGet('states');
 
-    // 1. Nedostupná/neznámá entita — do zásahů/reportu jdou až výpadky > 1 h.
-    // Kratší výpadky jsou často restart integrace nebo krátký síťový glitch.
+    // ── NÁLEZY ────────────────────────────────────────────────────────────
+    // 1. Nedostupná/neznámá entita — řeší se až výpadky > 1 h (kratší bývá
+    //    restart integrace nebo síťový glitch).
     const allUnavailable = states.filter(isUnavailableState);
     const unavailable = allUnavailable.filter(s => stateAgeMs(s) >= UNAVAILABLE_MIN_AGE_MS);
-    const transientUnavailable = allUnavailable.filter(s => stateAgeMs(s) < UNAVAILABLE_MIN_AGE_MS);
     const zigbeeUnavailable = (await describeUnavailableZigbee(states))
       .filter(z => z.age_ms >= UNAVAILABLE_MIN_AGE_MS);
 
@@ -4936,206 +4966,251 @@ async function runObchuzka() {
 
     // 3. Nízká baterie — podle device_class, ne podle názvu entity
     const lowBattery = states.filter(s =>
-      s.attributes?.device_class === 'battery' &&
+      s.attributes && s.attributes.device_class === 'battery' &&
       !isNaN(parseFloat(s.state)) &&
       parseFloat(s.state) < 20
     );
 
-    // 4. Kamera — dokud není v HA žádná entita domény camera.*, Žán ji nevidí
-    const cameras = states.filter(s => s.entity_id.startsWith('camera.'));
+    // 4. Add-on, který má běžet a neběží (seznam je zároveň allowlist)
+    const addons = await listAddons();
+    const addonsDown = addons.filter(a => a.state && a.state !== 'started' && a.state !== 'unknown');
 
-    // Sestav zprávu
-    const lines = [`🔧 *Servisní obchůzka* — ${new Date().toLocaleDateString('cs-CZ')} 18:00`, ''];
-
-    if (unavailable.length === 0) {
-      lines.push('✅ Všechna zařízení dostupná.');
-    } else {
-      lines.push(`⚠️ *${unavailable.length}× nedostupné/neznámé zařízení:*`);
-      for (const s of unavailable.slice(0, 15)) {
-        lines.push(`  • ${s.attributes.friendly_name || s.entity_id} (${formatAge(stateAgeMs(s))})`);
-      }
-      if (unavailable.length > 15) lines.push(`  • ...a ${unavailable.length - 15} dalších`);
-    }
-    if (transientUnavailable.length > 0) {
-      lines.push(`ℹ️ ${transientUnavailable.length}× krátký výpadek pod 1 h jen sleduju, zatím nehlásím jako incident.`);
+    const hasFindings = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0 || addonsDown.length > 0;
+    if (!hasFindings) {
+      // Ondra 19.8.: "Nemusí mi to už hlásit. Jen problémy." → ticho.
+      console.log('✅ Obchůzka: nic k řešení, nehlásím.');
+      u.last_run_date = today;
+      saveUdrzba(u);
+      return;
     }
 
-    if (zigbeeUnavailable.length > 0) {
-      lines.push('');
-      lines.push(`🛜 *Zigbee zařízení k fyzické kontrole / re-pair:*`);
-      for (const z of zigbeeUnavailable.slice(0, 10)) {
-        const hw = [z.manufacturer, z.model].filter(Boolean).join(' ');
-        lines.push(`  • ${z.name} (${z.entity_id}, ${formatAge(z.age_ms)}${hw ? `, ${hw}` : ''})`);
-      }
-      if (zigbeeUnavailable.length > 10) lines.push(`  • ...a ${zigbeeUnavailable.length - 10} dalších`);
-      lines.push('Re-pair nespouštím sám: můžu jen na výslovný pokyn otevřít Zigbee párování, fyzické reset/párování zařízení musí udělat člověk.');
-    }
+    // ── DIAGNÓZA PŘÍČIN + PROAKTIVNÍ ZÁSAHY ───────────────────────────────
+    // Mantinely VYNUCUJE KÓD, ne model:
+    //   - reload integrace: JEN na entity ze seznamu unavailable, max 2×/den/entita
+    //   - restart add-onu: JEN slug, který zná Supervisor, max 1×/den/add-on
+    //   - nikdy: instalace aktualizací, mazání, restart celého HA, Zigbee re-pair
+    const revivedIds = new Set();
+    const opraveno = [];
+    const neopraveno = [];
+    let diagnoza = '';
 
-    lines.push('');
-    if (updates.length === 0) {
-      lines.push('✅ Žádné čekající aktualizace.');
-    } else {
-      lines.push(`🔄 *${updates.length}× čekající aktualizace* (žádnou jsem sám nenainstaloval):`);
-      for (const up of updates) {
-        lines.push(`  • ${up.name}: ${up.installed} → ${up.latest}`);
-      }
-    }
+    let errorExcerpt = '';
+    try {
+      const raw = await axios.get(`${HA_URL}/api/error_log`, { headers: haHeaders(), timeout: 15000 });
+      errorExcerpt = String(raw.data || '').split('\n').filter(l => /ERROR|WARNING/i.test(l)).slice(-60).join('\n');
+    } catch {}
 
-    lines.push('');
-    if (lowBattery.length === 0) {
-      lines.push('✅ Žádná baterie pod 20 %.');
-    } else {
-      lines.push(`🔋 *${lowBattery.length}× nízká baterie:*`);
-      for (const s of lowBattery) lines.push(`  • ${s.attributes.friendly_name || s.entity_id}: ${s.state}%`);
-    }
+    try {
+      const diagPrompt = `Jsi Žán, údržbář chytrého domu. Tvůj úkol je najít PŘÍČINU, ne vyjmenovat příznaky.
 
-    if (cameras.length === 0) {
-      lines.push('');
-      lines.push('📷 Kamera v domě není napojená na Home Assistant — nevidím ji a nemůžu na ni dohlížet.');
-    }
-
-    // ── DIAGNÓZA NA SERVIS MODELU + REAKTIVNÍ ZÁSAHY (fáze 2 auditu,
-    // slabina S12; reaktivní zásahy rovnou = rozhodnutí Ondry 2026-07-06,
-    // dům = lab). Mantinely VYNUCUJE KÓD, ne model:
-    //   - allowlist: JEN homeassistant.reload_config_entry, a JEN na
-    //     entity ze seznamu unavailable (členství ověřuje kód)
-    //   - max 2 stejné zásahy/den; po druhém už jen hlásí
-    //   - nic nevratného (žádné updaty, mazání, restarty — ty se jen ptají)
-    const hasFindings = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0;
-    if (hasFindings) {
-      recordRepair({
-        source: 'obchuzka',
-        capability: 'get_states',
-        dedupe_key: 'service_walk_findings',
-        severity: unavailable.length > 0 ? 'warning' : 'info',
-        title: 'Servisní obchůzka našla věci ke kontrole',
-        detail: [
-          unavailable.length ? `${unavailable.length}× nedostupné/neznámé zařízení déle než 1 h` : '',
-          zigbeeUnavailable.length ? `${zigbeeUnavailable.length}× Zigbee kandidát k fyzické kontrole` : '',
-          updates.length ? `${updates.length}× čekající aktualizace` : '',
-          lowBattery.length ? `${lowBattery.length}× baterie pod 20 %` : '',
-        ].filter(Boolean).join('; '),
-        next_step: 'Přečíst servisní obchůzku, ověřit příčinu a rozhodnout ručně; Žán v repair inboxu nic neopravuje sám.',
-        evidence: {
-          unavailable: unavailable.slice(0, 20).map(s => s.entity_id),
-          zigbee_unavailable: zigbeeUnavailable.slice(0, 20).map(z => z.entity_id),
-          updates: updates.slice(0, 20).map(u => u.name),
-          low_battery: lowBattery.slice(0, 20).map(s => s.entity_id),
-        },
-      });
-    }
-    if (hasFindings) {
-      try {
-        let errorExcerpt = '';
-        try {
-          const raw = await axios.get(`${HA_URL}/api/error_log`, { headers: haHeaders(), timeout: 15000 });
-          errorExcerpt = String(raw.data || '').split('\n').filter(l => /ERROR|WARNING/i.test(l)).slice(-40).join('\n');
-        } catch {}
-
-        const diagPrompt = `Jsi Žán, údržbář chytrého domu. Výsledky servisní obchůzky:
-NEDOSTUPNÉ ENTITY: ${JSON.stringify(unavailable.slice(0, 30).map(s => ({ id: s.entity_id, name: s.attributes.friendly_name || s.entity_id })))}
+NEDOSTUPNÉ ENTITY (>1 h): ${JSON.stringify(unavailable.slice(0, 30).map(s => ({ id: s.entity_id, name: s.attributes.friendly_name || s.entity_id, age: formatAge(stateAgeMs(s)) })))}
 ZIGBEE OFFLINE KANDIDÁTI: ${JSON.stringify(zigbeeUnavailable.slice(0, 20).map(z => ({ id: z.entity_id, name: z.name, age: formatAge(z.age_ms), manufacturer: z.manufacturer, model: z.model, integration: z.integration })))}
+ADD-ONY, KTERÉ NEBĚŽÍ: ${JSON.stringify(addonsDown.map(a => ({ slug: a.slug, name: a.name, state: a.state })))}
+VŠECHNY NAINSTALOVANÉ ADD-ONY: ${JSON.stringify(addons.map(a => ({ slug: a.slug, name: a.name, state: a.state })))}
 ČEKAJÍCÍ UPDATY: ${JSON.stringify(updates)}
 SLABÉ BATERIE: ${JSON.stringify(lowBattery.map(s => ({ id: s.entity_id, pct: s.state })))}
 VÝŇATEK Z ERROR LOGU HA:
-${errorExcerpt.slice(0, 4000) || '(prázdný)'}
+${errorExcerpt.slice(0, 5000) || '(prázdný)'}
 
-Úkol: 1) urči pravděpodobné PŘÍČINY (skupiny entit stejné integrace = jedna příčina), 2) rozliš vážné od kosmetického, 3) navrhni zásahy.
-Jediný automaticky povolený zásah je reload integrace přes entitu (homeassistant.reload_config_entry) — dává smysl u zamrzlé integrace nebo síťového zařízení, NE u vybité baterie nebo fyzicky odpojeného Zigbee zařízení. Zigbee re-pair jen doporuč člověku; nespouštěj ho jako zásah. Max 3 zásahy.
-Vrať POUZE JSON bez komentářů: {"diagnoza":"stručně česky pro majitele — příčiny a co je vážné","zasahy":[{"entity_id":"...","duvod":"..."}]}`;
+Postup:
+1) SESKUP entity podle společné příčiny (víc entit jedné integrace = JEDNA příčina, ne pět problémů).
+2) Urči, co je vážné a co kosmetické.
+3) Navrhni zásahy, které to můžou opravit.
 
-        const diagResp = await claudeCreate({
-          model: MODEL_SERVIS, // ~12 volání/měsíc; rozhoduje o zásazích do živého domu
-          max_tokens: 900,
-          messages: [{ role: 'user', content: diagPrompt }],
-        });
-        const diagText = diagResp.content.find(b => b.type === 'text')?.text || '';
-        let diag = null;
-        try { diag = JSON.parse(diagText.replace(/^```(json)?|```$/gm, '').trim()); } catch {}
+Povolené zásahy (nic jiného kód neprovede):
+ - {"typ":"reload","entity_id":"..."} — reload integrace té entity. Dává smysl u zamrzlé integrace nebo síťového zařízení. NEDÁVÁ smysl u vybité baterie ani u fyzicky odpojeného Zigbee zařízení.
+ - {"typ":"restart_addon","slug":"..."} — restart add-onu. Dává smysl, když add-on neběží nebo je jeho integrace zamrzlá (např. zigbee2mqtt, mosquitto, music assistant). Slug musí být ze seznamu výše.
+Zigbee re-pair, instalaci aktualizací ani restart HA nenavrhuj — ty dělá jen člověk.
+Max 4 zásahy, seřaď od nejpravděpodobnější příčiny.
 
-        if (diag && diag.diagnoza) {
-          lines.push('');
-          lines.push(`🧠 *Diagnóza:* ${diag.diagnoza}`);
-        }
+Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčina a co je vážné","zasahy":[{"typ":"reload|restart_addon","entity_id":"...","slug":"...","duvod":"..."}]}`;
 
-        // Reaktivní zásahy s mantinely (vynucuje kód)
-        const unavailableIds = new Set(unavailable.map(s => s.entity_id));
-        u.interventions = u.interventions || {};
-        const dayKey = today;
-        u.interventions[dayKey] = u.interventions[dayKey] || {};
-        // drž jen posledních 14 dní
-        for (const k of Object.keys(u.interventions)) if (k < new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10)) delete u.interventions[k];
+      const diagResp = await claudeCreate({
+        model: MODEL_SERVIS,
+        max_tokens: 1200,
+        messages: [{ role: 'user', content: diagPrompt }],
+      });
+      const diagText = (diagResp.content.find(b => b.type === 'text') || {}).text || '';
+      let diag = null;
+      try { diag = JSON.parse(diagText.replace(/^```(json)?|```$/gm, '').trim()); } catch {}
+      diagnoza = (diag && diag.diagnoza) || '';
 
-        const proposed = Array.isArray(diag?.zasahy) ? diag.zasahy.slice(0, 3) : [];
-        for (const z of proposed) {
-          if (!z || !unavailableIds.has(z.entity_id)) continue; // mimo allowlist/seznam → ignoruj
-          const count = u.interventions[dayKey][z.entity_id] || 0;
-          if (count >= 2) {
-            lines.push(`🔧 ${z.entity_id}: dnes už jsem to zkoušel ${count}× — dál nezasahuju, chce to lidský pohled (${z.duvod})`);
-            continue;
-          }
-          u.interventions[dayKey][z.entity_id] = count + 1;
+      // ── EXEKUCE ZÁSAHŮ (allowlist vynucuje kód) ─────────────────────────
+      const unavailableIds = new Set(unavailable.map(s => s.entity_id));
+      const addonSlugs = new Set(addons.map(a => a.slug));
+      u.interventions = u.interventions || {};
+      u.interventions[today] = u.interventions[today] || {};
+      for (const k of Object.keys(u.interventions)) {
+        if (k < new Date(Date.now() - 14 * 86400e3).toISOString().slice(0, 10)) delete u.interventions[k];
+      }
+
+      const proposed = Array.isArray(diag && diag.zasahy) ? diag.zasahy.slice(0, 4) : [];
+      for (const z of proposed) {
+        if (!z || !z.typ) continue;
+
+        // ---- reload integrace ----
+        if (z.typ === 'reload') {
+          if (!unavailableIds.has(z.entity_id)) continue;         // mimo allowlist
+          const key = 'reload:' + z.entity_id;
+          const count = u.interventions[today][key] || 0;
+          if (count >= 2) { neopraveno.push(`${z.entity_id} — dnes už jsem reload zkoušel ${count}×, chce to lidský pohled`); continue; }
+          u.interventions[today][key] = count + 1;
           saveUdrzba(u);
           try {
             await haPost('services/homeassistant/reload_config_entry', { entity_id: z.entity_id });
             logAction(CHAT_ONDRA, 'Žán-údržbář', 'reload_config_entry', z.entity_id, 'ok');
-            await new Promise(r => setTimeout(r, 10000)); // dej integraci čas naběhnout
+            await new Promise(r => setTimeout(r, 10000));
             let after = null;
             try { after = await haGet(`states/${z.entity_id}`); } catch {}
-            const revived = after && after.state !== 'unavailable' && after.state !== 'unknown';
-            lines.push(`🔧 Obnovil jsem integraci ${z.entity_id} (${z.duvod}) → ${revived ? `✅ zase žije (${after.state})` : '⚠️ pořád nedostupná — nechávám na tobě'}`);
+            if (after && after.state !== 'unavailable' && after.state !== 'unknown') {
+              revivedIds.add(z.entity_id);
+              opraveno.push(`${z.entity_id} — reload integrace pomohl (${after.state})`);
+            } else {
+              neopraveno.push(`${z.entity_id} — reload nepomohl (${z.duvod || 'bez bližší příčiny'})`);
+            }
           } catch (e) {
-            lines.push(`🔧 Pokus o obnovu ${z.entity_id} selhal: ${e.message}`);
             logAction(CHAT_ONDRA, 'Žán-údržbář', 'reload_config_entry', z.entity_id, 'fail');
+            neopraveno.push(`${z.entity_id} — reload selhal: ${e.message}`);
+          }
+          continue;
+        }
+
+        // ---- restart add-onu (odemčeno WS cestou, viz learning 23.7.) ----
+        if (z.typ === 'restart_addon') {
+          if (!z.slug || !addonSlugs.has(z.slug)) continue;        // mimo allowlist Supervisoru
+          const key = 'addon:' + z.slug;
+          const count = u.interventions[today][key] || 0;
+          if (count >= 1) { neopraveno.push(`add-on ${z.slug} — dnes už jsem ho restartoval, znovu nesahám`); continue; }
+          u.interventions[today][key] = count + 1;
+          saveUdrzba(u);
+          try {
+            await restartAddon(z.slug);
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'restart_addon', z.slug, 'ok');
+            await new Promise(r => setTimeout(r, 20000));          // add-on potřebuje víc času než reload
+            const po = await listAddons();
+            const zaznam = po.find(a => a.slug === z.slug);
+            const stav = zaznam && zaznam.state;
+            if (stav === 'started') opraveno.push(`add-on ${z.slug} — restart pomohl, zase běží`);
+            else neopraveno.push(`add-on ${z.slug} — po restartu stav "${stav || 'neznámý'}"`);
+          } catch (e) {
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'restart_addon', z.slug, 'fail');
+            neopraveno.push(`add-on ${z.slug} — restart selhal: ${e.message}`);
           }
         }
-      } catch (e) {
-        console.error('Diagnóza obchůzky selhala (posílám aspoň výčet):', e.message);
       }
+    } catch (e) {
+      console.error('Diagnóza obchůzky selhala (hlásím aspoň výčet):', e.message);
     }
 
-    // Žádost o rozhodnutí, ne jen informace — jen když je vůbec co řešit
-    const needsDecision = unavailable.length > 0 || updates.length > 0 || lowBattery.length > 0 || cameras.length === 0;
-    if (needsDecision) {
-      lines.push('');
-      lines.push('*Co bych potřeboval rozhodnout:*');
-      let n = 1;
-      if (updates.some(u => u.name.toLowerCase().includes('core') || u.name.toLowerCase().includes('operating system'))) {
-        lines.push(`${n++}. Mám nainstalovat aktualizaci HA Core/OS, nebo počkat na klidnější chvíli? (jen s tvým souhlasem — nikdy sám)`);
-      }
-      if (unavailable.length > 0) {
-        lines.push(`${n++}. Něco z nedostupných zařízení stojí za fyzickou kontrolu — mrkneš na to, až budeš mít chvíli?`);
-      }
-      if (zigbeeUnavailable.length > 0) {
-        lines.push(`${n++}. U Zigbee zařízení můžu po tvém "ano" otevřít párování přes Žánův allowlist; fyzický reset/párování ale musíš udělat u zařízení.`);
-      }
-      if (cameras.length === 0) {
-        lines.push(`${n++}. Chceš, ať kameru zapojím do Home Assistantu? Pak na ni budu moct dohlížet a hlásit ti, co se děje.`);
-      }
-      lines.push('');
-      lines.push('Odpověz mi, až budeš mít čas 🙂');
-    } else {
-      lines.push('');
-      lines.push('Všechno vypadá v pořádku, nic ode mě teď nepotřebuješ.');
+    // ── CO ZBYLO PO ZÁSAZÍCH ──────────────────────────────────────────────
+    const unavailableLeft = unavailable.filter(s => !revivedIds.has(s.entity_id));
+    const zigbeeLeft = zigbeeUnavailable.filter(z => !revivedIds.has(z.entity_id));
+    const opravenoText = opraveno.join(' | ');
+    const addonsDownLeft = addonsDown.filter(a => !opravenoText.includes(a.slug));
+
+    const zbyvaProblem = unavailableLeft.length > 0 || addonsDownLeft.length > 0 ||
+                         updates.length > 0 || lowBattery.length > 0 || neopraveno.length > 0;
+
+    if (!zbyvaProblem) {
+      // Vše, co obchůzka našla, sama opravila → Ondru neotravujeme.
+      console.log(`✅ Obchůzka: opraveno ${opraveno.length}×, nic nezbylo — nehlásím.`);
+      if (opraveno.length) logAction(CHAT_ONDRA, 'Žán-údržbář', 'obchuzka_tiche_opravy', opravenoText, 'ok');
+      u.last_run_date = today;
+      saveUdrzba(u);
+      return;
     }
 
-    const reportText = lines.join('\n');
+    // ── REPORT: jen problémy ──────────────────────────────────────────────
+    const lines = [`🔧 *Obchůzka* — ${new Date().toLocaleDateString('cs-CZ')}`, ''];
+    if (diagnoza) { lines.push(`🧠 ${diagnoza}`); lines.push(''); }
+
+    if (opraveno.length) {
+      lines.push('✅ *Opravil jsem sám:*');
+      for (const o of opraveno) lines.push(`  • ${o}`);
+      lines.push('');
+    }
+
+    if (unavailableLeft.length) {
+      lines.push(`⚠️ *${unavailableLeft.length}× nedostupné déle než hodinu:*`);
+      for (const s of unavailableLeft.slice(0, 15)) {
+        lines.push(`  • ${s.attributes.friendly_name || s.entity_id} (${formatAge(stateAgeMs(s))})`);
+      }
+      if (unavailableLeft.length > 15) lines.push(`  • ...a ${unavailableLeft.length - 15} dalších`);
+      lines.push('');
+    }
+
+    if (addonsDownLeft.length) {
+      lines.push('📦 *Add-on neběží:*');
+      for (const a of addonsDownLeft) lines.push(`  • ${a.name} (${a.slug}) — ${a.state}`);
+      lines.push('');
+    }
+
+    if (zigbeeLeft.length) {
+      lines.push('🛜 *Zigbee k fyzické kontrole* (re-pair nespouštím sám):');
+      for (const z of zigbeeLeft.slice(0, 10)) {
+        const hw = [z.manufacturer, z.model].filter(Boolean).join(' ');
+        lines.push(`  • ${z.name} (${formatAge(z.age_ms)}${hw ? `, ${hw}` : ''})`);
+      }
+      lines.push('');
+    }
+
+    if (neopraveno.length) {
+      lines.push('🔧 *Zkoušel jsem, nepomohlo:*');
+      for (const n of neopraveno.slice(0, 10)) lines.push(`  • ${n}`);
+      lines.push('');
+    }
+
+    if (lowBattery.length) {
+      lines.push('🔋 *Baterie pod 20 %:*');
+      for (const s of lowBattery) lines.push(`  • ${s.attributes.friendly_name || s.entity_id}: ${s.state}%`);
+      lines.push('');
+    }
+
+    if (updates.length) {
+      lines.push('🔄 *Čekající aktualizace* (žádnou neinstaluju sám):');
+      for (const up of updates) lines.push(`  • ${up.name}: ${up.installed} → ${up.latest}`);
+      lines.push('');
+    }
+
+    recordRepair({
+      source: 'obchuzka',
+      capability: 'get_states',
+      dedupe_key: 'service_walk_findings',
+      severity: (unavailableLeft.length > 0 || addonsDownLeft.length > 0) ? 'warning' : 'info',
+      title: 'Obchůzka: zbylo, co jsem sám nevyřešil',
+      detail: [
+        opraveno.length ? `${opraveno.length}× opraveno samo` : '',
+        unavailableLeft.length ? `${unavailableLeft.length}× nedostupné >1 h` : '',
+        addonsDownLeft.length ? `${addonsDownLeft.length}× add-on neběží` : '',
+        zigbeeLeft.length ? `${zigbeeLeft.length}× Zigbee k fyzické kontrole` : '',
+        updates.length ? `${updates.length}× čekající aktualizace` : '',
+        lowBattery.length ? `${lowBattery.length}× baterie pod 20 %` : '',
+      ].filter(Boolean).join('; '),
+      next_step: 'Projít zbylé problémy; reload integrace a restart add-onu už Žán zkusil sám.',
+      evidence: {
+        opraveno,
+        unavailable: unavailableLeft.slice(0, 20).map(s => s.entity_id),
+        addons_down: addonsDownLeft.map(a => a.slug),
+        zigbee_unavailable: zigbeeLeft.slice(0, 20).map(z => z.entity_id),
+        updates: updates.slice(0, 20).map(x => x.name),
+        low_battery: lowBattery.slice(0, 20).map(s => s.entity_id),
+      },
+    });
+
+    const reportText = lines.join('\n').trimEnd();
     await sendSafe(CHAT_ONDRA, reportText, { parse_mode: 'Markdown' });
 
-    // Report patří i do konverzační historie — odpověď "1: ano" na
-    // číslovaná rozhodnutí musí mít kontext (stejný vzor jako u návyků).
     if (!conversationHistory[CHAT_ONDRA]) conversationHistory[CHAT_ONDRA] = [];
-    conversationHistory[CHAT_ONDRA].push({ role: 'assistant', content: `[Poslal jsem report servisní obchůzky]\n${reportText}` });
+    conversationHistory[CHAT_ONDRA].push({ role: 'assistant', content: `[Poslal jsem report obchůzky]\n${reportText}` });
     persistConversations();
 
     u.last_run_date = today;
     saveUdrzba(u);
-    console.log('✅ Servisní obchůzka odeslána');
+    console.log(`✅ Obchůzka odeslána (opraveno ${opraveno.length}, zbylo k řešení)`);
   } catch (e) {
     console.error('Servisní obchůzka selhala:', e.message);
   }
 }
-
 // ═══════════════════════════════════════════════
 // TÝDENNÍ SEBEREFLEXE (fáze 2 auditu, sekce 4.3) — neděle 20:30, SERVIS
 // model projde poučení + logy týdne a NAVRHNE Ondrovi úpravy: které
@@ -5485,10 +5560,11 @@ if (!HARNESS_ONLY) {
   // v 7:00 téhož dne. getDay(): 0=ne, 1=po, 2=út, 3=st, 4=čt, 5=pá, 6=so.
   setInterval(() => {
     const now = new Date();
-    const isObchuzkaDen = now.getDay() === 3 || now.getDay() === 6;
-    if (isObchuzkaDen && now.getHours() === 7 && now.getMinutes() < 5) {
-      announceObchuzka();
-    }
+    // Ondra 19.8.: obchuzka kazdy den (drive St+So). 'Prestalo mi to fungovat'
+    // neceka na stredu - porucha ze soboty by jinak lezela 4 dny.
+    const isObchuzkaDen = true;
+    // Ranni ohlaseni 'dnes vecer se podivam na dum' zruseno 19.8. (Ondra:
+    // 'Nemusi mi to uz hlasit. Jen problemy.') - pri dennim behu je to sum.
     if (isObchuzkaDen && now.getHours() === 18 && now.getMinutes() < 5) {
       runObchuzka();
     }

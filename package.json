@@ -44,7 +44,8 @@
     "test:communication-profile": "node scripts/check-communication-profile.js",
     "test:temperature-sense": "node scripts/check-temperature-sense.js",
     "test:narrator": "node scripts/check-narrator.js",
-    "test:subscription-auth": "node scripts/check-subscription-auth.js"
+    "test:subscription-auth": "node scripts/check-subscription-auth.js",
+    "test:obchuzka-guards": "node scripts/check-obchuzka-guards.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
