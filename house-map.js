@@ -105,11 +105,19 @@ function scoreSeedRoomMatch(seedRoom, customerRoom) {
 
 function bestSeedRoomMatch(seedRoom, customerRooms) {
   let best = null;
+  const scoredAll = [];
   for (const candidate of customerRooms) {
     const scored = scoreSeedRoomMatch(seedRoom, candidate);
-    if (!best || scored.score > best.score) best = { ...candidate, ...scored };
+    const entry = { ...candidate, ...scored };
+    scoredAll.push(entry);
+    if (!best || scored.score > best.score) best = entry;
   }
-  return best || { score: 0, reason: 'no customer rooms' };
+  if (!best) return { score: 0, reason: 'no customer rooms', tied_candidates: [] };
+  // Remíza: kolik DALŠÍCH zákaznických místností (jiné area_id) dosahuje shodně
+  // nejvyššího skóre. Když aspoň jedna → seed místnost nejde jednoznačně napasovat
+  // a nesmí se tiše vybrat první (jinak druhá stejnojmenná místnost zmizí bez stopy).
+  const tied = scoredAll.filter(e => String(e.area_id) !== String(best.area_id) && Math.abs(e.score - best.score) < 1e-9);
+  return { ...best, tied_candidates: tied.map(e => ({ area_id: e.area_id, name: e.name, score: Number(e.score.toFixed(2)) })) };
 }
 
 function prepareHouseMapSeed(seed = {}, customerRooms = [], opts = {}) {
@@ -124,7 +132,9 @@ function prepareHouseMapSeed(seed = {}, customerRooms = [], opts = {}) {
 
   for (const room of sourceRooms) {
     const match = bestSeedRoomMatch(room, customers);
-    if (match.score >= threshold && !matchedAreaIds.has(match.area_id)) {
+    const tiedCount = Array.isArray(match.tied_candidates) ? match.tied_candidates.length : 0;
+    const ambiguous = match.score >= threshold && tiedCount >= 1;
+    if (match.score >= threshold && !matchedAreaIds.has(match.area_id) && !ambiguous) {
       const roomId = slugify(match.area_id, 'room');
       matchedAreaIds.add(match.area_id);
       matchBySeedId.set(slugify(room.id || room.area_id || room.name, ''), roomId);
@@ -144,7 +154,12 @@ function prepareHouseMapSeed(seed = {}, customerRooms = [], opts = {}) {
         polycam_name: room.name || '',
         polycam_area_id: room.area_id || '',
         best_customer_room: match.area_id ? { area_id: match.area_id, name: match.name, score: Number(match.score.toFixed(2)), reason: match.reason } : null,
-        reason: matchedAreaIds.has(match.area_id) ? 'customer room already used' : 'below confidence threshold',
+        reason: ambiguous
+          ? `ambiguous: ${tiedCount + 1} candidates tied at score ${match.score.toFixed(2)}`
+          : (matchedAreaIds.has(match.area_id) ? 'customer room already used' : 'below confidence threshold'),
+        tied_candidates: ambiguous
+          ? [{ area_id: match.area_id, name: match.name, score: Number(match.score.toFixed(2)) }, ...match.tied_candidates]
+          : undefined,
       });
     }
   }
