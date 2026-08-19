@@ -26,6 +26,22 @@ const DEFAULT_MIN_DELTA_C = 0.2;
 // Minimální rozpětí měření, abychom o trendu vůbec mluvili. Kratší okno =
 // šum, ne trend → „trend zatím nezměřím".
 const DEFAULT_MIN_SPAN_MINUTES = 10;
+// Věrohodné pásmo pokojové teploty. Reálné HW glitche (DS18B20 1-wire chyba
+// −127 °C, power-on-reset 85 °C, Zigbee overflow sentinely 255…) jsou KONEČNÁ
+// čísla — projdou asNumber jako „platná" hodnota a modul by je jinak ohlásil
+// jako reálnou teplotu/trend (přesně fabulace, proti které tenhle „druhý
+// smysl" stojí). Pásmo je schválně široké: −50 pokryje i garáž/nevytápěný
+// prostor v silné zimě, 80 i čidlo u kamen — ale zachytí sentinely mimo něj.
+// POZOR (poctivá hranice): 0 °C dropout (Zigbee) je UVNITŘ pásma a od reálné
+// mrazivé místnosti se hodnotou nedá odlišit → tenhle clamp ho NEchytí.
+const PLAUSIBLE_MIN_C = -50;
+const PLAUSIBLE_MAX_C = 80;
+
+// Je hodnota věrohodná pokojová teplota? Nečíselné/NaN i mimo pásmo → false.
+function isPlausibleRoomTemp(value) {
+  const n = asNumber(value);
+  return n !== null && n >= PLAUSIBLE_MIN_C && n <= PLAUSIBLE_MAX_C;
+}
 
 function normalizeText(value) {
   return String(value || '')
@@ -113,9 +129,13 @@ function pickTemperatureSensors(areaId, states = [], entityRegistry = [], device
 function computeTrend(points, opts = {}) {
   const minDeltaC = Number.isFinite(opts.minDeltaC) ? opts.minDeltaC : DEFAULT_MIN_DELTA_C;
   const minSpanMinutes = Number.isFinite(opts.minSpanMinutes) ? opts.minSpanMinutes : DEFAULT_MIN_SPAN_MINUTES;
+  // Glitch body (−127, 85, 255…) mimo věrohodné pásmo zahoď PŘED výpočtem
+  // trendu — jinak by jeden chybový vzorek v historii vyrobil absurdní trend
+  // („klesá −148 °C za 30 min"). Zahození = zacházíme s nimi jako s chybějícím
+  // měřením, ne s reálnou teplotou.
   const clean = (Array.isArray(points) ? points : [])
     .map(p => ({ t: Number(p.t), v: asNumber(p.v) }))
-    .filter(p => Number.isFinite(p.t) && p.v !== null)
+    .filter(p => Number.isFinite(p.t) && p.v !== null && isPlausibleRoomTemp(p.v))
     .sort((a, b) => a.t - b.t);
   if (clean.length < 2) {
     return { trend: 'unknown', deltaC: null, spanMinutes: 0, samples: clean.length, reason: 'málo měření' };
@@ -177,6 +197,20 @@ function buildTemperatureVerdict(input = {}) {
       text: `Teplotní čidlo v ${areaName} (${sensors[0]}) teď nehlásí čitelnou hodnotu — nemůžu potvrdit teplotu.`,
     };
   }
+  // Glitch aktuální hodnota (−127 °C 1-wire chyba, 85 °C POR, sentinel) je
+  // číslo, ale ne reálná teplota — NEHLÁSIT ji jako fakt. Zacházej stejně
+  // jako s nečitelným čidlem: poctivé přiznání, ne fabulovaná teplota.
+  if (!isPlausibleRoomTemp(currentC)) {
+    return {
+      found: true,
+      reason: 'sensor_glitch',
+      area: areaName,
+      sensor: sensors[0],
+      current_c: null,
+      trend: 'unknown',
+      text: `Teplotní čidlo v ${areaName} (${sensors[0]}) hlásí nesmyslnou hodnotu (${fmt(currentC)} °C) — nejspíš chyba čidla, teplotu nepotvrdím.`,
+    };
+  }
 
   const t = (trend && trend.trend) || 'unknown';
   let text = `V ${areaName} je teď ${fmt(currentC)} °C`;
@@ -220,8 +254,11 @@ function historyToPoints(historyResponse) {
 module.exports = {
   DEFAULT_MIN_DELTA_C,
   DEFAULT_MIN_SPAN_MINUTES,
+  PLAUSIBLE_MIN_C,
+  PLAUSIBLE_MAX_C,
   normalizeText,
   asNumber,
+  isPlausibleRoomTemp,
   isTemperatureSensor,
   entityAreaId,
   resolveAreaId,
