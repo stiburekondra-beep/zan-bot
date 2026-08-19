@@ -252,6 +252,26 @@ function readPlaybook(name) {
   catch { return null; }
 }
 
+// Seed playbooky — postupy, které Žán má umět od začátku, ne až si je sám odvodí.
+// Žijí v gitu (playbooks-seed/), při startu se doplní do runtime složky.
+// NEPŘEPISUJE existující: co si Žán nebo Ondra upravil na místě, zůstává.
+function seedPlaybooks() {
+  const zdroj = path.join(__dirname, 'playbooks-seed');
+  if (!fs.existsSync(zdroj)) return;
+  try {
+    fs.mkdirSync(PLAYBOOK_DIR, { recursive: true });
+    let doplneno = 0;
+    for (const f of fs.readdirSync(zdroj).filter(x => x.endsWith('.md'))) {
+      const cil = path.join(PLAYBOOK_DIR, f);
+      if (fs.existsSync(cil)) continue;
+      fs.copyFileSync(path.join(zdroj, f), cil);
+      doplneno++;
+    }
+    if (doplneno) console.log(`📘 Playbooky: doplněno ${doplneno} ze seedu`);
+  } catch (e) { console.error('seedPlaybooks:', e.message); }
+}
+seedPlaybooks();
+
 // rodina.md — živý profil TÉHLE domácnosti (Žán #1: Stiburkovi).
 // Per-dům data, žijí mimo git sdíleného kódu (rozhodnuti.md 2026-07-05/06).
 // Plní se dotazníkem po jedné otázce (kickoff: /onboarding), čte se celý
@@ -5114,6 +5134,10 @@ async function runObchuzka() {
       errorExcerpt = String(raw.data || '').split('\n').filter(l => /ERROR|WARNING/i.test(l)).slice(-60).join('\n');
     } catch {}
 
+    // Diagnostika je samostatné volání modelu BEZ nástrojů — playbook by se k ní jinak
+    // vůbec nedostal. Když jsou v nálezu Zigbee zařízení, vložíme mu postupy přímo.
+    const playbookSignal = zigbeeUnavailable.length ? readPlaybook('zigbee-signal') : null;
+
     try {
       const diagPrompt = `Jsi Žán, údržbář chytrého domu. Tvůj úkol je najít PŘÍČINU, ne vyjmenovat příznaky.
 
@@ -5127,7 +5151,10 @@ SLABÉ BATERIE: ${JSON.stringify(lowBattery.map(s => ({ id: s.entity_id, pct: s.
 VÝŇATEK Z ERROR LOGU HA:
 ${errorExcerpt.slice(0, 5000) || '(prázdný)'}
 
-Postup:
+${zigbeeUnavailable.length && playbookSignal ? `POSTUPY NA OŽIVENÍ ZIGBEE SIGNÁLU (playbook — drž se ho, nevymýšlej vlastní):
+${playbookSignal}
+
+` : ''}Postup:
 1) SESKUP entity podle společné příčiny (víc entit jedné integrace = JEDNA příčina, ne pět problémů).
 2) Urči, co je vážné a co kosmetické.
 3) U ZIGBEE VŽDY POUŽIJ SÍLU SIGNÁLU: zařízení s LQI pod 80 nejspíš nevypadlo poruchou, ale kvůli dosahu — do diagnózy napiš konkrétní hodnotu a doporuč přesun blíž k routeru nebo přidání opakovače (zásuvková Zigbee zařízení fungují jako routery). Když má síť málo routerů a slabých zařízení je víc, je to JEDNA systémová příčina, ne několik poruch. Naopak zařízení se silným signálem, které je mimo, ukazuje na vybitou baterii nebo poruchu — tam přesun nepomůže.

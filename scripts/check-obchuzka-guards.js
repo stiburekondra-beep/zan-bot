@@ -71,6 +71,16 @@ const kontroly = [
     /Než ho spáruješ zpátky na stejné místo/.test(obchuzka)],
   ['počítá se i počet routerů (systémová příčina)',
     /function spocitejRoutery/.test(src) && /zigbeeRouteru/.test(obchuzka)],
+
+  // ── playbook na oživení signálu (Ondra 19.8.) ──────────────────────────
+  ['seed playbook zigbee-signal existuje v repu',
+    fs.existsSync(path.join(__dirname, '..', 'playbooks-seed', 'zigbee-signal.md'))],
+  ['seed playbooky se při startu doplní do runtime složky',
+    /function seedPlaybooks/.test(src) && /seedPlaybooks\(\);/.test(src)],
+  ['seed NEPŘEPISUJE existující playbook',
+    /if \(fs\.existsSync\(cil\)\) continue;/.test(src)],
+  ['playbook se vkládá do diagnostiky obchůzky (jinak by ležel ladem)',
+    /readPlaybook\('zigbee-signal'\)/.test(obchuzka) && /POSTUPY NA OŽIVENÍ ZIGBEE SIGNÁLU/.test(obchuzka)],
 ];
 
 let chyb = 0;
