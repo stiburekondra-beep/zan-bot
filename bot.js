@@ -4856,13 +4856,84 @@ function looksLikeZigbeeDevice(device, state) {
   ].filter(Boolean).join(' ').toLowerCase();
   return /zigbee|zha|z2m|zigbee2mqtt|aqara|lumi|ikea|tradfri|zbbridge|ewelink|\bzb[-_\s]?\w*/.test(hay);
 }
+// ═══════════════════════════════════════════════
+// SÍLA ZIGBEE SIGNÁLU — u vypadávajícího zařízení bývá příčinou dosah, ne porucha.
+// Ondra 19.8.: "při párování a re-párování ať využije znalost o síle signálu
+// a dá z toho výstup."
+// Zdroje (v pořadí spolehlivosti):
+//   1) ZHA WS `zha/devices` — nese lqi, rssi, device_type (Router/EndDevice), last_seen
+//   2) fallback: diagnostické entity (*_lqi, *_rssi, *_linkquality) ze states (i Z2M)
+// LQI je 0–255. Pásma níž jsou orientační, ne norma — proto se hlásí i syrová hodnota.
+// ═══════════════════════════════════════════════
+function hodnotSignal(lqi) {
+  if (lqi == null || isNaN(lqi)) return null;
+  if (lqi < 30) return 'velmi slabý — na hraně dosahu, tohle je pravděpodobná příčina výpadků';
+  if (lqi < 80) return 'slabý — vypadávat může, chtělo by to blíž k routeru nebo opakovač';
+  if (lqi < 150) return 'ucházející';
+  return 'dobrý';
+}
+
+async function zhaSignalMap() {
+  // ieee/name → { lqi, rssi, typ, last_seen }
+  const mapa = new Map();
+  try {
+    const devices = await haWsCommand('zha/devices', {}, 15000);
+    for (const d of (Array.isArray(devices) ? devices : [])) {
+      const zaznam = {
+        lqi: d.lqi ?? null,
+        rssi: d.rssi ?? null,
+        typ: d.device_type || '',
+        last_seen: d.last_seen || null,
+        available: d.available,
+        name: d.user_given_name || d.name || '',
+      };
+      if (d.ieee) mapa.set(String(d.ieee).toLowerCase(), zaznam);
+      if (zaznam.name) mapa.set(zaznam.name.toLowerCase(), zaznam);
+    }
+  } catch (e) {
+    console.log('ZHA signál: zha/devices nedostupné (' + e.message + '), zkusím diagnostické entity');
+  }
+  return mapa;
+}
+
+// Fallback i doplněk: LQI/RSSI vystavené jako entity (ZHA diagnostika i Zigbee2MQTT)
+function signalZEntit(states, jmenoZarizeni) {
+  if (!jmenoZarizeni) return null;
+  const klic = jmenoZarizeni.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+  if (!klic) return null;
+  let lqi = null, rssi = null;
+  for (const s of states) {
+    const id = s.entity_id.toLowerCase();
+    if (!id.includes(klic)) continue;
+    const v = parseFloat(s.state);
+    if (isNaN(v)) continue;
+    if (/_lqi$|_linkquality$/.test(id)) lqi = v;
+    if (/_rssi$/.test(id)) rssi = v;
+  }
+  return (lqi != null || rssi != null) ? { lqi, rssi } : null;
+}
+
+// Kolik je v síti routerů (opakovačů) — málo routerů = systémová příčina slabého signálu
+function spocitejRoutery(signalMap) {
+  const videno = new Set();
+  let routeru = 0;
+  for (const z of signalMap.values()) {
+    const k = (z.name || '') + z.typ + z.lqi;
+    if (videno.has(k)) continue;
+    videno.add(k);
+    if (/router|coordinator/i.test(z.typ || '')) routeru++;
+  }
+  return routeru;
+}
+
 async function describeUnavailableZigbee(states) {
   const unavailable = states.filter(isUnavailableState);
   if (unavailable.length === 0) return [];
 
-  const [entityReg, deviceReg] = await Promise.all([
+  const [entityReg, deviceReg, signalMap] = await Promise.all([
     haRegistry('entity_registry').catch(() => null),
     haRegistry('device_registry').catch(() => null),
+    zhaSignalMap(),
   ]);
   const entityById = new Map((Array.isArray(entityReg) ? entityReg : []).map(e => [e.entity_id, e]));
   const deviceById = new Map((Array.isArray(deviceReg) ? deviceReg : []).map(d => [d.id, d]));
@@ -4872,13 +4943,30 @@ async function describeUnavailableZigbee(states) {
       const entity = entityById.get(s.entity_id);
       const device = entity?.device_id ? deviceById.get(entity.device_id) : null;
       if (!looksLikeZigbeeDevice(device, s)) return null;
+
+      const nazev = s.attributes?.friendly_name || entity?.name || entity?.original_name || s.entity_id;
+
+      // signál: nejdřív ZHA (podle IEEE z connections, jinak podle jména), pak entity
+      let sig = null;
+      for (const c of (device?.connections || [])) {
+        const hodnota = String(c[1] || '').toLowerCase();
+        if (signalMap.has(hodnota)) { sig = signalMap.get(hodnota); break; }
+      }
+      if (!sig && signalMap.has(nazev.toLowerCase())) sig = signalMap.get(nazev.toLowerCase());
+      if (!sig) sig = signalZEntit(states, nazev);
+
       return {
         entity_id: s.entity_id,
-        name: s.attributes?.friendly_name || entity?.name || entity?.original_name || s.entity_id,
+        name: nazev,
         age_ms: stateAgeMs(s),
         manufacturer: device?.manufacturer || '',
         model: device?.model || '',
         integration: (device?.identifiers || []).map(i => i[0]).filter(Boolean).join(', '),
+        lqi: sig?.lqi ?? null,
+        rssi: sig?.rssi ?? null,
+        typ_zarizeni: sig?.typ || '',
+        last_seen: sig?.last_seen || null,
+        signal_hodnoceni: hodnotSignal(sig?.lqi),
       };
     })
     .filter(Boolean)
@@ -4925,6 +5013,23 @@ async function restartAddon(slug) {
   return supervisorApi(`/addons/${slug}/restart`, 'post', 90000);
 }
 
+// Plná záloha PŘED nevratným zásahem (update, restart HA). Ondra 19.8. povolil
+// Žánovi i nevratné akce — podmínkou je, že z nich jde couvnout.
+// Pozn.: hassio.backup_full vrací klíč `backup`, ne `slug`
+// (CHoS-: docs/learnings/2026-07-23_supervisor-api-z-windows.md).
+async function fullBackup(duvod) {
+  const name = `zan-pred-zasahem ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+  try {
+    const r = await haPost('services/hassio/backup_full?return_response', { name });
+    const slug = r?.service_response?.backup || r?.backup || null;
+    logAction(CHAT_ONDRA, 'Žán-údržbář', 'backup_full', `${duvod} → ${slug || 'ok'}`, 'ok');
+    return { ok: true, slug, name };
+  } catch (e) {
+    logAction(CHAT_ONDRA, 'Žán-údržbář', 'backup_full', `${duvod} selhalo: ${e.message}`, 'fail');
+    return { ok: false, error: e.message };
+  }
+}
+
 async function runObchuzka() {
   const u = loadUdrzba();
   const today = todayStr();
@@ -4954,6 +5059,11 @@ async function runObchuzka() {
     const unavailable = allUnavailable.filter(s => stateAgeMs(s) >= UNAVAILABLE_MIN_AGE_MS);
     const zigbeeUnavailable = (await describeUnavailableZigbee(states))
       .filter(z => z.age_ms >= UNAVAILABLE_MIN_AGE_MS);
+    // kolik má síť opakovačů — málo routerů je systémová příčina slabého signálu
+    let zigbeeRouteru = null;
+    if (zigbeeUnavailable.length) {
+      try { zigbeeRouteru = spocitejRoutery(await zhaSignalMap()); } catch {}
+    }
 
     // 2. Čekající aktualizace (core i add-ony jsou update.* entity)
     const updates = states
@@ -4985,10 +5095,14 @@ async function runObchuzka() {
     }
 
     // ── DIAGNÓZA PŘÍČIN + PROAKTIVNÍ ZÁSAHY ───────────────────────────────
-    // Mantinely VYNUCUJE KÓD, ne model:
-    //   - reload integrace: JEN na entity ze seznamu unavailable, max 2×/den/entita
-    //   - restart add-onu: JEN slug, který zná Supervisor, max 1×/den/add-on
-    //   - nikdy: instalace aktualizací, mazání, restart celého HA, Zigbee re-pair
+    // Ondra 19.8.: "vsechno to zapni" — Žán smí i nevratné zásahy.
+    // Mantinely VYNUCUJE KÓD, ne model. Nejde už o zákazy, ale o VRATNOST
+    // a o ochranu před smyčkou (restart → unavailable → restart → ...):
+    //   - reload integrace: JEN na entity ze seznamu unavailable, max 5×/den/entita
+    //   - restart add-onu:  JEN slug, který zná Supervisor, max 3×/den/add-on
+    //   - Zigbee párování:  max 2×/den, okno se zavře samo
+    //   - instalace updatu: VŽDY nejdřív plná záloha; max 3×/den, Core/OS max 1×/den
+    //   - restart celého HA: VŽDY nejdřív plná záloha; max 1×/den (víc = smyčka)
     const revivedIds = new Set();
     const opraveno = [];
     const neopraveno = [];
@@ -5004,7 +5118,8 @@ async function runObchuzka() {
       const diagPrompt = `Jsi Žán, údržbář chytrého domu. Tvůj úkol je najít PŘÍČINU, ne vyjmenovat příznaky.
 
 NEDOSTUPNÉ ENTITY (>1 h): ${JSON.stringify(unavailable.slice(0, 30).map(s => ({ id: s.entity_id, name: s.attributes.friendly_name || s.entity_id, age: formatAge(stateAgeMs(s)) })))}
-ZIGBEE OFFLINE KANDIDÁTI: ${JSON.stringify(zigbeeUnavailable.slice(0, 20).map(z => ({ id: z.entity_id, name: z.name, age: formatAge(z.age_ms), manufacturer: z.manufacturer, model: z.model, integration: z.integration })))}
+ZIGBEE OFFLINE KANDIDÁTI (vč. SÍLY SIGNÁLU — LQI 0-255, pod 30 je na hraně dosahu, pod 80 slabý): ${JSON.stringify(zigbeeUnavailable.slice(0, 20).map(z => ({ id: z.entity_id, name: z.name, age: formatAge(z.age_ms), manufacturer: z.manufacturer, model: z.model, lqi: z.lqi, rssi: z.rssi, typ: z.typ_zarizeni, hodnoceni: z.signal_hodnoceni })))}
+ZIGBEE SÍŤ: ${zigbeeRouteru != null ? `${zigbeeRouteru} routerů/opakovačů` : 'počet routerů se nepodařilo zjistit'}
 ADD-ONY, KTERÉ NEBĚŽÍ: ${JSON.stringify(addonsDown.map(a => ({ slug: a.slug, name: a.name, state: a.state })))}
 VŠECHNY NAINSTALOVANÉ ADD-ONY: ${JSON.stringify(addons.map(a => ({ slug: a.slug, name: a.name, state: a.state })))}
 ČEKAJÍCÍ UPDATY: ${JSON.stringify(updates)}
@@ -5015,12 +5130,16 @@ ${errorExcerpt.slice(0, 5000) || '(prázdný)'}
 Postup:
 1) SESKUP entity podle společné příčiny (víc entit jedné integrace = JEDNA příčina, ne pět problémů).
 2) Urči, co je vážné a co kosmetické.
-3) Navrhni zásahy, které to můžou opravit.
+3) U ZIGBEE VŽDY POUŽIJ SÍLU SIGNÁLU: zařízení s LQI pod 80 nejspíš nevypadlo poruchou, ale kvůli dosahu — do diagnózy napiš konkrétní hodnotu a doporuč přesun blíž k routeru nebo přidání opakovače (zásuvková Zigbee zařízení fungují jako routery). Když má síť málo routerů a slabých zařízení je víc, je to JEDNA systémová příčina, ne několik poruch. Naopak zařízení se silným signálem, které je mimo, ukazuje na vybitou baterii nebo poruchu — tam přesun nepomůže.
+4) Navrhni zásahy, které to můžou opravit.
 
-Povolené zásahy (nic jiného kód neprovede):
+Povolené zásahy (nic jiného kód neprovede), od nejmírnějšího:
  - {"typ":"reload","entity_id":"..."} — reload integrace té entity. Dává smysl u zamrzlé integrace nebo síťového zařízení. NEDÁVÁ smysl u vybité baterie ani u fyzicky odpojeného Zigbee zařízení.
- - {"typ":"restart_addon","slug":"..."} — restart add-onu. Dává smysl, když add-on neběží nebo je jeho integrace zamrzlá (např. zigbee2mqtt, mosquitto, music assistant). Slug musí být ze seznamu výše.
-Zigbee re-pair, instalaci aktualizací ani restart HA nenavrhuj — ty dělá jen člověk.
+ - {"typ":"restart_addon","slug":"..."} — restart add-onu. Když add-on neběží nebo je jeho integrace zamrzlá (zigbee2mqtt, mosquitto, music assistant). Slug musí být ze seznamu výše.
+ - {"typ":"zigbee_pair"} — otevře Zigbee párování na pár minut. Jen když je odpojené Zigbee zařízení, které se má znovu spárovat. Fyzický reset zařízení stejně musí udělat člověk — tohle jen otevře okno.
+ - {"typ":"install_update","entity_id":"update....."} — nainstaluje čekající aktualizaci. Před instalací se VŽDY dělá plná záloha (dělá kód sám). U HA Core / Operating System to zvaž obzvlášť opatrně — breaking changes umí rozbít integrace.
+ - {"typ":"restart_ha"} — restart celého Home Assistanta. Poslední instance, když nic mírnějšího nepomohlo a víc integrací je mimo. Dům je na pár minut bez řízení.
+POŘADÍ JE ZÁVAZNÉ: nejdřív zkus to nejmírnější, co může příčinu odstranit. Restart HA nenavrhuj jako první krok, když stačí reload jedné integrace.
 Max 4 zásahy, seřaď od nejpravděpodobnější příčiny.
 
 Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčina a co je vážné","zasahy":[{"typ":"reload|restart_addon","entity_id":"...","slug":"...","duvod":"..."}]}`;
@@ -5053,7 +5172,7 @@ Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčin
           if (!unavailableIds.has(z.entity_id)) continue;         // mimo allowlist
           const key = 'reload:' + z.entity_id;
           const count = u.interventions[today][key] || 0;
-          if (count >= 2) { neopraveno.push(`${z.entity_id} — dnes už jsem reload zkoušel ${count}×, chce to lidský pohled`); continue; }
+          if (count >= 5) { neopraveno.push(`${z.entity_id} — dnes už jsem reload zkoušel ${count}×, dál to nemá smysl opakovat`); continue; }
           u.interventions[today][key] = count + 1;
           saveUdrzba(u);
           try {
@@ -5080,7 +5199,7 @@ Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčin
           if (!z.slug || !addonSlugs.has(z.slug)) continue;        // mimo allowlist Supervisoru
           const key = 'addon:' + z.slug;
           const count = u.interventions[today][key] || 0;
-          if (count >= 1) { neopraveno.push(`add-on ${z.slug} — dnes už jsem ho restartoval, znovu nesahám`); continue; }
+          if (count >= 3) { neopraveno.push(`add-on ${z.slug} — dnes už jsem ho restartoval ${count}×, dál to nepomáhá`); continue; }
           u.interventions[today][key] = count + 1;
           saveUdrzba(u);
           try {
@@ -5096,6 +5215,104 @@ Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčin
             logAction(CHAT_ONDRA, 'Žán-údržbář', 'restart_addon', z.slug, 'fail');
             neopraveno.push(`add-on ${z.slug} — restart selhal: ${e.message}`);
           }
+          continue;
+        }
+
+        // ---- otevreni Zigbee parovani (vratne, okno se zavre samo) ----
+        if (z.typ === 'zigbee_pair') {
+          const key = 'zigbee_pair';
+          const count = u.interventions[today][key] || 0;
+          if (count >= 2) { neopraveno.push('Zigbee párování jsem dnes otevíral už 2×, dál ne'); continue; }
+          u.interventions[today][key] = count + 1;
+          saveUdrzba(u);
+          // stejná dvojcesta jako nástroj zigbee_permit_join: ZHA služba, jinak Z2M přepínač
+          let otevreno = false;
+          try {
+            await haPost('services/zha/permit', { duration: 120 });
+            otevreno = true;
+          } catch (e1) {
+            try {
+              const pj = states.find(x => x.entity_id.includes('permit_join') && ['switch', 'input_boolean'].includes(x.entity_id.split('.')[0]));
+              if (pj) {
+                await haPost(`services/${pj.entity_id.split('.')[0]}/turn_on`, { entity_id: pj.entity_id });
+                otevreno = true;
+              }
+            } catch (e2) { /* ani Z2M cesta nevyšla */ }
+          }
+          if (otevreno) {
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'zigbee_permit', '120 s', 'ok');
+            // Ondra 19.8.: u párování rovnou říct, co víme o signálu — ať se zařízení
+            // nepáruje znovu na místě, kde stejně nebude držet.
+            const kandidati = zigbeeUnavailable.filter(x => x.lqi != null).slice(0, 5);
+            let radaKSignalu = '';
+            if (kandidati.length) {
+              const nej = kandidati.sort((a, b) => (a.lqi || 0) - (b.lqi || 0))[0];
+              radaKSignalu = ` Nejhorší signál měl "${nej.name}" (LQI ${nej.lqi}${nej.rssi != null ? `, RSSI ${nej.rssi} dBm` : ''}) — ${nej.signal_hodnoceni}.`;
+              if (nej.lqi < 80) {
+                radaKSignalu += ' Než ho spáruješ zpátky na stejné místo: posuň ho blíž k routeru, nebo mezi něj a bránu dej Zigbee zásuvku, která dělá opakovač — jinak bude vypadávat dál.';
+              }
+              if (zigbeeRouteru != null && zigbeeRouteru <= 2) {
+                radaKSignalu += ` Síť má jen ${zigbeeRouteru} router(y) — na větší dům je to málo, opakovač pomůže všem zařízením naráz.`;
+              }
+            } else {
+              radaKSignalu = ' Sílu signálu se mi u odpojených zařízení nepodařilo zjistit.';
+            }
+            opraveno.push(`otevřel jsem Zigbee párování na 2 minuty — fyzický reset zařízení musíš udělat ty.${radaKSignalu}`);
+          } else {
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'zigbee_permit', 'ZHA i Z2M cesta selhala', 'fail');
+            neopraveno.push('Zigbee párování se nepodařilo otevřít (ani ZHA, ani Zigbee2MQTT)');
+          }
+          continue;
+        }
+
+        // ---- instalace aktualizace (NEVRATNE -> vzdy zaloha predem) ----
+        if (z.typ === 'install_update') {
+          if (!z.entity_id || !z.entity_id.startsWith('update.')) continue;
+          const jeCoreNeboOs = /core|operating_system|supervisor/i.test(z.entity_id);
+          const key = 'update:' + z.entity_id;
+          const denniUpdaty = Object.keys(u.interventions[today]).filter(k => k.startsWith('update:')).length;
+          const coreDnes = Object.keys(u.interventions[today]).filter(k => /^update:.*(core|operating_system|supervisor)/i.test(k)).length;
+          if ((u.interventions[today][key] || 0) >= 1) { neopraveno.push(`${z.entity_id} — update jsem dnes už zkoušel`); continue; }
+          if (denniUpdaty >= 3) { neopraveno.push(`${z.entity_id} — dnes jsem už instaloval 3 aktualizace, zbytek nechávám na tebe`); continue; }
+          if (jeCoreNeboOs && coreDnes >= 1) { neopraveno.push(`${z.entity_id} — Core/OS aktualizaci dělám max jednu denně`); continue; }
+          u.interventions[today][key] = 1;
+          saveUdrzba(u);
+
+          const zal = await fullBackup(`update ${z.entity_id}`);
+          if (!zal.ok) {
+            neopraveno.push(`${z.entity_id} — aktualizaci NEinstaluju, nepodařilo se udělat zálohu (${zal.error})`);
+            continue;
+          }
+          try {
+            await haPost('services/update/install', { entity_id: z.entity_id });
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'install_update', z.entity_id, 'ok');
+            opraveno.push(`nainstaloval jsem aktualizaci ${z.entity_id} (záloha "${zal.name}" předem)`);
+          } catch (e) {
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'install_update', z.entity_id, 'fail');
+            neopraveno.push(`${z.entity_id} — instalace selhala: ${e.message} (záloha "${zal.name}" existuje)`);
+          }
+          continue;
+        }
+
+        // ---- restart celeho HA (posledni instance -> vzdy zaloha predem) ----
+        if (z.typ === 'restart_ha') {
+          const key = 'restart_ha';
+          if ((u.interventions[today][key] || 0) >= 1) { neopraveno.push('restart HA jsem dnes už udělal, podruhé ne — to by byla smyčka'); continue; }
+          u.interventions[today][key] = 1;
+          saveUdrzba(u);
+
+          const zal = await fullBackup('restart HA');
+          try {
+            // report musi odejit DRIV, nez si Žán podřízne větev pod sebou
+            await sendSafe(CHAT_ONDRA, `🔧 Restartuju Home Assistanta — ${z.duvod || 'víc integrací je mimo a mírnější zásahy nepomohly'}. Záloha ${zal.ok ? `"${zal.name}" je hotová` : 'se nepovedla'}. Dům bude pár minut bez řízení.`);
+            await haPost('services/homeassistant/restart', {});
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'restart_ha', z.duvod || '', 'ok');
+            opraveno.push('restartoval jsem Home Assistanta');
+          } catch (e) {
+            logAction(CHAT_ONDRA, 'Žán-údržbář', 'restart_ha', e.message, 'fail');
+            neopraveno.push(`restart HA selhal: ${e.message}`);
+          }
+          continue;
         }
       }
     } catch (e) {
@@ -5146,10 +5363,19 @@ Vrať POUZE JSON: {"diagnoza":"stručně česky pro majitele — CO je příčin
     }
 
     if (zigbeeLeft.length) {
-      lines.push('🛜 *Zigbee k fyzické kontrole* (re-pair nespouštím sám):');
+      lines.push('🛜 *Zigbee zařízení mimo:*');
       for (const z of zigbeeLeft.slice(0, 10)) {
         const hw = [z.manufacturer, z.model].filter(Boolean).join(' ');
         lines.push(`  • ${z.name} (${formatAge(z.age_ms)}${hw ? `, ${hw}` : ''})`);
+        if (z.lqi != null) {
+          lines.push(`    📶 signál naposledy LQI ${z.lqi}${z.rssi != null ? ` / RSSI ${z.rssi} dBm` : ''} — ${z.signal_hodnoceni}`);
+        } else {
+          lines.push('    📶 sílu signálu se mi nepodařilo zjistit');
+        }
+      }
+      const slabe = zigbeeLeft.filter(z => z.lqi != null && z.lqi < 80);
+      if (slabe.length) {
+        lines.push(`    ↳ ${slabe.length} z nich mělo slabý signál — spíš než porucha to vypadá na dosah (blíž k routeru, nebo přidat opakovač).`);
       }
       lines.push('');
     }
