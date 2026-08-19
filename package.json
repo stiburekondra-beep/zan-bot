@@ -43,7 +43,8 @@
     "test:pairing-followup": "node scripts/check-pairing-followup.js",
     "test:communication-profile": "node scripts/check-communication-profile.js",
     "test:temperature-sense": "node scripts/check-temperature-sense.js",
-    "test:narrator": "node scripts/check-narrator.js"
+    "test:narrator": "node scripts/check-narrator.js",
+    "test:subscription-auth": "node scripts/check-subscription-auth.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

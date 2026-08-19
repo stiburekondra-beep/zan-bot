@@ -30,6 +30,11 @@ export ZAN_MODEL_FAST=$(jq --raw-output '.ZAN_MODEL_FAST // ""' /data/options.js
 export ZAN_MODEL_SMART=$(jq --raw-output '.ZAN_MODEL_SMART // ""' /data/options.json)
 export ZAN_MODEL_SERVIS=$(jq --raw-output '.ZAN_MODEL_SERVIS // ""' /data/options.json)
 
+# Subscription-first auth (prototyp, OFF by default — prázdné = jede na API klíči).
+export ZAN_AUTH_MODE=$(jq --raw-output '.ZAN_AUTH_MODE // ""' /data/options.json)
+export ZAN_SUBSCRIPTION_PROXY_URL=$(jq --raw-output '.ZAN_SUBSCRIPTION_PROXY_URL // ""' /data/options.json)
+export ZAN_SUBSCRIPTION_TOKEN=$(jq --raw-output '.ZAN_SUBSCRIPTION_TOKEN // ""' /data/options.json)
+
 # Video na TV přes Google Cast (nástroj play_video). Prázdný YOUTUBE_API_KEY
 # = hledání přes veřejnou stránku výsledků YouTube; s klíčem jde oficiální
 # Data API. Prázdné ZAN_VIDEO_PLAYER_ENTITY_ID = autodetekce cast obrazovky.
