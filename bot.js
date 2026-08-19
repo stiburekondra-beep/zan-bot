@@ -1644,12 +1644,13 @@ function buildTools(chatId, profil) {
     },
     {
       name: 'assign_area',
-      description: 'Přiřadí entitu do místnosti v HA entity registry.',
+      description: 'Přiřadí místnost JEDNÉ ENTITĚ (entity override). VÝJIMEČNÝ nástroj — normálně patří místnost na zařízení, použij ha_setup_assign_device. Override je správně jen tehdy, když jedno fyzické zařízení sahá do dvou místností (např. dvoukanálové relé, kde jeden kanál spíná světlo v koupelně a druhý na chodbě). Jinak by tvoji práci neviděly dashboardy ani area cíle automatizací.',
       input_schema: {
         type: 'object',
         properties: {
           entity_id: { type: 'string' },
           area_name: { type: 'string', description: 'Název oblasti, např. Obývák' },
+          override_duvod: { type: 'string', description: 'Proč tahle entita patří do jiné místnosti než její zařízení (např. "druhý kanál relé spíná světlo na chodbě"). Bez důvodu nástroj odmítne a odkáže na ha_setup_assign_device.' },
         },
         required: ['entity_id', 'area_name'],
       },
@@ -2722,6 +2723,16 @@ async function executeTool(name, input, chatId) {
 
       case 'rename_entity': {
         if (!isAdmin(chatId)) return { error: 'Přejmenování vyžaduje admin přístup.' };
+        // POJISTKA (2026-08-19): do pole "název" se nesmí dostat entity_id.
+        // Stalo se: switch.sonoff_acc8009232 dostal jméno "light.obyvak1" — v UI to
+        // vypadá rozbitě. Standard: playbook "ha-pojmenovani-a-mistnosti", pravidlo 2.
+        if (/^(light|switch|sensor|binary_sensor|cover|climate|fan|lock|media_player|camera|valve|siren|number|select|button|update|scene|script|automation|input_\w+)\.[a-z0-9_]+$/i.test(String(input.new_name || '').trim())) {
+          return {
+            error: 'To není jméno, ale entity_id.',
+            proc: `"${input.new_name}" má tvar entity_id. Do pole název patří lidský popis, jak by to řekl člověk — třeba "Stropní světlo" nebo "Jídelní kout".`,
+            dalsi_krok: 'Když jsi chtěl změnit entity_id (technický identifikátor), řekni to výslovně — je to jiná operace a je potřeba nejdřív projít automatizace a dashboardy, které ho používají.',
+          };
+        }
         try {
           // Oprava 2026-07-05: REST config/entity_registry/update vrací 404
           // (HA to vystavuje jen přes WebSocket) — přepnuto na haWsCommand.
@@ -2838,10 +2849,37 @@ async function executeTool(name, input, chatId) {
           if (!area) {
             return { error: `Oblast "${input.area_name}" nenalezena.`, available: Array.isArray(areas) ? areas.map(a => a.name) : [] };
           }
+
+          // POJISTKA (2026-08-19): místnost patří na ZAŘÍZENÍ, ne na entitu.
+          // Entity override je výjimka pro zařízení sahající do dvou místností.
+          // Když Žán přiřadí entitu, nástroje čtoucí device_registry (dashboardy,
+          // area cíle) jeho práci vůbec neuvidí — přesně to se stalo 19.8.
+          // Standard: playbook "ha-pojmenovani-a-mistnosti", pravidlo 1.
+          const entReg = await haWsCommand('config/entity_registry/list').catch(() => []);
+          const entita = Array.isArray(entReg) ? entReg.find(e => e.entity_id === input.entity_id) : null;
+          if (entita && entita.device_id && !input.override_duvod) {
+            const devReg = await haWsCommand('config/device_registry/list').catch(() => []);
+            const dev = Array.isArray(devReg) ? devReg.find(d => d.id === entita.device_id) : null;
+            const sourozenci = Array.isArray(entReg)
+              ? entReg.filter(e => e.device_id === entita.device_id && /^(light|switch|cover|climate|fan|lock|valve|media_player)\./.test(e.entity_id))
+              : [];
+            return {
+              error: 'Použij ha_setup_assign_device — místnost patří na zařízení, ne na entitu.',
+              proc: `${input.entity_id} patří zařízení ${dev ? (dev.name_by_user || dev.name) : entita.device_id}. Když dáš místnost zařízení, entity ji zdědí a uvidí to i dashboardy a hlasové povely. Entity override vidí jen HA UI.`,
+              dalsi_krok: `ha_setup_assign_device(device_id: "${entita.device_id}", area_id: "${area.area_id}")`,
+              kdy_je_override_spravne: sourozenci.length > 1
+                ? `Tohle zařízení má ${sourozenci.length} ovládacích entit (${sourozenci.map(e => e.entity_id).join(', ')}). Když KAŽDÁ spíná něco v JINÉ místnosti, override je správně — pak zavolej assign_area znovu s override_duvod:"proč" a vysvětli to.`
+                : 'Override dává smysl jen u zařízení, které fyzicky sahá do dvou místností (dvoukanálové relé). Tohle takové není.',
+            };
+          }
+
           // Oprava 2026-07-05: REST config/entity_registry/update vrací 404 — WS.
           await haWsCommand('config/entity_registry/update', { entity_id: input.entity_id, area_id: area.area_id });
-          logAction(chatId, user.name, 'assign_area', input.entity_id, area.area_id);
-          return { success: true, message: `${input.entity_id} přiřazena do oblasti ${area.name}` };
+          logAction(chatId, user.name, 'assign_area', input.entity_id, `${area.area_id}${input.override_duvod ? ` (override: ${input.override_duvod})` : ''}`);
+          return {
+            success: true,
+            message: `${input.entity_id} přiřazena do oblasti ${area.name}${input.override_duvod ? ' (entity override)' : ''}`,
+          };
         } catch (e) {
           return { error: e.message };
         }
@@ -3886,6 +3924,12 @@ Po KAŽDÉM write_dashboard zavolej validate_dashboard a chybějící entity opr
 NOVÉ ZAŘÍZENÍ: nejdřív zjisti, jestli už je v HA nebo na síti → get_new_entities / scan_all_devices / scan_network. Návrh kategorie z nástroje je jen kandidát, finální typ potvrď uživatelem. Wi-Fi/LAN zařízení přidávej přes onboard_device(category, handler, ...): handler netipuj, vyber ho podle výrobce/modelu/oficiální HA integrace; když ho neznáš, řekni co chybí. Zigbee/Matter: pokud ještě není spárované → zigbee_permit_join → předej uživateli konkrétní instrukce a když nástroj vrátí proactive_followup, řekni, že se sám ozveš a zkontroluješ nová zařízení; po potvrzení uživatele nebo po vlastní kontrolní zprávě spusť scan_all_devices/get_new_entities → identifikuj nové. Pak navrhni české názvy + místnost → ČEKEJ na OK → rename_entity → ha_setup_create_area (jen když chybí) → ha_setup_assign_device → remember → navrhni 2–3 automatizace s YAML → ČEKEJ na OK → write_package → doporuč doplňkový HW.
 PROAKTIVITA PŘI PÁROVÁNÍ: nikdy nekonči pasivně „dej mi vědět / napiš mi". U každého párovacího kroku oznam stav aktivně: co jsem našel nebo spustil, co má člověk teď fyzicky udělat, kdy se sám ozvu / co sám zkontroluju, a čím ověřím výsledek. „Hotovo, přidal jsem" smíš říct až po ověření nové entity nebo úspěšného create_entry; jinak řekni další konkrétní krok.
 MÍSTNOST U NOVÉHO ZAŘÍZENÍ: když uživatel řekne místnost, používej přesný název, který řekl. Nesmíš si ho potichu přeložit na jinou existující místnost (např. "pracovna = Dílna"). Pokud stejnou místnost v HA nevidíš, zeptej se, jestli ji máš vytvořit, nebo kam z existujících místností zařízení patří.
+STANDARD POJMENOVÁNÍ A MÍSTNOSTÍ (závazné, detaily v playbooku "ha-pojmenovani-a-mistnosti"):
+ 1) Místnost patří na ZAŘÍZENÍ → ha_setup_assign_device. Entity ji zdědí. assign_area (entity override) použij JEN když jedno fyzické zařízení opravdu sahá do dvou místností (dvoukanálové relé, kde každý kanál spíná něco v jiné místnosti). Když oba kanály míří do stejného pokoje, override nedělej — nástroje čtoucí zařízení by tvoji práci vůbec neviděly.
+ 2) Do pole NÁZEV nikdy nepiš entity_id. "light.obyvak1" není jméno, je to identifikátor. Jméno je lidský popis ("Stropní světlo"). Když chceš změnit entity_id, měň entity_id.
+ 3) Název neopakuj místnost, ve které zařízení je — HA zobrazuje "Místnost + název" a vzniklo by "Obývák Obývák – světlo".
+ 4) Když přejmenováváš zařízení, přejmenuj i jeho ovládací entity (sourozence); diagnostické (_lqi, _rssi, _baterie) nech být.
+ 5) Před změnou entity_id projdi automatizace, skripty, scény a dashboardy (i badges a hlavičky sekcí) — přejmenování je tiše rozbije. Když si nejsi jistý, změň jen zobrazovaný název, ten nerozbije nic.
 TECHNOLOGIE A DOKUMENTACE: když se uživatel ptá, jaké technologie dům má/bude mít, nebo kde je manuál, použij technology_inventory. Položka se stavem "plánováno-nezapojeno" je jen znalostní plán, není důkaz ovládání. U Samsung kanálových jednotek a rekuperace v Ondrově domě výslovně říkej, že nejsou zapojené a Žán dnes neřídí teploty ani větrání, dokud to není fyzicky ověřené.
 MAPA DOMU: když se uživatel ptá, co je kde v domě, co s čím sousedí, kde stojí věc, nebo pracuješ s půdorysem, použij house_map. Místnosti v house_map musí odkazovat na ověřené HA area_id z get_areas/ha_setup_list; nevytvářej druhý číselník místností. U Polycam/export seedu vždy nejdřív použij prepare_seed: autoritou jsou zákazníkem zadané/HA názvy místností, Polycam auto-názvy jsou jen fuzzy fallback a poznámka. apply_seed volej jen s confirmed:true po lidské kontrole návrhu a bez nevyřešených místností. Sousednost, dveře, schody a věci ukládej jen z potvrzeného půdorysu nebo z výslovné věty uživatele. Když informace v mapě chybí, řekni, že ji nevíš, a zeptej se na potvrzení místo domýšlení.
 DRUHÝ SMYSL (TEPLOTA): když se máš přesvědčit, jestli teplota reálně reaguje ("je tepleji?", "zatopilo se?", "stoupá teplota?"), nevěř slepě tomu, že akce zabrala — použij check_temperature(room=...). Vrátí aktuální hodnotu z čidla a NAMĚŘENÝ trend z historie. Řekni, co čidlo ukazuje ("v obýváku je 20,6 °C a stoupá o +0,4 °C za 30 min" / "drží se" / "zatím trend nezměřím"). Když v místnosti čidlo není, řekni to a teplotu NEFABULUJ. Tohle je jen měření a poctivá rada — nikdy z toho nedělej claim, že Žán řídí topení nebo klima (kanálové jednotky doma nejsou zapojené).

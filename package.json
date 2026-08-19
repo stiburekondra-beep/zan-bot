@@ -45,7 +45,8 @@
     "test:temperature-sense": "node scripts/check-temperature-sense.js",
     "test:narrator": "node scripts/check-narrator.js",
     "test:subscription-auth": "node scripts/check-subscription-auth.js",
-    "test:obchuzka-guards": "node scripts/check-obchuzka-guards.js"
+    "test:obchuzka-guards": "node scripts/check-obchuzka-guards.js",
+    "test:ha-naming-standard": "node scripts/check-ha-naming-standard.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
