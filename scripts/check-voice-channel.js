@@ -1,6 +1,7 @@
 'use strict';
 const assert = require('assert');
-const { tokenOk, resolveVoiceChat, createVoiceHandler } = require('../voice-channel');
+const { tokenOk, resolveVoiceChat, createVoiceHandler, createNarratorHandler } = require('../voice-channel');
+const { pickNarratorFiller } = require('../narrator');
 
 const TOKEN = 'sekret-voice-token-123';
 const ALLOWED = [111, 222];
@@ -69,5 +70,31 @@ const handle = createVoiceHandler({ token: TOKEN, allowedChats: ALLOWED, default
   assert.strictEqual(out.status, 500, 'chyba dispatch → 500');
   assert.strictEqual(out.json.error, 'model down', 'chyba se propíše');
 
-  console.log('check-voice-channel: OK (auth + chat resolve + handler e2e)');
+  // ── 4) createNarratorHandler: instant filler, žádný mozek, fail-closed ──
+  const narrate = createNarratorHandler({ token: TOKEN, pickFiller: pickNarratorFiller });
+
+  // 4a) bez tokenu → 401 (fail-closed)
+  out = await narrate({ authHeader: 'Bearer spatny', body: { text: 'zapni světlo' } });
+  assert.strictEqual(out.status, 401, 'narrate: špatný token → 401');
+
+  // 4b) prázdný text → 400
+  out = await narrate({ authHeader: `Bearer ${TOKEN}`, body: { text: '   ' } });
+  assert.strictEqual(out.status, 400, 'narrate: prázdný text → 400');
+
+  // 4c) povel k ovládání → narrate:true + neprázdná krycí fráze
+  out = await narrate({ authHeader: `Bearer ${TOKEN}`, body: { text: 'zhasni v obýváku' } });
+  assert.strictEqual(out.status, 200, 'narrate: povel → 200');
+  assert.strictEqual(out.json.narrate, true, 'narrate: povel má krycí frázi');
+  assert.ok(out.json.narrator.length > 0, 'narrate: fráze není prázdná');
+
+  // 4d) triviální pozdrav → narrate:false (mozek odpoví hned, žádná fráze)
+  out = await narrate({ authHeader: `Bearer ${TOKEN}`, body: { text: 'ahoj' } });
+  assert.strictEqual(out.status, 200, 'narrate: pozdrav → 200');
+  assert.strictEqual(out.json.narrate, false, 'narrate: triviální zpráva → žádná fráze');
+  assert.strictEqual(out.json.narrator, '', 'narrate: prázdná fráze u triviální zprávy');
+
+  // 4e) narrator handler NIKDY nevolá mozek (žádný dispatch parametr vůbec)
+  //     — dokázáno tím, že handler nemá dispatch a přesto vrací 200 (výše).
+
+  console.log('check-voice-channel: OK (auth + chat resolve + handler e2e + narrate)');
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -1,6 +1,6 @@
 name: "Žán Bot"
 description: "AI správce domu Žán — Telegram bot pro Home Assistant"
-version: "5.12.12"
+version: "5.12.13"
 slug: "zan_bot"
 init: false
 arch:
@@ -42,6 +42,11 @@ options:
   ZAN_MODEL_FAST: ""
   ZAN_MODEL_SMART: ""
   ZAN_MODEL_SERVIS: ""
+  # Subscription-first auth (PROTOTYP, OFF by default — prázdné = jede na API klíči).
+  # Zapnout jen vědomě na firemním účtu: ZAN_AUTH_MODE=subscription + proxy URL + token.
+  ZAN_AUTH_MODE: ""
+  ZAN_SUBSCRIPTION_PROXY_URL: ""
+  ZAN_SUBSCRIPTION_TOKEN: ""
 schema:
   TELEGRAM_TOKEN: str
   CHAT_ID_ONDRA: str
@@ -65,3 +70,6 @@ schema:
   ZAN_MODEL_FAST: str?
   ZAN_MODEL_SMART: str?
   ZAN_MODEL_SERVIS: str?
+  ZAN_AUTH_MODE: str?
+  ZAN_SUBSCRIPTION_PROXY_URL: str?
+  ZAN_SUBSCRIPTION_TOKEN: str?

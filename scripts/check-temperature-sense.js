@@ -87,6 +87,38 @@ const vNoTrend = t.buildTemperatureVerdict({
 ok('málo dat: hodnota ano, trend „nezměřím" (nefabuluje)',
   /20,6\s*°C/.test(vNoTrend.text) && /nezměřím/.test(vNoTrend.text) && vNoTrend.trend === 'unknown');
 
+// ── PLAUSIBILITA (sc.70): glitch hodnoty čidla se NEHLÁSÍ jako teplota ──
+// isPlausibleRoomTemp: sentinely mimo pásmo, věrohodné hodnoty uvnitř.
+ok('isPlausibleRoomTemp: DS18B20 −127 chyba → false', !t.isPlausibleRoomTemp(-127));
+ok('isPlausibleRoomTemp: DS18B20 85 POR → false', !t.isPlausibleRoomTemp(85));
+ok('isPlausibleRoomTemp: Zigbee 255 overflow → false', !t.isPlausibleRoomTemp(255));
+ok('isPlausibleRoomTemp: reálná pokojová 20,6 → true', t.isPlausibleRoomTemp(20.6));
+ok('isPlausibleRoomTemp: mrazivá garáž −18 → true (diskriminace)', t.isPlausibleRoomTemp(-18));
+ok('isPlausibleRoomTemp: 0 °C (uvnitř pásma, nechytneme hodnotou) → true', t.isPlausibleRoomTemp(0));
+
+// computeTrend: glitch bod v historii se zahodí PŘED trendem (žádný absurdní trend).
+const glitchHist = [{ t: base, v: 21.0 }, { t: base + 15 * 60000, v: -127 }, { t: base + 30 * 60000, v: 21.4 }];
+const glitchTrend = t.computeTrend(glitchHist);
+ok('computeTrend: −127 glitch zahozen, žádný absurdní pokles',
+  glitchTrend.samples === 2 && glitchTrend.deltaC !== null && Math.abs(glitchTrend.deltaC) < 5);
+ok('computeTrend: DS18B20 85 POR zahozen',
+  t.computeTrend([{ t: base, v: 20 }, { t: base + 30 * 60000, v: 85 }]).samples === 1);
+// Diskriminace: zdravé body projdou beze změny.
+ok('computeTrend: zdravé body dál rising (nepřeblokuje)', t.computeTrend(rising).trend === 'rising');
+
+// buildTemperatureVerdict: glitch aktuální hodnota → sensor_glitch, ne fabulace.
+const vGlitch = t.buildTemperatureVerdict({
+  roomQuery: 'obývák', areaResolved: true, areaName: 'Obývák',
+  sensors: ['sensor.obyvak_teplota'], currentC: -127, trend: t.computeTrend([]),
+});
+ok('glitch current → sensor_glitch, current_c null', vGlitch.reason === 'sensor_glitch' && vGlitch.current_c === null);
+ok('glitch current: text NEHLÁSÍ −127 jako teplotu (nefabuluje)',
+  /nesmyslnou|chyba čidla/i.test(vGlitch.text) && vGlitch.trend === 'unknown');
+ok('glitch 85 POR → sensor_glitch',
+  t.buildTemperatureVerdict({ roomQuery: 'obývák', areaResolved: true, areaName: 'Obývák', sensors: ['sensor.x'], currentC: 85 }).reason === 'sensor_glitch');
+// Diskriminace: věrohodná hodnota dál projde jako ok.
+ok('věrohodná hodnota 20,6 dál ok (nepřeblokuje)', vOk.reason === 'ok' && vOk.current_c === 20.6);
+
 // ── historyToPoints: parsuje HA history/period tvar ──
 const hist = [[
   { entity_id: 'sensor.obyvak_teplota', state: '20.0', last_changed: new Date(base).toISOString() },

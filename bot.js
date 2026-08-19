@@ -63,7 +63,8 @@ const {
   formatEntityArchiveList,
 } = require('./entity-archive');
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
-const { createVoiceHandler } = require('./voice-channel');
+const { createVoiceHandler, createNarratorHandler } = require('./voice-channel');
+const { pickNarratorFiller } = require('./narrator');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
@@ -72,6 +73,7 @@ const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
 const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, buildPairingCheckMessage } = require('./pairing-followup');
+const { resolveAuthConfig, isLimitError, subscriptionClientOptions, SubscriptionRouter } = require('./subscription-auth');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
 // image add-onu (Alpine, apk add nodejs) nemusí mít Node dost novej na to,
@@ -413,6 +415,30 @@ if (!HARNESS_ONLY && !BOT_USERNAME) {
     .catch((e) => console.error('getMe (bot username) selhalo:', e.message));
 }
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+
+// ── Subscription-first auth (karta 2026-08-16-programator-zana-02, PROTOTYP,
+// feature-flag OFF by default). Když je subscription režim vědomě zapnutý
+// (ZAN_AUTH_MODE=subscription + proxy + token, na firemním účtu), Žán jede
+// přes komunitní OAuth proxy a na placené API padá jen při vyčerpaném tarifu
+// (429/limit), po cooldownu zpět. DEFAULT (prázdné env) → AUTH_CFG.active=false
+// → subscriptionAnthropic zůstane null → claudeCreate jede beze změny na API.
+// Poctivá hrana: OAuth proxy cesta NENÍ živě ověřená (gated na firemní-účet
+// test), proti ToS Anthropic — nezapínat bez Ondrova vědomého pokynu.
+const AUTH_CFG = resolveAuthConfig();
+const authRouter = new SubscriptionRouter(AUTH_CFG);
+let subscriptionAnthropic = null;
+if (AUTH_CFG.active) {
+  try {
+    const so = subscriptionClientOptions(AUTH_CFG);
+    subscriptionAnthropic = new Anthropic({ baseURL: so.baseURL, authToken: so.authToken });
+    console.log(`🔑 Auth režim: SUBSCRIPTION (proxy ${AUTH_CFG.proxyUrl}) — fallback na API při vyčerpání tarifu`);
+  } catch (e) {
+    console.error('🔑 subscription klient selhal, jedu na API:', e.message);
+    subscriptionAnthropic = null;
+  }
+} else if (AUTH_CFG.requested === 'subscription') {
+  console.warn(`🔑 Auth režim subscription požadován, ale nekompletní (${AUTH_CFG.reason}) → jedu na API`);
+}
 // Konverzace per chat — perzistentní na disku (fáze 1 auditu, slabina S7):
 // bez toho každý update/restart add-onu znamenal "o čem jsme to mluvili?".
 // Ukládají se jen texty (fotky se do historie stejně nedávají).
@@ -505,7 +531,25 @@ function trackUsage(usage, model = MODEL) {
 }
 
 async function claudeCreate(params) {
-  const response = await anthropic.messages.create(params);
+  let response;
+  // Když je subscription aktivní a nejsme v cooldownu, zkus předplatné;
+  // při vyčerpání tarifu (429/limit) přepni na API a spusť cooldown.
+  // Když je subscription OFF (default), tahle větev se přeskočí = beze změny.
+  if (subscriptionAnthropic && authRouter.currentMode() === 'subscription') {
+    try {
+      response = await subscriptionAnthropic.messages.create(params);
+    } catch (err) {
+      if (isLimitError(err)) {
+        authRouter.markLimited();
+        console.warn(`🔑 Předplatné vyčerpáno (tarif), přepínám na API na ~${Math.round(AUTH_CFG.cooldownMs / 60000)} min`);
+        response = await anthropic.messages.create(params);
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    response = await anthropic.messages.create(params);
+  }
   trackUsage(response.usage, params.model || MODEL);
   return response;
 }
@@ -4541,16 +4585,22 @@ function startVoiceChannel() {
         enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
     })
     : null;
+  // /narrate: instant krycí fráze (vypravěč) BEZ mozku — pipeline ji promluví
+  // hned, zatímco /voice na pozadí počítá skutečnou odpověď. Zamluví latenci.
+  const narrate = token ? createNarratorHandler({ token, pickFiller: pickNarratorFiller }) : null;
   const server = http.createServer((req, res) => {
     if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
-    if (!handle || req.method !== 'POST' || req.url !== '/voice') { res.writeHead(404); return res.end(); }
+    const routeHandle = req.method === 'POST' && req.url === '/narrate' ? narrate
+      : req.method === 'POST' && req.url === '/voice' ? handle
+      : null;
+    if (!routeHandle) { res.writeHead(404); return res.end(); }
     let raw = '';
     req.on('data', (c) => { raw += c; if (raw.length > 8192) req.destroy(); });
     req.on('end', async () => {
       let body = {};
       try { body = raw ? JSON.parse(raw) : {}; } catch { res.writeHead(400); return res.end(JSON.stringify({ error: 'bad json' })); }
       try {
-        const out = await handle({ authHeader: req.headers['authorization'], body });
+        const out = await routeHandle({ authHeader: req.headers['authorization'], body });
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.json));
       } catch (e) {
@@ -4560,7 +4610,7 @@ function startVoiceChannel() {
     });
   });
   server.on('error', (e) => console.error('Voice kanál error:', e.message));
-  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /onboarding (bearer token)`));
+  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /narrate + /onboarding (bearer token)`));
 }
 startVoiceChannel();
 
