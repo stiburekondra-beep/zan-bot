@@ -105,6 +105,10 @@ function addScheduledAction(file, input, allowedDomains, now = new Date()) {
     // schedulePairingFollowup / executeDueScheduledActions v bot.js).
     pairing_check: input.pairing_check === true || null,
     backend: input.backend || null,
+    // Zmražený baseline entit z DOBY NAPLÁNOVÁNÍ (před spárováním). runPairingCheck
+    // porovnává proti němu, ne proti živému memory.known_entities, které mezitím
+    // přepíše periodická pollStates smyčka a absorbuje nové zařízení (race sc.65).
+    known_snapshot: Array.isArray(input.known_snapshot) ? input.known_snapshot : null,
     chat_id: input.chat_id,
     created_by: input.created_by || null,
     created_at: now.toISOString(),
