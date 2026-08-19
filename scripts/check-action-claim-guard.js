@@ -14,6 +14,8 @@ const CALL_SERVICE_OK = [{ name: 'call_service', ok: true }];
 const ENTITY_ARCHIVE_OK = [{ name: 'entity_archive', ok: true }];
 const PERMIT_JOIN_OK = [{ name: 'zigbee_permit_join', ok: true }];
 const PERMIT_JOIN_FAIL = [{ name: 'zigbee_permit_join', ok: false }];
+// Smíšené kolo: párování ZAPNUTO (permit_join ok) + zdravá aktuace (turn_on ok).
+const PERMIT_JOIN_AND_TURN_ON = [{ name: 'zigbee_permit_join', ok: true }, { name: 'turn_on', ok: true }];
 
 // ── 1) PŘESNÁ repro věta z bugu (msg #3): undo bez tool callu → FIRE ──────────
 const bug1 = 'Vrátil jsem poslední zápis — balíček je smazaný a HA ho už nezná.';
@@ -242,4 +244,34 @@ assert.strictEqual(
   '26c: neúspěšný permit_join + tvrzení „zapnul jsem" = fabrikace (bridge offline)',
 );
 
-console.log('check-action-claim-guard: OK (28 scénářů)');
+// ── 27) sc.68 (tester over-relaxation, oprava 2026-08-19): úspěšný permit_join ─
+//        NESMÍ maskovat FABRIKOVANOU aktuaci JINÉ kategorie v témž kole. Před
+//        fixem #73 slil párování a aktuaci do jednoho `deviceSatisfied` →
+//        permit_join vouchnul i za fabrikované rozsvícení světla.
+const mixText = 'Zapnul jsem párování a rozsvítil jsem světlo v obýváku.';
+const mixReq = 'zapni párování a rozsviť světlo';
+// 27a: jen permit_join proběhl, turn_on NE → fabrikace světla MUSÍ fire.
+const r27 = guardActionClaim(mixText, mixReq, PERMIT_JOIN_OK);
+assert.strictEqual(
+  r27.changed,
+  true,
+  '27a: permit_join ok, ale fabrikované „rozsvítil jsem světlo" (turn_on neproběhl) → fire',
+);
+// 27a': diskriminace — fire je za ZAŘÍZENÍ (fabricatedDevice), párování je kryté.
+assert.strictEqual(r27.fabricatedDevice, true, '27a\': fabricatedDevice=true (světlo)');
+assert.strictEqual(r27.fabricatedPairing, false, '27a\': fabricatedPairing=false (permit_join kryje párování)');
+// 27b: smíšené kolo ZDRAVĚ — permit_join i turn_on proběhly → SILENT (žádná fabrikace).
+assert.strictEqual(
+  guardActionClaim(mixText, mixReq, PERMIT_JOIN_AND_TURN_ON).changed,
+  false,
+  '27b: párování ok + turn_on ok → obě tvrzení kryté, guard mlčí',
+);
+// 27c: čisté párování (regrese vs #73) — jen párovací tvrzení, permit_join ok → SILENT.
+//      „switchi" (párovaná zásuvka) NESMÍ spadnout do device claimu a spustit fire.
+assert.strictEqual(
+  guardActionClaim(pairText, 'zapni párování zigbee dongle', PERMIT_JOIN_OK).changed,
+  false,
+  '27c: „zapnul jsem párování na switchi" + permit_join ok → párovací kbelík, mlčí (ne regrese k #73)',
+);
+
+console.log('check-action-claim-guard: OK (32 scénářů)');

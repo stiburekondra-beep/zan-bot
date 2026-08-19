@@ -46,7 +46,21 @@ const DEVICE_TOOLS = ['turn_on', 'turn_off', 'toggle', 'call_service'];
 // false-positive (guard fabuluje NEúspěch reálně provedené akce) — přesně ta
 // „divná zpráva", co Ondra viděl. `zigbee_permit_join` je zásah do zařízení
 // (zapnutí párovacího režimu) a jeho úspěch legitimizuje „zapnul jsem párování".
+//
+// POZOR (over-relaxation, tester sc.68, oprava 2026-08-19): první fix #73 slil
+// PAIRING_TOOLS do jednoho `deviceSatisfied` s DEVICE_TOOLS → úspěšný permit_join
+// pak vouchnul za JAKOUKOLI fabrikovanou aktuaci JINÉ kategorie v témž kole
+// („zapni párování A rozsviť světlo" + jen permit_join → guard MLČEL i o
+// fabrikovaném rozsvícení). Proto teď párování má VLASTNÍ `pairingSatisfied`
+// kbelík a párovací tvrzení (párov*/pairing + done-verb) se odděluje od
+// aktuačního tvrzení zařízení (viz PAIRING_NOUN + rozdělení claim níže).
 const PAIRING_TOOLS = ['zigbee_permit_join'];
+// Objekt párování — odliší párovací tvrzení („zapnul jsem PÁROVÁNÍ") od aktuace
+// zařízení („rozsvítil jsem SVĚTLO"). Bez něj by AMBIG „zapnul jsem" u textu se
+// slovem „switch" (párovaná zásuvka) spadl do device claimu a permit_join by
+// ho nesměl legitimizovat (regrese k #73) — nebo naopak by permit_join maskoval
+// fabrikaci světla (sc.68). PAIRING_NOUN rozhoduje, do kterého kbelíku patří.
+const PAIRING_NOUN = /(párov|parov|spárov|sparov|napárov|naparov|pairing)/i;
 // Přehrávání médií. Doplněno 2026-08-12 po živém nálezu v labu: Ondra dvakrát
 // za sebou požádal „pusť na youtube traktory v blátě" a Žán podruhé odpověděl
 // „Hotovo! Traktory teď hrají na televizi", aniž by zavolal jediný nástroj —
@@ -79,6 +93,10 @@ const RESTART_DONE = /\brestartoval[ao]?\s+jsem\b|\b(?:home\s*assistant|ha)\s+(?
 // a běžné domácí formulace; dotazy na stav („svítí?") sem nepatří. Pozn.:
 // infinitiv se nedá odvodit z rozkazu (í≠i, „zapnout"≠„zapni") → vypsat zvlášť.
 const USER_DEVICE_INTENT = /(?<![\p{L}])(zapni|zapnout|vypni|vypnout|rozsviť|rozsvit|rozsvítit|rozsvitit|zhasni|zhasnout|přepni|prepn[ií]|přepnout|prepnout|sepni|sepnout|vytáhni|vytahni|vytáhnout|vytahnout|zatáhni|zatahni|zatáhnout|zatahnout|otevři|otevri|otevřít|otevrit|zavři|zavri|zavřít|zavrit|nastav|nastavit|dej|udělej|udelej)\p{L}*/iu;
+// (1''') Uživatel právě žádá párování zařízení („zapni párování", „napárovat",
+// „spárovat znovu"). Vlastní intent gate pro párovací tvrzení — párování je
+// jiná třída akce než aktuace zařízení (permit_join ho legitimizuje, turn_on ne).
+const USER_PAIRING_INTENT = /(?<![\p{L}])(párov|parov|spárov|sparov|napárov|naparov|pairing)\p{L}*/iu;
 // (2'') Odpověď tvrdí hotovou aktuaci. Dva kbelíky (díra 1, tester 2026-08-15):
 //   STRONG = inherentně device-verby (rozsvítil/zhasl/přepnul/sepnul/vytáhl/
 //     zatáhl jsem) — noun v ODPOVĚDI NEPOTŘEBUJÍ. Krátká hlasová odpověď
@@ -105,36 +123,50 @@ const MEDIA_NOUN = /(televiz|telce|telka|youtube|video|hudb|píseň|pisen|skladb
 // userMessage: text aktuální uživatelovy zprávy (gate 1 — o co si právě řekl).
 // actionCalls: pole { name, ok } — nástroje volané v TOMTO kole a jestli
 //   doběhly úspěšně (ok === true). Bot.js ho plní během agentické smyčky.
-// Vrací { text, changed, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia }.
+// Vrací { text, changed, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedPairing, fabricatedMedia }.
 function guardActionClaim(text, userMessage, actionCalls) {
-  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false, fabricatedDevice: false, fabricatedMedia: false };
+  const noop = { text, changed: false, fabricatedConfig: false, fabricatedRestart: false, fabricatedDevice: false, fabricatedPairing: false, fabricatedMedia: false };
   if (!text || typeof text !== 'string') return noop;
 
   const um = typeof userMessage === 'string' ? userMessage : '';
   const calls = Array.isArray(actionCalls) ? actionCalls : [];
   const configSatisfied = calls.some(c => c && c.ok && CONFIG_TOOLS.includes(c.name));
   const restartSatisfied = calls.some(c => c && c.ok && RESTART_TOOLS.includes(c.name));
-  const deviceSatisfied = calls.some(c => c && c.ok && (DEVICE_TOOLS.includes(c.name) || PAIRING_TOOLS.includes(c.name)));
+  // sc.68: párování má VLASTNÍ kbelík — úspěšný permit_join legitimizuje jen
+  // párovací tvrzení, NE fabrikovanou aktuaci zařízení v témž kole.
+  const deviceSatisfied = calls.some(c => c && c.ok && DEVICE_TOOLS.includes(c.name));
+  const pairingSatisfied = calls.some(c => c && c.ok && PAIRING_TOOLS.includes(c.name));
   const mediaSatisfied = calls.some(c => c && c.ok && MEDIA_TOOLS.includes(c.name));
 
   // (2) tvrdí odpověď dokončený zásah?
   const configClaim = (VERB_DONE.test(text) && CONFIG_NOUN.test(text)) || CONFIG_PHRASE.test(text);
   const restartClaim = RESTART_DONE.test(text);
-  const deviceClaim = DEVICE_DONE_STRONG.test(text) || (DEVICE_DONE_AMBIG.test(text) && DEVICE_NOUN.test(text));
+  // Párovací tvrzení: done-verb (AMBIG „zapnul jsem" i STRONG) v okolí párování.
+  const pairingClaim = (DEVICE_DONE_STRONG.test(text) || DEVICE_DONE_AMBIG.test(text)) && PAIRING_NOUN.test(text);
+  // Device claim: STRONG device-verb je VŽDY aktuace (rozsvítil/zhasl/přepnul jsem).
+  // AMBIG + device noun je aktuace JEN když to není subsumované párovací tvrzení
+  // (tj. bez PAIRING_NOUN) — jinak „zapnul jsem párování na switchi" (párování
+  // zásuvky) spadne do párovacího kbelíku, ne do aktuace. STRONG verb ale párování
+  // nikdy nepopisuje, takže sc.68 „…a rozsvítil jsem světlo" zůstane device claim.
+  const strongDeviceClaim = DEVICE_DONE_STRONG.test(text);
+  const ambigDeviceClaim = DEVICE_DONE_AMBIG.test(text) && DEVICE_NOUN.test(text);
+  const deviceClaim = strongDeviceClaim || (ambigDeviceClaim && !pairingClaim);
   const mediaClaim = MEDIA_DONE.test(text) && MEDIA_NOUN.test(text);
 
   // (1) požádal o něj uživatel v tomhle kole? + (3) neproběhl nástroj?
   const fabricatedConfig = configClaim && USER_CONFIG_INTENT.test(um) && !configSatisfied;
   const fabricatedRestart = restartClaim && USER_RESTART_INTENT.test(um) && !restartSatisfied;
   const fabricatedDevice = deviceClaim && USER_DEVICE_INTENT.test(um) && !deviceSatisfied;
+  const fabricatedPairing = pairingClaim && USER_PAIRING_INTENT.test(um) && !pairingSatisfied;
   const fabricatedMedia = mediaClaim && USER_MEDIA_INTENT.test(um) && !mediaSatisfied;
 
-  if (!fabricatedConfig && !fabricatedRestart && !fabricatedDevice && !fabricatedMedia) return noop;
+  if (!fabricatedConfig && !fabricatedRestart && !fabricatedDevice && !fabricatedPairing && !fabricatedMedia) return noop;
 
   const parts = [];
   if (fabricatedConfig) parts.push('zásah do konfigurace (vrácení / zápis / smazání balíčku)');
   if (fabricatedRestart) parts.push('restart Home Assistanta');
   if (fabricatedDevice) parts.push('ovládání zařízení v domě');
+  if (fabricatedPairing) parts.push('zapnutí párování zařízení');
   if (fabricatedMedia) parts.push('puštění hudby nebo videa');
   const what = parts.join(' ani ');
 
@@ -145,7 +177,7 @@ function guardActionClaim(text, userMessage, actionCalls) {
     `jsem neudělal. Napiš mi prosím ještě jednou, co přesně mám udělat, a provedu ` +
     `to doopravdy — potvrdím ti to až podle skutečného výsledku nástroje.`;
 
-  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedMedia };
+  return { text: replacement, changed: true, fabricatedConfig, fabricatedRestart, fabricatedDevice, fabricatedPairing, fabricatedMedia };
 }
 
 module.exports = { guardActionClaim, CONFIG_TOOLS, RESTART_TOOLS, DEVICE_TOOLS, PAIRING_TOOLS, MEDIA_TOOLS };
