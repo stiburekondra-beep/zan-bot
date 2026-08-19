@@ -165,6 +165,16 @@ function setTon(memory, ton, dite) {
   return { ok: true, ton: t, dite: c.dite === true, label: TONES[t].label };
 }
 
+// Bezpečnostní rozhodnutí volané z bot.js: SMÍ tenhle požadavek vypnout dětskou
+// hranu? `dite === false` je JEDINÁ cesta, jak setTon zruší dětský příznak (změna
+// tónu bez explicitního boolean dite ho nechává být — viz setTon výše). Vypnutí
+// dětské hrany je bezpečnostní krok → volající vrstva ho smí povolit jen adminovi;
+// dítě (role user) si nesmí samo zrušit dětský příznak a odemknout reinforcement.
+// (Tester reziduál sc.67, karta 2026-08-17-programator-zana-03.)
+function tonRequestDisablesChildGuard(dite) {
+  return dite === false;
+}
+
 // Blok do DYNAMICKÉHO (necachovaného) kontextu systémového promptu — profil se
 // liší per domácnost, proto NESMÍ jít do SYSTEM_STATIC (rozbil by prompt cache).
 function renderCommunicationInstruction(memory) {
@@ -197,5 +207,6 @@ module.exports = {
   isChild,
   setExpertiseLevel,
   setTon,
+  tonRequestDisablesChildGuard,
   renderCommunicationInstruction,
 };

@@ -25,8 +25,11 @@ const {
   isChild,
   setExpertiseLevel,
   setTon,
+  tonRequestDisablesChildGuard,
   renderCommunicationInstruction,
 } = require('../communication-profile');
+const fs = require('fs');
+const path = require('path');
 
 let n = 0;
 function ok(cond, label) {
@@ -157,5 +160,25 @@ ok(!adultRender.includes(CHILD_SAFETY_INVARIANT), 'dospělý profil nenese děts
 // KRITICKÉ: hrana REINFORCUJE, nikdy nezmírní — nikde neříká, že dítě smí víc
 ok(!/dítě smí|dite smi|bez potvrzení|bez potvrzeni/.test(childRender.toLowerCase()),
   'dětská hrana NIKDY neodemyká — žádné "dítě smí" / "bez potvrzení"');
+
+// ── vypnutí dětské hrany je admin-only (tester reziduál sc.67, karta -03) ────
+// Předikát: JEN dite=false (vyčištění příznaku) vyžaduje admin; zapnutí dítěte
+// ani pouhá změna tónu ne — posílení bezpečí ani přejmenování rejstříku není riziko.
+ok(tonRequestDisablesChildGuard(false) === true, 'dite=false (vypnutí dětské hrany) → vyžaduje admin');
+ok(tonRequestDisablesChildGuard(true) === false, 'dite=true (zapnutí dítěte) → admin nepotřeba (posílení bezpečí)');
+ok(tonRequestDisablesChildGuard(undefined) === false, 'změna jen tónu (bez dite) → admin nepotřeba');
+// Strukturální důkaz PROČ gate: dite=false reálně SUNDÁ dětskou hranu z renderu.
+const kidClear = { communication: { ton: 'detsky', dite: true } };
+ok(isChild(kidClear) === true, 'před: dětská hrana aktivní');
+setTon(kidClear, 'butler', false);
+ok(isChild(kidClear) === false, 'setTon(butler,false) SUNDÁ dětskou hranu → přesně proč je dite=false admin-only');
+// Kontrola diskriminace: přepnutí tónu BEZ dite hranu NEsundá → gate na dite=false stačí.
+const kidKeep = { communication: { ton: 'detsky', dite: true } };
+setTon(kidKeep, 'butler');
+ok(isChild(kidKeep) === true, 'setTon(butler) bez dite NEsundá hranu (dite drží) → gate na dite=false je úplný');
+// Wiring: bot.js handler set_communication_tone reálně zapojuje admin gate.
+const botSrc = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8');
+ok(/case 'set_communication_tone'[\s\S]{0,400}tonRequestDisablesChildGuard\(input\.dite\)[\s\S]{0,80}!isAdmin\(chatId\)/.test(botSrc),
+  'bot.js: set_communication_tone gatuje vypnutí dětské hrany na isAdmin (wiring nesmí tiše zmizet)');
 
 console.log(`communication-profile ok: ${n} kontrol`);

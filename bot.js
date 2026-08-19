@@ -66,7 +66,7 @@ const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler, createNarratorHandler } = require('./voice-channel');
 const { pickNarratorFiller } = require('./narrator');
 const { sanitizeVoiceResponse } = require('./voice-response');
-const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
+const { getExpertiseLevel, setExpertiseLevel, setTon, tonRequestDisablesChildGuard, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
@@ -2435,6 +2435,12 @@ async function executeTool(name, input, chatId) {
       }
       case 'set_communication_tone': {
         if (user.role === 'guest') return { error: 'Nastavení komunikace smí měnit jen rodina.' };
+        // Vypnout dětský režim (dite=false) je bezpečnostní krok → smí ho jen admin.
+        // Dítě (role user) si nesmí samo zrušit dětskou hranu a odemknout reinforcement.
+        // Zapnutí dítěte (dite=true) i pouhá změna tónu zůstávají pro celou rodinu.
+        if (tonRequestDisablesChildGuard(input.dite) && !isAdmin(chatId)) {
+          return { error: 'Vypnout dětský režim smí jen správce domácnosti (admin).' };
+        }
         const res = setTon(memory, input.ton, input.dite);
         if (!res.ok) return { error: res.error };
         saveMemory(memory);
