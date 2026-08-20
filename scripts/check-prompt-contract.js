@@ -29,6 +29,10 @@ function assertRegex(regex, label) {
   }
 }
 
+// Obecné otázky (Ondra 2026-08-20: „Žán nikdy neměl být jen domácí produkt") —
+// prompt je nesmí odmítat, jinak se z „správce domu" stane tvrdá hranice.
+assertIncludes('NEJSI jen na dum', 'general questions allowed');
+assertIncludes('nikdy neodmitej s tim, ze', 'no household-only refusal');
 assertIncludes('STYL ODPOVEDI', 'style section exists');
 assertIncludes('Bezna odpoved ma max 3-4 kratke vety', 'default answer length');
 assertIncludes('Pis jednoduse jako cloveku v kuchyni', 'human tone stays');
