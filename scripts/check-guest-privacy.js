@@ -86,6 +86,7 @@ assert.match(janaPamet, /Štěpán/, '/pamet pro rodinu zůstává funkční');
 
 assert.deepStrictEqual(bot.buildTools(9999).map(t => t.name), [], 'Host nedostane žádné nástroje domu');
 assert.ok(bot.buildTools(bot.CHAT_JANA).some(t => t.name === 'recall'), 'rodina dál dostane recall');
+assert.ok(bot.buildTools(bot.CHAT_JANA).some(t => t.name === 'recall_days'), 'rodina dál dostane recall_days');
 assert.ok(bot.buildTools(bot.CHAT_JANA).some(t => t.name === 'get_states'), 'rodina dál dostane get_states');
 
 Promise.resolve()

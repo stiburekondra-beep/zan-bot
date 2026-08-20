@@ -119,6 +119,12 @@
       "skills_required": true
     },
     {
+      "name": "recall_days",
+      "scope": "memory-read",
+      "admin_only": false,
+      "skills_required": true
+    },
+    {
       "name": "technology_inventory",
       "scope": "memory-read",
       "admin_only": false,

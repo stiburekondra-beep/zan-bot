@@ -68,6 +68,13 @@ const { pickNarratorFiller } = require('./narrator');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
+const {
+  appendDiaryEntry,
+  cleanupOldDiaryFiles,
+  ensureYesterdaySummary,
+  recallDays,
+  yesterdaySummaryContext,
+} = require('./conversation-diary');
 const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
@@ -173,6 +180,7 @@ if (DATA_DIR !== __dirname) {
 const MEMORY_FILE       = path.join(DATA_DIR, 'home_memory.json');
 const LOG_FILE          = path.join(DATA_DIR, 'zan_actions.log');
 const CONVO_LOG_FILE    = path.join(DATA_DIR, 'zan_conversation.log');
+const CONVO_DIARY_DIR   = path.join(DATA_DIR, 'denik');
 const CONVO_QUALITY_FILE = path.join(DATA_DIR, 'conversation_quality.jsonl');
 const HARNESS_DIR       = path.join(DATA_DIR, 'harness');
 const HARNESS_IN_DIR    = path.join(HARNESS_DIR, 'in');
@@ -580,6 +588,14 @@ async function claudeCreate(params) {
 function logAction(chatId, user, action, entity, result) {
   const entry = `[${new Date().toISOString()}] user=${user}(${chatId}) action=${action} entity=${entity || '-'} result=${result}\n`;
   try { fs.appendFileSync(LOG_FILE, entry); } catch {}
+  try { if (canAccessHouseholdPrivateData(chatId, getUser(chatId))) {
+    appendDiaryEntry(CONVO_DIARY_DIR, {
+      role: 'TOOL',
+      chatId,
+      userName: user,
+      text: `${action} entity=${entity || '-'} result=${result}`,
+    }, { timeZone: LOCAL_TIME_ZONE });
+  } } catch {}
   console.log(entry.trim());
 }
 
@@ -606,6 +622,35 @@ function logConvo(role, chatId, userName, text) {
     const lines = fs.readFileSync(CONVO_LOG_FILE, 'utf8').split('\n');
     if (lines.length > 2000) fs.writeFileSync(CONVO_LOG_FILE, lines.slice(-2000).join('\n'));
   } catch {}
+  try { if (canAccessHouseholdPrivateData(chatId, getUser(chatId))) {
+    appendDiaryEntry(CONVO_DIARY_DIR, { role, chatId, userName, text }, { timeZone: LOCAL_TIME_ZONE });
+  } } catch {}
+}
+
+let lastDiaryMaintenanceDay = null;
+async function maintainConversationDiary(enabled) {
+  if (!enabled) return;
+  const today = localDateParts().year + '-' + localDateParts().month + '-' + localDateParts().day;
+  if (lastDiaryMaintenanceDay === today) return;
+  lastDiaryMaintenanceDay = today;
+  try { cleanupOldDiaryFiles(CONVO_DIARY_DIR, { timeZone: LOCAL_TIME_ZONE }); } catch (e) {
+    console.warn('⚠️ Úklid deníku rozhovoru selhal:', e.message);
+  }
+  try {
+    await ensureYesterdaySummary(CONVO_DIARY_DIR, async (source, day) => {
+      const response = await claudeCreate({
+        model: MODEL_FAST,
+        ...claudeRequestOptionsForModel(MODEL_FAST),
+        max_tokens: 260,
+        system: 'Shrnuj denik rozhovoru rodinneho asistenta. Vrat jen 3 az 6 kratkych odrazek v cestine: co se resilo, rozhodnuti a otevrene veci. Necituj soukroma jmena zbytecne, nefabuluj.',
+        messages: [{ role: 'user', content: `Den ${day}:\n${source}` }],
+      });
+      const block = response.content.find(b => b.type === 'text');
+      return block ? block.text : '';
+    }, { timeZone: LOCAL_TIME_ZONE });
+  } catch (e) {
+    console.warn('⚠️ Shrnutí včerejšího deníku se nevytvořilo:', e.message);
+  }
 }
 
 // ═══════════════════════════════════════════════
@@ -1520,6 +1565,18 @@ function buildTools(chatId, profil) {
         type: 'object',
         properties: { category: { type: 'string', enum: ['all', 'rooms', 'devices', 'preferences', 'notes', 'residents', 'checkin'] } },
         required: ['category'],
+      },
+    },
+    {
+      name: 'recall_days',
+      description: 'Přečte deník rozhovoru po dnech z /config/zan_data/denik. Použij na dotazy typu "co jsme řešili včera/minule/před týdnem"; nefabuluj z hlavy. days_back=1 znamená včera, 7 znamená před týdnem. Volitelné query vrátí jen odpovídající řádky.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          days_back: { type: 'number', description: 'Kolik dní zpět číst, 1–14. 1 = včera.' },
+          query: { type: 'string', description: 'Volitelný dotaz pro hledání v surových řádcích deníku.' },
+        },
+        required: ['days_back'],
       },
     },
     {
@@ -2470,6 +2527,16 @@ async function executeTool(name, input, chatId) {
         }
         const map = { rooms: 'rooms', devices: 'devices', preferences: 'preferences', notes: 'notes', residents: 'residents', checkin: 'checkin' };
         return memory[map[input.category]] || {};
+      }
+
+      case 'recall_days': {
+        const daysBack = Math.max(1, Math.min(14, Number(input.days_back || 1)));
+        return recallDays(CONVO_DIARY_DIR, {
+          daysBack,
+          query: input.query,
+          timeZone: LOCAL_TIME_ZONE,
+          maxLines: 40,
+        });
       }
 
       case 'technology_inventory': {
@@ -3836,6 +3903,7 @@ const SYSTEM_STATIC = `Jsi Žán — veselý, oddaný a chytrý správce domu. J
 - Po každé změně popiš výsledek LIDSKY (co to dělá pro dům), technikálie jen když se někdo zeptá.
 - Víc otázek najednou = očísluj je tak, aby šlo odpovědět „3: kuchyň, 6: ano" z mobilu. Jedno zadání, jedna odpověď — netříšti je do víc zpráv s jiným číslováním.
 - Nové info o domě/lidech ukládej hned (remember, update_family_member, update_house_info, rodina_update), nečekej na potvrzení — ale jen od známého člena domácnosti/admina. Host/neznámý chat nesmí číst ani zapisovat rodinnou paměť; požádej ho, ať ho Ondra přidá mezi známé uživatele.
+- Když se uživatel ptá „co jsme včera řešili", „co jsme minule probírali", „co bylo před týdnem" nebo podobně, použij recall_days. Nefabuluj z krátké historie; když deník nic nemá, řekni to.
 - Host/neznámý chat: neprozrazuj rodinnou paměť, jména dětí, rutiny, preference, místnosti, zařízení, kamery/mikrofony ani souhrn stavu domu. Řekni stručně, že rodinná data můžeš ukázat až po potvrzení adminem.
 - Téma neurčuje osobu. Zahrada, děti ani dům automaticky neznamenají Jana/Ondra; oslovuj jen aktuálního uživatele z kontextu. Když není jasné, komu rada patří nebo kdo něco pěstuje, zeptej se krátce „ty, nebo Jana/Ondra?".
 
@@ -3996,8 +4064,12 @@ async function processMessage(chatId, userMessage, imageBase64 = null, opts = {}
   const seasonal = getSeasonalTasks(month);
   const isJana = chatId === CHAT_JANA;
   const trustedHousehold = canAccessHouseholdPrivateData(chatId, user);
+  await maintainConversationDiary(trustedHousehold);
   const includeGardenContext = trustedHousehold && (isJana || isGardenRelated(userMessage));
   const displayHomeName = trustedHousehold ? memory.home_name : 'domácnost';
+  const previousDaySummary = trustedHousehold
+    ? yesterdaySummaryContext(CONVO_DIARY_DIR, { timeZone: LOCAL_TIME_ZONE, maxChars: 400 })
+    : '';
 
   // Dynamický kontext — proměnlivé věci patří sem (za cache breakpoint),
   // ne do SYSTEM_STATIC, jinak by rozbíjely prompt cache
@@ -4017,6 +4089,7 @@ Dnešní útrata zatím: ~${todayCzk} Kč (${todayUsage.calls} volání) — pou
 UŽIVATEL: ${user.name} (${user.role === 'admin' ? 'administrátor — plná práva' : user.role === 'guest' ? 'host — rodinná data a nástroje domu skryté' : 'uživatel — může ovládat zařízení, ne YAML'})
 ${householdContext}
 Aktivní připomínky v tomhle chatu: ${activeReminders || 'žádné'}
+Včerejší deník rozhovoru (stručný kontext, ne zdroj pro přesné citace): ${previousDaySummary || 'není k dispozici'}
 Ponaučení z minulých chyb (řiď se jimi, neopakuj je): ${relevantLessons(userMessage).map(l => `[${l.topic}] ${l.text}`).join(' | ') || 'zatím žádná'}
 Playbooky (ověřené postupy, obsah přes read_playbook): ${listPlaybooks().join(', ') || 'zatím žádné'}
 ${includeGardenContext ? `🌱 Zahrada — zóny: ${Object.entries(garden.map || {}).map(([k, v]) => `${v.name}${(v.plants || []).length ? ' (' + v.plants.join(', ') + ')' : ''}`).join(' | ') || 'nenastavena'} | profilů rostlin: ${Object.keys(garden.plant_profiles || {}).length} | ${seasonal.season}, sez. úkoly: ${seasonal.tasks.slice(0, 3).join(', ')}

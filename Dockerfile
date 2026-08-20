@@ -50,6 +50,7 @@ COPY service-onboarding.js ./
 COPY play-music.js ./
 COPY play-video.js ./
 COPY conversation-quality.js ./
+COPY conversation-diary.js ./
 COPY capability-gap-repair.js ./
 COPY pairing-followup.js ./
 COPY narrator.js ./
