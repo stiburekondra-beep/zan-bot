@@ -4158,7 +4158,9 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
         persistConversations();
         logConvo('ŽÁN', chatId, user.name, fastConfirmation);
         console.log(`voice-confirmation: lokální potvrzení po ověřené rutinní aktuaci`);
-        return fastConfirmation;
+        return opts.returnVoiceMeta
+          ? { reply: fastConfirmation, local_confirmation: 'success' }
+          : fastConfirmation;
       }
       continue;
     }
@@ -4667,7 +4669,9 @@ function startVoiceChannel() {
       allowedChats: ALLOWED_CHATS,
       defaultChatId,
       dispatch: (chatId, text) =>
-        enqueueForChat(chatId, () => processMessage(chatId, text, null, { profil: 'ovladani', voice: true })),
+        enqueueForChat(chatId, () => processMessage(chatId, text, null, {
+          profil: 'ovladani', voice: true, returnVoiceMeta: true,
+        })),
     })
     : null;
   // /narrate: instant krycí fráze (vypravěč) BEZ mozku — pipeline ji promluví
