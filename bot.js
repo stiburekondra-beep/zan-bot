@@ -66,6 +66,7 @@ const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler, createNarratorHandler } = require('./voice-channel');
 const { pickNarratorFiller } = require('./narrator');
 const { sanitizeVoiceResponse } = require('./voice-response');
+const { buildVoiceFastConfirmation } = require('./voice-confirmation');
 const { getExpertiseLevel, setExpertiseLevel, setTon, renderCommunicationInstruction } = require('./communication-profile');
 const { analyzeConversationLog } = require('./conversation-quality');
 const { playMusic } = require('./play-music');
@@ -4052,6 +4053,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
   // Nástroje, které v TOMTO kole (napříč iteracemi smyčky) reálně proběhly
   // a jestli doběhly úspěšně — vstup pro action-claim-guard (fabrikace akce).
   const actionCalls = [];
+  const toolExecutions = [];
 
   // Deterministické rozpoznání povelu "pusť mi tohle na televizi/youtube" →
   // v prvním kole se nástroj vynutí (viz tool_choice níže). Bez fotky a jen
@@ -4112,6 +4114,7 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
           // ok = žádná chyba a nástroj se sám neoznačil za neúspěch.
           const toolOk = !!result && !result.error && result.success !== false && result.ok !== false;
           actionCalls.push({ name: block.name, ok: toolOk });
+          toolExecutions.push({ name: block.name, input: block.input, result });
           if (result && result.error) {
             // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
             // něco selhalo, jen že Žán o tom slušně informoval uživatele.
@@ -4139,6 +4142,24 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
         }
       }
       messages.push({ role: 'user', content: toolResults });
+
+      // U jednoho potvrzeného světla/zásuvky už se model nemusí volat podruhé
+      // jen proto, aby řekl „hotovo“. Výsledek nástroje už obsahuje post-read
+      // skutečného HA stavu. Vše neověřené, citlivé nebo složené fail-closed
+      // pokračuje normální smyčkou a model vysvětlí výsledek.
+      const fastConfirmation = buildVoiceFastConfirmation({
+        voice: opts.voice,
+        toolExecutions,
+        variantIndex: conversationHistory[chatId].length,
+      });
+      if (fastConfirmation) {
+        conversationHistory[chatId].push({ role: 'assistant', content: fastConfirmation });
+        if (conversationHistory[chatId].length > 20) conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
+        persistConversations();
+        logConvo('ŽÁN', chatId, user.name, fastConfirmation);
+        console.log(`voice-confirmation: lokální potvrzení po ověřené rutinní aktuaci`);
+        return fastConfirmation;
+      }
       continue;
     }
 
