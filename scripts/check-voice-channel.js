@@ -61,7 +61,17 @@ const handle = createVoiceHandler({ token: TOKEN, allowedChats: ALLOWED, default
   out = await handle({ authHeader: `Bearer ${TOKEN}`, body: { text: 'ahoj', chat_id: 999 } });
   assert.strictEqual(out.json.chat_id, DEFAULT_CHAT, 'nepovolený chat → default, ne cizí chat');
 
-  // 3f) chyba v dispatch → 500 (ne pád procesu)
+  // 3f) strukturovaná fast-confirmation metadata se bezpečně propíší
+  const detailed = createVoiceHandler({
+    token: TOKEN, allowedChats: ALLOWED, defaultChatId: DEFAULT_CHAT,
+    dispatch: async () => ({ reply: 'Rozsvíceno.', local_confirmation: 'success' }),
+  });
+  out = await detailed({ authHeader: `Bearer ${TOKEN}`, body: { text: 'rozsviť' } });
+  assert.strictEqual(out.status, 200, 'strukturovaná odpověď → 200');
+  assert.strictEqual(out.json.reply, 'Rozsvíceno.', 'strukturovaná odpověď zachová text');
+  assert.strictEqual(out.json.local_confirmation, 'success', 'fast confirmation metadata se propíší');
+
+  // 3g) chyba v dispatch → 500 (ne pád procesu)
   const failing = createVoiceHandler({
     token: TOKEN, allowedChats: ALLOWED, defaultChatId: DEFAULT_CHAT,
     dispatch: async () => { throw new Error('model down'); },

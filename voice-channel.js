@@ -14,7 +14,9 @@
 //    (172.30.32.1:8099) — port je pak dosažitelný i na LAN, proto NIKDY bez tokenu.
 //
 // Tento modul je framework-agnostický a bez závislosti na Anthropic/HA —
-// dispatch (text→odpověď) se injektuje, takže jde otestovat bez modelu.
+// dispatch (text→odpověď nebo {reply, local_confirmation}) se injektuje,
+// takže jde otestovat bez modelu. Strukturovaná odpověď dovolí Realtime
+// transportu přehrát lokální potvrzení bez dalšího generování audio výstupu.
 // ═══════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
 
@@ -51,8 +53,14 @@ function createVoiceHandler({ token, allowedChats, defaultChatId, dispatch }) {
     const chatId = resolveVoiceChat(body && body.chat_id, allowedChats, defaultChatId);
     if (!Number.isInteger(chatId)) return { status: 400, json: { error: 'no valid chat' } };
     try {
-      const reply = await dispatch(chatId, text);
-      return { status: 200, json: { reply: String(reply == null ? '' : reply), chat_id: chatId } };
+      const result = await dispatch(chatId, text);
+      const structured = result && typeof result === 'object' && !Array.isArray(result);
+      const reply = structured ? result.reply : result;
+      const json = { reply: String(reply == null ? '' : reply), chat_id: chatId };
+      if (structured && result.local_confirmation === 'success') {
+        json.local_confirmation = 'success';
+      }
+      return { status: 200, json };
     } catch (e) {
       return { status: 500, json: { error: e.message } };
     }
