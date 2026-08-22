@@ -5,6 +5,12 @@
   "purpose": "Read-only registry of Zan tool capabilities. It is checked against bot.js and CHoS SKILLS.md, but is not used at runtime yet.",
   "capabilities": [
     {
+      "name": "get_version",
+      "scope": "diagnostics-read",
+      "admin_only": false,
+      "skills_required": false
+    },
+    {
       "name": "get_areas",
       "scope": "ha-read",
       "admin_only": false,
