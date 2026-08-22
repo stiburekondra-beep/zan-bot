@@ -4297,7 +4297,15 @@ Zahradní nástroje používej aktivně: garden_map (zóny), garden_plant_profil
           // Zaznamenej pro action-claim-guard: proběhl nástroj a byl úspěšný?
           // ok = žádná chyba a nástroj se sám neoznačil za neúspěch.
           const toolOk = !!result && !result.error && result.success !== false && result.ok !== false;
-          actionCalls.push({ name: block.name, ok: toolOk });
+          // Media/aktuační tool může strukturálně uspět (ok=true), a přesto SÁM
+          // přiznat, že se efekt NEstal (mrtvý přehrávač: unavailable/unknown/off).
+          // play_music vrací v takovém případě success:true + confirmed:false +
+          // unavailable:true (poctivá hláška modelu), ale action-claim-guard to
+          // musí vědět — jinak model claim „Pouštím X" u mrtvého přehrávače projde
+          // (guard-disarm, tester reziduál karty -06). Idle/latence startu
+          // (unavailable:false) je legitimní „odesláno" → NEznačíme jako selhání.
+          const effectUnverified = !!result && result.unavailable === true;
+          actionCalls.push({ name: block.name, ok: toolOk, effectUnverified });
           toolExecutions.push({ name: block.name, input: block.input, result });
           if (result && result.error) {
             // Generický log chyb nástrojů — bez tohohle nešlo zjistit, PROČ
