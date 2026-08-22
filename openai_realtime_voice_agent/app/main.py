@@ -6,6 +6,12 @@ import logging
 import time
 from typing import Optional
 import dotenv
+from pipecat.frames.frames import (
+    FunctionCallResultProperties,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -17,6 +23,20 @@ from app.disconnect_tool import get_disconnect_tool_definition, create_disconnec
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, create_ask_zan_tool_handler
 from app.voice_safety import is_sensitive_actuation
+from app.voice_fastlane import (
+    CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
+    SAMPLE_RATE as FASTLANE_SAMPLE_RATE,
+    VERIFY_DELAY_S,
+    VERIFY_TRIES,
+    PhraseLibrary,
+    build_event,
+    classify as fastlane_classify,
+    event_url as fastlane_event_url,
+    fetch_states,
+    judge as fastlane_judge,
+    room_variant,
+    _post_event_blocking,
+)
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
@@ -226,8 +246,22 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
                     return
             except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
                 logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
+
+            # RYCHLÁ DRÁHA (2026-08-22): u jednoduchých povelů, kde víme, co má
+            # být po akci vidět ve stavu, jede tok „průběhová fráze HNED +
+            # akce souběžně → ověření → tón". Cokoli jiného (a všechno, co
+            # projde bezpečnostní brzdou výš) jde beze změny starou cestou.
+            plan = None
+            if getattr(self, "fastlane_enabled", False):
+                try:
+                    plan = fastlane_classify(function_name, getattr(params, "arguments", None))
+                except Exception as e:  # pragma: no cover
+                    logger.warning(f"⚠️ fast-lane klasifikace selhala: {e!r}")
+
             TURN_LIVENESS.tool_started()
             try:
+                if plan is not None:
+                    return await self._run_fast_lane(plan, function_name, handler, params)
                 return await handler(params)
             finally:
                 TURN_LIVENESS.tool_finished()
@@ -235,6 +269,191 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         super().register_function(
             function_name, liveness_tracked, start_callback, cancel_on_interruption=False
         )
+
+    # -----------------------------------------------------------------------
+    # Rychlá dráha: přednahraná pusa místo modelu
+    # -----------------------------------------------------------------------
+
+    async def play_phrase(self, zamer: str) -> bool:
+        """Pustí přednahranou frázi/tón rovnou do pipeline — bez modelu.
+
+        Audio jde jako `TTSAudioRawFrame` po 20 ms kusech, tedy přesně tak,
+        jak do pipeline padá řeč z OpenAI. Pro zařízení je to k nerozeznání
+        od normální odpovědi, jen nestála nic a nečekalo se na model.
+        """
+        lib = getattr(self, "phrase_library", None)
+        if lib is None:
+            return False
+        pcm = lib.get(zamer)
+        if not pcm:
+            logger.info("🔇 fráze %r není v knihovně — nechávám mluvit model", zamer)
+            return False
+        try:
+            await self.push_frame(TTSStartedFrame())
+            for i in range(0, len(pcm), FASTLANE_CHUNK_BYTES):
+                await self.push_frame(
+                    TTSAudioRawFrame(
+                        audio=pcm[i:i + FASTLANE_CHUNK_BYTES],
+                        sample_rate=FASTLANE_SAMPLE_RATE,
+                        num_channels=1,
+                    )
+                )
+            await self.push_frame(TTSStoppedFrame())
+            logger.info("🔊 přehráno z knihovny: %s (%d B)", zamer, len(pcm))
+            return True
+        except Exception as e:  # pragma: no cover - přehrání nesmí shodit tool
+            logger.warning("⚠️ přehrání fráze %s selhalo: %r", zamer, e)
+            return False
+
+    async def _verify_after_action(self, pre, plan) -> str:
+        """Přečte stav PO akci a vrátí verdikt: ok / fail / unconfirmed / ha_down.
+
+        Čte se opakovaně (HA stav se propíše se zpožděním), ale krátce —
+        maximálně ~1,4 s. `unavailable`/`unknown` se nikdy nepovažuje za úspěch.
+        """
+        verdict = "unconfirmed"
+        for attempt in range(VERIFY_TRIES):
+            try:
+                post = await asyncio.to_thread(fetch_states, plan.domains)
+            except Exception as e:
+                logger.warning("⚠️ fast-lane: HA stav nejde přečíst: %r", e)
+                return "ha_down"
+            verdict = fastlane_judge(pre, post, plan)
+            if verdict == "ok":
+                return "ok"
+            if attempt < VERIFY_TRIES - 1:
+                await asyncio.sleep(VERIFY_DELAY_S)
+        return verdict
+
+    def _mirror_to_zan(self, plan, function_name, args, verdict, note="") -> None:
+        """Pošle událost do Žán-Code (`POST /event`) — asynchronně, hlas nečeká.
+
+        Mozek má vědět, co se v domě dělo, i když to sám neprováděl: rychlá
+        dráha jinak zůstane pro Žán-Code neviditelná.
+        """
+        url = getattr(self, "zan_event_url", "")
+        if not url:
+            return
+        payload = build_event(plan, function_name, args, verdict, note)
+        token = getattr(self, "zan_event_token", "")
+
+        async def _send():
+            try:
+                await asyncio.to_thread(_post_event_blocking, url, token, payload)
+                logger.debug("↪️ zrcadleno do Žán-Code: %s/%s", payload["action"], verdict)
+            except Exception as e:
+                logger.info("ℹ️ zrcadlení do Žán-Code neprošlo (hlas to neřeší): %r", e)
+
+        try:
+            asyncio.create_task(_send())
+        except Exception as e:  # pragma: no cover
+            logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
+
+    async def _run_fast_lane(self, plan, function_name, handler, params):
+        """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
+        lib = getattr(self, "phrase_library", None)
+        args = dict(getattr(params, "arguments", None) or {})
+        real_cb = params.result_callback
+        captured = []
+
+        async def capture(result, *, properties=None):
+            captured.append(result)
+
+        # Stav PŘED akcí — jen jako referenční snímek na porovnání.
+        try:
+            pre = await asyncio.to_thread(fetch_states, plan.domains)
+        except Exception as e:
+            logger.warning("⚠️ fast-lane: stav PŘED se nepodařilo přečíst: %r", e)
+            pre = {}
+
+        # SOUČASNĚ: pusť průběhovou frázi a odpal HA akci. Žádné čekání jednoho
+        # na druhé — uživatel má slyšet „Rozsvěcuju." v tomtéž okamžiku, kdy
+        # povel odchází do Home Assistanta.
+        params.result_callback = capture
+        zamer = room_variant(lib, plan) if lib else plan.progress
+        started = time.time()
+        speak_task = asyncio.create_task(self.play_phrase(zamer))
+        action_task = asyncio.create_task(handler(params))
+        spoke, action_res = await asyncio.gather(
+            speak_task, action_task, return_exceptions=True
+        )
+        spoke = spoke is True
+        if isinstance(action_res, Exception):
+            logger.warning("⚠️ fast-lane: HA akce selhala: %r", action_res)
+        logger.info(
+            "⚡ fast-lane %s: fráze %s (%s), akce hotová za %.0f ms",
+            function_name, zamer, "přehrána" if spoke else "chybí v knihovně",
+            (time.time() - started) * 1000,
+        )
+
+        verdict = await self._verify_after_action(pre, plan)
+
+        # Neúspěch → JEDEN pokus znovu (ústava, Princip 2 bod 4).
+        if verdict == "fail":
+            logger.info("🔁 fast-lane: %s neprošlo, zkouším jednou znovu", function_name)
+            await self.play_phrase("vysledek_fail")
+            try:
+                await handler(params)
+            except Exception as e:
+                logger.warning("⚠️ fast-lane: druhý pokus selhal: %r", e)
+            verdict = await self._verify_after_action(pre, plan)
+
+        self._mirror_to_zan(plan, function_name, args, verdict)
+
+        # Knihovna nemá čím mluvit → ať mluví model, ale jen ověřenou pravdu.
+        if not spoke:
+            params.result_callback = real_cb
+            await real_cb(self._verdict_text(verdict, plan, captured))
+            return
+
+        if verdict == "ok":
+            await self.play_phrase("vysledek_ok")   # krátký tón „tadá"
+            await real_cb(
+                {"status": "verified_success", "spoken_locally": "tón + průběhová fráze"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+
+        if verdict == "unconfirmed":
+            # Poctivě: povel odešel, ale nemáme důkaz. Nikdy ne tón úspěchu.
+            await self.play_phrase("nepotvrdilo_stav")
+            await real_cb(
+                {"status": "unconfirmed", "spoken_locally": "povel odešel, stav nepotvrzen"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+
+        if verdict == "ha_down":
+            await self.play_phrase("ha_neodpovida")
+            await real_cb(
+                {"status": "ha_unreachable", "spoken_locally": "Home Assistant neodpovídá"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+
+        # Selhalo i podruhé → poctivá věta + diagnostiku převezme Žán-Code.
+        await self.play_phrase("nepovedlo_se")
+        cil = plan.target or plan.area or "to"
+        await real_cb(
+            "Akce se nepovedla ani na druhý pokus a ověřený stav to potvrzuje. "
+            f"Uživatel UŽ SLYŠEL „Nepovedlo se mi to, zjišťuju proč.\" — nic o "
+            "výsledku už neopakuj a hlavně netvrď, že se to povedlo. Rovnou "
+            f"zavolej ask_zan s textem „proč nejde {cil}\" a nech Žán-Code najít příčinu."
+        )
+
+    @staticmethod
+    def _verdict_text(verdict: str, plan, captured) -> str:
+        """Text pro model, když knihovna frází chybí — pořád jen ověřená pravda."""
+        cil = plan.target or plan.area or "to"
+        if verdict == "ok":
+            return f"Ověřeno: {plan.label} — {cil} je v požadovaném stavu. Řekni jednu krátkou větu."
+        if verdict == "unconfirmed":
+            return ("Povel odešel, ale zařízení stav nepotvrdilo. Řekni přesně tohle, "
+                    "netvrď úspěch.")
+        if verdict == "ha_down":
+            return "Home Assistant neodpovídá. Řekni to na rovinu, nic neslibuj."
+        return (f"Nepovedlo se to ani napodruhé ({cil}). Řekni „Nepovedlo se mi to, "
+                f"zjišťuju proč.\" a zavolej ask_zan s textem „proč nejde {cil}\".")
 
     async def _receive_task_handler(self):  # type: ignore[override]
         """Surface OpenAI reader death as an ErrorFrame so recovery can act.
@@ -530,8 +749,17 @@ class Application:
                 "— vždy přes ask_zan: zámky, alarm, brány a garážová vrata, "
                 "kotel/topný okruh, mazání, restart. Když by povel spadl sem, "
                 "místo provedení zavolej ask_zan.\n"
+                "• RYCHLÁ PUSA: u jednoduchých povelů řekne průběh („Rozsvěcuju.\") "
+                "a po ověření stavu pípne krátký tón sám systém, z přednahrané "
+                "knihovny — TY UŽ K TOMU NIC NEŘÍKEJ. Když nástroj vrátí "
+                "status verified_success / unconfirmed / ha_unreachable, uživatel "
+                "to už slyšel: mlč a čekej na další povel.\n"
+                "• POCTIVOST: nikdy netvrď VÝSLEDEK („rozsvíceno\", „hotovo\") bez "
+                "ověřeného stavu a nevymýšlej si, co je v domě. Průběh („dělám to\") "
+                "smí zaznít hned. Když ověřit nejde, řekni přesně to.\n"
                 "• Nikdy nevyslovuj entity_id ani technické názvy; mluv o „světle "
-                "v obýváku\". Odpovědi krátké, mluvené, bez markdownu a výčtů.\n\n"
+                "v obýváku\". Odpovědi krátké, mluvené, bez markdownu a výčtů, "
+                "stručně a k věci, žádná vata.\n\n"
                 + instructions
             )
         self.instructions = instructions
@@ -548,6 +776,28 @@ class Application:
         self.zan_voice_url = zan_voice_url
         self.zan_voice_token = zan_voice_token
         self.zan_voice_chat_id = zan_voice_chat_id
+
+        # RYCHLÁ DRÁHA — knihovna přednahraných frází a tónů (generuje ji
+        # `projects/baklazan/zan/zan-code/generovat-fraze.js` do
+        # `zan_data/fraze/`). Načte se jednou, drží se v paměti: přehrání pak
+        # stojí nula latence a nula peněz. Když knihovna chybí, rychlá dráha se
+        # vypne sama a mluví model jako dřív — nic se nerozbije.
+        self.fastlane_enabled = os.environ.get("FASTLANE_PHRASES", "true").lower() not in (
+            "false", "0", "no", "off"
+        )
+        self.phrase_library = PhraseLibrary() if self.fastlane_enabled else None
+        if self.fastlane_enabled and (self.phrase_library is None or not self.phrase_library.audio):
+            logger.warning("⚠️ rychlá dráha: knihovna frází je prázdná — mluví model")
+            self.fastlane_enabled = False
+        # Zrcadlení akcí rychlé dráhy do Žán-Code (`POST /event`) — ať mozek ví,
+        # co se v domě dělo, i když to sám neprováděl.
+        self.zan_event_url = fastlane_event_url(zan_voice_url)
+        self.zan_event_token = zan_voice_token
+        logger.info(
+            "⚡ rychlá dráha: %s · zrcadlení do Žán-Code: %s",
+            "zapnutá" if self.fastlane_enabled else "vypnutá",
+            self.zan_event_url or "vypnuté",
+        )
 
         # Initialize audio recording service (optional)
         self.audio_recording_service = AudioRecordingService(
@@ -767,6 +1017,12 @@ class Application:
                 start_audio_paused=False
             )
             self.openai_service.zan_broadcast_json = self.websocket_handler.broadcast_json
+            # Rychlá dráha potřebuje knihovnu frází a adresu pro zrcadlení —
+            # služba se vytváří znovu při každém spojení, tak jí to předáme.
+            self.openai_service.fastlane_enabled = self.fastlane_enabled
+            self.openai_service.phrase_library = self.phrase_library
+            self.openai_service.zan_event_url = self.zan_event_url
+            self.openai_service.zan_event_token = self.zan_event_token
             if self.zan_bridge_enabled:
                 self.openai_service.register_function(
                     "ask_zan",
