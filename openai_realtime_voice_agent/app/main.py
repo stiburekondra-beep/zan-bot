@@ -16,6 +16,7 @@ from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, create_ask_zan_tool_handler
+from app.voice_safety import is_sensitive_actuation
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
@@ -207,6 +208,24 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
         inspects the signature to pick the calling convention).
         """
         async def liveness_tracked(params):
+            # HARD BEZPEČNOSTNÍ BRZDA (2026-08-22): nevratné/rizikové cíle
+            # (zámky, alarm, brány/garážová vrata, kotel) se na rychlé dráze
+            # NEPROVÁDĚJÍ — vždy přes ask_zan (elevace + potvrzení v Žán-Code).
+            # Vynuceno kódem, ne jen promptem; čtení (GetLiveContext) a vlastní
+            # mosty (ask_zan/web_search) jsou vyňaté ve voice_safety.
+            try:
+                if is_sensitive_actuation(function_name, getattr(params, "arguments", None)):
+                    logger.warning(
+                        "🛑 fast-lane blokoval citlivý úkon %s(%r) → přesměruj na ask_zan",
+                        function_name, getattr(params, "arguments", None),
+                    )
+                    await params.result_callback(
+                        "Tohle je bezpečnostní úkon — zámek, alarm, vrata nebo kotel. "
+                        "Neprovedu ho napřímo. Zavolej ask_zan s přesným zněním, ať to potvrdíme."
+                    )
+                    return
+            except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
+                logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
             TURN_LIVENESS.tool_started()
             try:
                 return await handler(params)
@@ -442,10 +461,14 @@ class Application:
         try:
             supervisor_token = os.environ.get("LONGLIVED_TOKEN") or os.environ.get("SUPERVISOR_TOKEN")
             ha_mcp_url = os.environ.get("HA_MCP_URL", "http://supervisor/core/api/mcp")
-            if zan_bridge_enabled:
-                logger.info("Žán bridge enabled: direct Home Assistant MCP tools stay hidden")
-            elif supervisor_token:
-                logger.info("Loading Home Assistant MCP tools...")
+            # RYCHLÁ DRÁHA (2026-08-22): HA MCP nástroje se načítají VŽDY, i když
+            # je Žán bridge zapnutý. Dřív se v bridge režimu schovávaly a všechno
+            # (i „rozsviť") muselo přes ask_zan → mozek (~20 s). Teď jednoduché
+            # ovládání (světla, zásuvky, hudba, čtení stavů) vyřídí model sám
+            # nativními HA nástroji hned, a ask_zan zůstává jen pro „přemýšlení"
+            # (automatizace, diagnostika, dashboardy). Routing určuje prompt níže.
+            if supervisor_token:
+                logger.info("Loading Home Assistant MCP tools (fast lane, coexists with ask_zan)...")
                 self.mcp_service = HomeAssistantMCPService(url=ha_mcp_url, access_token=supervisor_token)
                 mcp_client = await self.mcp_service.initialize()
                 logger.info("✅ Home Assistant MCP Client initialized")
@@ -487,11 +510,28 @@ class Application:
         self.transcription_language = transcription_language
         self.transcription_model = transcription_model
         if zan_bridge_enabled:
+            # RYCHLÁ DRÁHA vs. DELEGACE (2026-08-22). Model má k dispozici jak
+            # nativní HA nástroje (rychlá dráha), tak ask_zan (most na mozek).
+            # Tento prefix je vynucen KÓDEM (přežije editaci volby instructions),
+            # osobnost/kontext přidává volba instructions za ním.
             instructions = (
-                "Jsi hlasové rozhraní Žána. Vždy zavolej ask_zan přesně jednou "
-                "s přesným textem uživatele. Nikdy sám neodpovídej, nerozhoduj ani "
-                "nevolej jiné nástroje. Výsledek vyslov přesně, bez úvodu, "
-                "dovysvětlování nebo opakování. Odpovědi jsou krátké a přirozené.\n\n"
+                "ROUTING (řiď se tímto přednostně):\n"
+                "• JEDNODUCHÉ OVLÁDÁNÍ DOMU udělej SÁM svými HA nástroji, HNED, "
+                "bez ask_zan: rozsvítit/zhasnout světla, zapnout/vypnout zásuvku "
+                "nebo spotřebič, hudba a hlasitost (play/pause/další/ztlumit), "
+                "čtení stavů a teploty. Zavolej nástroj rovnou a pak řekni jednu "
+                "krátkou větu s výsledkem.\n"
+                "• ask_zan zavolej JEN když jde o: psaní nebo změnu automatizací "
+                "a konfigurace, diagnostiku typu „proč něco nejede\", tvorbu "
+                "dashboardu, cokoli na víc než dvě věty přemýšlení, nebo když si "
+                "nejsi jistý. Když deleguješ, řekni krátce „jdu na to, dám vědět\" "
+                "a pak zavolej ask_zan přesně jednou s textem uživatele.\n"
+                "• BEZPEČNOST: nevratné a rizikové akce NIKDY sám přes HA nástroje "
+                "— vždy přes ask_zan: zámky, alarm, brány a garážová vrata, "
+                "kotel/topný okruh, mazání, restart. Když by povel spadl sem, "
+                "místo provedení zavolej ask_zan.\n"
+                "• Nikdy nevyslovuj entity_id ani technické názvy; mluv o „světle "
+                "v obýváku\". Odpovědi krátké, mluvené, bez markdownu a výčtů.\n\n"
                 + instructions
             )
         self.instructions = instructions
@@ -594,12 +634,13 @@ class Application:
 
             # Web search tool (optional). Lets the model look things up online via
             # a secondary OpenAI Responses web_search call in the handler.
-            if self.enable_web_search and not self.zan_bridge_enabled:
+            # Rychlá dráha: koexistuje i s ask_zan (dřív jen mimo bridge).
+            if self.enable_web_search:
                 all_tools.append(get_web_search_tool_definition())
 
-            # Get MCP tool definitions if available
+            # Get MCP tool definitions if available (rychlá dráha — i v bridge režimu)
             mcp_tools_schema = None
-            if self.mcp_client and not self.zan_bridge_enabled:
+            if self.mcp_client:
                 try:
                     logger.info("🔧 Fetching MCP tool definitions...")
                     mcp_tools_schema = await self.mcp_client.get_tools_schema()
@@ -743,15 +784,15 @@ class Application:
                 logger.info("✅ Registered disconnect tool handler")
 
             # Register web search tool handler (only when the tool is exposed)
-            if self.enable_web_search and not self.zan_bridge_enabled:
+            if self.enable_web_search:
                 self.openai_service.register_function(
                     "web_search",
                     create_web_search_tool_handler(self.openai_api_key, self.web_search_model),
                 )
                 logger.info(f"✅ Registered web_search tool handler (model={self.web_search_model})")
-            
-            # Register MCP tool handlers if available
-            if self.mcp_client and mcp_tools_schema and not self.zan_bridge_enabled:
+
+            # Register MCP tool handlers if available (rychlá dráha — i v bridge režimu)
+            if self.mcp_client and mcp_tools_schema:
                 try:
                     await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
                     logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
