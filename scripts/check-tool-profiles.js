@@ -6,7 +6,7 @@ const { PROFILES, VOICE_CONTROL_TOOLS, resolveProfile, filterToolsByProfile } = 
 const fullTools = [
   'get_states', 'get_state', 'get_areas', 'check_temperature', 'turn_on', 'turn_off', 'toggle',
   'call_service', 'schedule_action', 'announce_home', 'play_music', 'play_video',
-  'read_cookbook',
+  'recall_days', 'read_cookbook',
   'garden_map', 'remember', 'recall', 'house_map', 'rodina_update',
   // admin-only:
   'write_package', 'delete_package', 'write_dashboard', 'restart_ha', 'onboard_device',
@@ -35,7 +35,7 @@ assert.deepStrictEqual(
 for (const forbidden of ['write_package', 'delete_package', 'write_dashboard', 'restart_ha', 'onboard_device', 'rodina_update', 'remember']) {
   assert.ok(!voiceNames.includes(forbidden), `hlasový profil NESMÍ obsahovat ${forbidden}`);
 }
-assert.ok(voiceNames.length <= 13, 'hlasový profil je malý (≤13 nástrojů)');
+assert.ok(voiceNames.length <= 14, 'hlasový profil je malý (≤14 nástrojů)');
 
 // ── 4) STABILITA per kanál (prompt cache): dvě volání = identické pole ──
 const a = filterToolsByProfile(fullTools, 'ovladani').map((t) => t.name);
@@ -48,6 +48,7 @@ assert.deepStrictEqual(partial.map((t) => t.name), ['get_states'], 'filtr ponech
 
 // ── 6) PROFILES kontrakt ──
 assert.ok(Array.isArray(PROFILES.ovladani) && PROFILES.ovladani.length >= 8, 'ovladani má rozumnou sadu');
+assert.ok(VOICE_CONTROL_TOOLS.includes('recall_days'), 'hlasový profil umí dohledat deník rozhovoru');
 assert.strictEqual(PROFILES.rodina, null, 'rodina = bez filtru');
 assert.strictEqual(PROFILES.admin, null, 'admin = bez filtru');
 
