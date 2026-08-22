@@ -255,4 +255,27 @@ let zhaLqiSnapshot = buildDeviceLayoutSnapshot({
 assert.strictEqual(zhaLqiSnapshot.devices.find(d => d.name === 'Dveře garáže').lqi, 35, 'LQI read from dedicated *_lqi diagnostic entity');
 assert.ok(zhaLqiSnapshot.diagnosis.recommendations.some(r => r.type === 'zigbee_weak_signal'), 'weak signal from ZHA LQI entity');
 
+// sc.66 (tester reziduál k.2026-08-17-programator-zana-02): MRTVÉ zařízení (unavailable)
+// se ZASTARALÝM atributem `linkquality` NESMÍ dostat radu "kup router". Bridge ONLINE,
+// jen jedno Zigbee zařízení unavailable (<2 v zóně → ani mesh_candidate) — čistě izoluje
+// LQI asymetrii: dřív atributová cesta četla stale hodnotu a fabulovala slabý signál.
+let deadStaleLqi = buildDeviceLayoutSnapshot({
+  states: [
+    { entity_id: 'sensor.sonoff_10028202d8', state: 'online', last_changed: old, attributes: { friendly_name: 'ZBBridge-U' } },
+    { entity_id: 'binary_sensor.garaz_dvere', state: 'unavailable', last_changed: old, attributes: { friendly_name: 'Dveře garáže', linkquality: 40 } },
+  ],
+  entityRegistry: [
+    { entity_id: 'sensor.sonoff_10028202d8', device_id: 'dev_bridge', name: 'ZBBridge-U', area_id: 'garaz' },
+    { entity_id: 'binary_sensor.garaz_dvere', device_id: 'dev_door', name: 'Dveře garáže', area_id: 'garaz' },
+  ],
+  deviceRegistry: [bridgeDevice, garageDoor],
+  areaRegistry,
+  houseMap,
+  now,
+  minAgeMs: 60 * 60 * 1000,
+});
+assert.strictEqual(deadStaleLqi.devices.find(d => d.name === 'Dveře garáže').lqi, null, 'unavailable device: stale linkquality attribute must NOT be read as LQI');
+assert.strictEqual(deadStaleLqi.counts.zigbee_weak_signal, 0, 'dead device with stale LQI must not count as weak signal');
+assert.ok(!deadStaleLqi.diagnosis.recommendations.some(r => r.type === 'zigbee_weak_signal'), 'no "buy router" advice for a dead (likely dead-battery) device');
+
 console.log('device layout contract OK');
