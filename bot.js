@@ -187,6 +187,101 @@ const TECHNOLOGY_DOCS_DIR = path.join(DATA_DIR, 'docs');
 const HOUSE_MAP_FILE    = path.join(DATA_DIR, 'house_map.json');
 const ENTITY_ARCHIVE_FILE = path.join(DATA_DIR, 'entity_archive.json');
 
+// ═══════════════════════════════════════════════
+// VERZE ŽÁNA (karta 2026-08-21-programator-zana-08)
+// Kanonický zdroj = config.yaml (pole version) — TO SAMÉ, co čte HA
+// Supervisor při instalaci add-onu. NE package.json (mrtvý, drží "1.0.0").
+// config.yaml + CHANGELOG.md jsou součástí image (Dockerfile COPY), takže
+// jdou číst přímo ze __dirname bez závislosti na Supervisor API/HA online.
+// Stav "co už bylo oznámeno" žije v DATA_DIR (/config/zan_data), tedy
+// PŘEŽIJE restart procesu i update add-onu — to je jádro "jednou".
+// ═══════════════════════════════════════════════
+const CONFIG_YAML_PATH = path.join(__dirname, 'config.yaml');
+const CHANGELOG_PATH = path.join(__dirname, 'CHANGELOG.md');
+const VERSION_ANNOUNCE_FILE = path.join(DATA_DIR, 'zan_version_announce.json');
+
+let cachedZanVersion = null;
+// Pravdivé číslo verze zan-bota. NENÍ verze Voice PE firmwaru ani
+// použitého AI modelu — ty se nikde tady neodvozují ani nemíchají.
+function getZanVersion() {
+  if (cachedZanVersion) return cachedZanVersion;
+  try {
+    const parsed = yaml.load(fs.readFileSync(CONFIG_YAML_PATH, 'utf8'));
+    if (parsed && typeof parsed.version === 'string' && parsed.version.trim()) {
+      cachedZanVersion = parsed.version.trim();
+      return cachedZanVersion;
+    }
+  } catch (e) {
+    console.warn('⚠️ Verzi se nepodařilo přečíst z config.yaml:', e.message);
+  }
+  return 'neznámá';
+}
+
+// Vrátí bullet-body sekce "## <verze>" z CHANGELOG.md, nebo null když
+// verze v changelogu není (raději mlčet než vymyslet neexistující změny).
+function getChangelogEntry(version) {
+  try {
+    const lines = fs.readFileSync(CHANGELOG_PATH, 'utf8').split('\n');
+    const start = lines.findIndex((l) => l.trim().startsWith(`## ${version}`));
+    if (start === -1) return null;
+    const rest = lines.slice(start + 1);
+    const end = rest.findIndex((l) => l.trim().startsWith('## '));
+    const body = (end === -1 ? rest : rest.slice(0, end)).join('\n').trim();
+    return body || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function loadVersionAnnounceState() {
+  try { if (fs.existsSync(VERSION_ANNOUNCE_FILE)) return JSON.parse(fs.readFileSync(VERSION_ANNOUNCE_FILE, 'utf8')); } catch {}
+  return {};
+}
+function saveVersionAnnounceState(state) {
+  try { fs.writeFileSync(VERSION_ANNOUNCE_FILE, JSON.stringify(state, null, 2), 'utf8'); }
+  catch (e) { console.warn('⚠️ Zápis stavu oznámení verze selhal:', e.message); }
+}
+
+// Čistá rozhodovací logika, bez I/O — ať jde otestovat bez sítě/mocku.
+// 'baseline': první běh vůbec (žádný uložený stav) — jen zapsat výchozí
+//   bod, NEOZNAMOVAT (jinak by zavedení téhle funkce vypálilo falešné
+//   "nová verze" na verzi, co už dávno běží).
+// 'none': stejná verze jako minule (restart procesu, ne upgrade).
+// 'announce': verze se změnila od posledního oznámení — přesně tohle je
+//   ten JEDEN moment, kdy se má promluvit.
+function decideVersionAnnouncement(state, currentVersion) {
+  if (!state || !state.last_announced_version) return { action: 'baseline', version: currentVersion };
+  if (state.last_announced_version === currentVersion) return { action: 'none', version: currentVersion };
+  return { action: 'announce', version: currentVersion, previous: state.last_announced_version };
+}
+
+// sendFn injektovatelný kvůli testu (výchozí = skutečné odeslání).
+async function announceVersionIfChanged(sendFn = sendSafe) {
+  const version = getZanVersion();
+  if (version === 'neznámá') return; // bez kanonického zdroje neriskovat lživé oznámení
+  const state = loadVersionAnnounceState();
+  const decision = decideVersionAnnouncement(state, version);
+
+  if (decision.action === 'baseline') {
+    saveVersionAnnounceState({ ...state, last_announced_version: version });
+    return;
+  }
+  if (decision.action === 'none') return;
+
+  if (await isAiStopped()) return; // AI STOP: neoznamovat teď, zkusí to zas při dalším startu
+
+  const notes = getChangelogEntry(version);
+  const text = notes
+    ? `🆕 Mám novou verzi ${version} (byl jsem ${decision.previous}). Co je nové:\n${notes}`
+    : `🆕 Mám novou verzi ${version} (byl jsem ${decision.previous}).`;
+  try {
+    await sendFn(CHAT_ONDRA, text);
+    saveVersionAnnounceState({ ...state, last_announced_version: version, announced_at: new Date().toISOString() });
+  } catch (e) {
+    console.warn('⚠️ Oznámení nové verze selhalo, zkusí to při dalším startu:', e.message);
+  }
+}
+
 // Poučení z chyb — Žán si je ukládá sám (save_lesson) a dostává je
 // v každém dynamickém kontextu, aby stejnou chybu neopakoval
 const LESSONS_FILE      = path.join(DATA_DIR, 'zan_lessons.json');
@@ -1906,6 +2001,11 @@ Po zápisu vždy popsat změny LIDSKY.`,
         },
       },
       {
+        name: 'get_version',
+        description: 'Přečte tvoje SKUTEČNÉ číslo verze (kanonický zdroj: config.yaml, ne mrtvý package.json). Použij, když se Ondra zeptá "jakou máš verzi" nebo "co je nového". POZOR: tohle je jen verze zan-bota — nezaměňuj ji s verzí Voice PE firmwaru ani s tím, jaký AI model zrovna odpovídá.',
+        input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
         name: 'save_playbook',
         description: 'Uloží OVĚŘENÝ postup jako playbook (markdown, kroky za sebou, včetně čísel/nástrojů, které fungovaly). Ukládej JEN když postup prokazatelně funguje a Ondra řekl "ulož si to jako postup" (nebo to potvrdil na tvůj návrh). Playbook = "takhle se dělá X"; poučení (save_lesson) = "tohle nedělej".',
         input_schema: {
@@ -3110,6 +3210,14 @@ async function executeTool(name, input, chatId) {
         const status = input.status === 'all' ? 'all' : 'open';
         const limit = Math.min(Math.max(Number(input.limit || 12), 1), 30);
         return { status, text: formatRepairInbox(REPAIRS_FILE, { status, limit }) };
+      }
+
+      case 'get_version': {
+        const version = getZanVersion();
+        return {
+          zan_verze: version,
+          poznamka: 'Tohle je verze zan-bota (add-on). Nezaměňuj ji s verzí Voice PE firmwaru ani s použitým AI modelem — ty se odvozují jinde.',
+        };
       }
 
       case 'save_playbook': {
@@ -4655,6 +4763,28 @@ startHarnessInbox();
 // Profil 'ovladani' + voice režim (krátká mluvená odpověď, bez eskalace)
 // sdílí STEJNÝ processMessage = stejná paměť i nástroje.
 // ═══════════════════════════════════════════════
+// Stejné tři pojistky jako handleMessage (Telegram) — hlas dřív šel rovnou
+// do processMessage a všechny tři obcházel (karta
+// 2026-08-21-programator-zana-02). Pořadí i texty zrcadlí Telegram větev
+// (bot.js ~4275–4297): rate limit → HA online → AI STOP. Pojmenovaná funkce
+// (ne inline closure) záměrně — jde exportovat pod TEST_EXPORTS a mít na ni
+// kontraktní test (scripts/check-voice-guards.js), který hlídá, že se z ní
+// guardy zase nevytratí.
+async function voiceDispatch(chatId, text) {
+  if (!checkRateLimit(chatId)) {
+    return '⏳ Příliš mnoho zpráv. Počkej chvíli.';
+  }
+  if (!(await isHaOnline())) {
+    return '🔴 Home Assistant není dostupný. Akce nelze provést.';
+  }
+  if (await isAiStopped()) {
+    return '🛑 AI STOP je aktivní. Deaktivuj ho v Home Assistant.';
+  }
+  return enqueueForChat(chatId, () => processMessage(chatId, text, null, {
+    profil: 'ovladani', voice: true, returnVoiceMeta: true,
+  }));
+}
+
 function startVoiceChannel() {
   if (HARNESS_ONLY) return; // test/harness běh nesmí otvírat kanál
   const token = process.env.ZAN_VOICE_TOKEN;
@@ -4668,15 +4798,14 @@ function startVoiceChannel() {
       token,
       allowedChats: ALLOWED_CHATS,
       defaultChatId,
-      dispatch: (chatId, text) =>
-        enqueueForChat(chatId, () => processMessage(chatId, text, null, {
-          profil: 'ovladani', voice: true, returnVoiceMeta: true,
-        })),
+      dispatch: voiceDispatch,
     })
     : null;
   // /narrate: instant krycí fráze (vypravěč) BEZ mozku — pipeline ji promluví
   // hned, zatímco /voice na pozadí počítá skutečnou odpověď. Zamluví latenci.
-  const narrate = token ? createNarratorHandler({ token, pickFiller: pickNarratorFiller }) : null;
+  // checkStop: vypravěč nesmí mluvit, když je STOP aktivní (i bez mozku by
+  // jinak řekl "makám na tom" a /voice hned potom mlčel/odmítl — matoucí).
+  const narrate = token ? createNarratorHandler({ token, pickFiller: pickNarratorFiller, checkStop: isAiStopped }) : null;
   const server = http.createServer((req, res) => {
     if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
     const routeHandle = req.method === 'POST' && req.url === '/narrate' ? narrate
@@ -5843,6 +5972,11 @@ async function executeDueScheduledActions() {
 // ČASOVAČE
 // ═══════════════════════════════════════════════
 if (!HARNESS_ONLY) {
+  // Verze: jednou (per proces) po startu zjistí, jestli se od posledního
+  // oznámení verze změnila, a pokud ano, řekne to. NE setInterval — je to
+  // kontrola "co se stalo od minula", ne opakovaný tik.
+  announceVersionIfChanged();
+
   // Polluj stavy každých 5 minut
   setInterval(pollStates, 5 * 60 * 1000);
 
@@ -5994,5 +6128,14 @@ if (TEST_EXPORTS) {
     renderOnboardingIntro,
     modelSupportsTemperature,
     claudeRequestOptionsForModel,
+    voiceDispatch,
+    isAiStopped,
+    getZanVersion,
+    getChangelogEntry,
+    decideVersionAnnouncement,
+    announceVersionIfChanged,
+    VERSION_ANNOUNCE_FILE,
+    CONFIG_YAML_PATH,
+    CHANGELOG_PATH,
   };
 }

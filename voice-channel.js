@@ -79,13 +79,24 @@ function createVoiceHandler({ token, allowedChats, defaultChatId, dispatch }) {
 // bearer token stejně jako /voice: bez tokenu endpoint neexistuje (401).
 // Vrací { narrate, narrator } — `narrate:false` = triviální zpráva (mozek
 // odpoví hned), pipeline pak žádnou frázi nepřehrává.
-function createNarratorHandler({ token, pickFiller }) {
+//
+// `checkStop()` se injektuje volitelně (framework-agnostický modul nezná HA) —
+// když vrátí true, vypravěč MLČÍ (narrate:false), i když by jinak měl frázi.
+// Bez injekce (test/jiný provoz bez STOP konceptu) se chová jako dřív.
+// Selhání checkStop() NESMÍ shodit endpoint (fail-open na filler, ne na 500) —
+// STOP se ověřuje ostře jen na /voice, kde jde o skutečnou akci.
+function createNarratorHandler({ token, pickFiller, checkStop }) {
   return async function handle({ authHeader, body }) {
     if (!tokenOk(authHeader, token)) {
       return { status: 401, json: { error: 'unauthorized' } };
     }
     const text = body && typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) return { status: 400, json: { error: 'missing text' } };
+    if (checkStop) {
+      let stopped = false;
+      try { stopped = await checkStop(); } catch { stopped = false; }
+      if (stopped) return { status: 200, json: { narrate: false, narrator: '' } };
+    }
     let filler = null;
     try { filler = pickFiller(text); } catch { filler = null; }
     return { status: 200, json: { narrate: !!filler, narrator: filler || '' } };

@@ -18,6 +18,12 @@ RUN npm install --production
 # POZOR: musí se vyjmenovat KAŽDÝ modul, který bot.js vyžaduje — jinak image
 # spadne hned při startu na MODULE_NOT_FOUND (stalo se 2026-07-14 u v5.7.2:
 # polling-watchdog.js se nezkopíroval a Žán se vůbec nespustil).
+# config.yaml + CHANGELOG.md: kanonický zdroj verze a jejího popisu (karta
+# 2026-08-21-programator-zana-08) — bot.js je čte za běhu, takže musí být
+# v image, ne jen v repu (Supervisor si config.yaml jinak čte sám, ale
+# kontejner k němu bez COPY přístup nemá).
+COPY config.yaml ./
+COPY CHANGELOG.md ./
 COPY bot.js ./
 COPY budget-report.js ./
 COPY onboard-device.js ./
