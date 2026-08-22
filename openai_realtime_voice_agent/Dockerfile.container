@@ -1,0 +1,79 @@
+# =====================================================================
+#  Hlasový most jako OBYČEJNÝ DOCKER KONTEJNER (ne HA add-on).
+#
+#  Proč druhý Dockerfile: `Dockerfile` vedle je add-on image — staví se na
+#  HA base image se s6-overlay a spouští `root/run.sh`, který konfiguraci
+#  tahá přes `bashio::config` ze Supervisoru. Na Ubuntu krabici (migrace
+#  TRIGKEY z HAOS, 23. 8. 2026) žádný Supervisor ani bashio není, takže
+#  tady je čistý python image: init = tini, aplikace se spouští přímo a
+#  konfigurace přijde z env proměnných (docker `env_file`).
+#
+#  Kód je pro oba světy JEDEN: `app/config_source.py` čte /data/options.json
+#  (add-on), a když neexistuje, bere env proměnné + výchozí hodnoty
+#  z config.yaml. V add-onu se tím nemění nic.
+#
+#  Build a běh (na krabici; kompletní compose je v repu CHoS-,
+#  projects/baklazan/zan/zan-box/docker-compose.yml):
+#
+#     docker build -f Dockerfile.container -t zan-realtime .
+#     docker run -d --name zan-realtime --restart unless-stopped \
+#        --network host --env-file /etc/zan/realtime.env \
+#        -v /opt/ha/config:/homeassistant:ro zan-realtime
+#
+#  Povinné proměnné: OPENAI_API_KEY, LONGLIVED_TOKEN (v add-onu ho zastupuje
+#  SUPERVISOR_TOKEN, ten tu neexistuje), HA_MCP_URL a HA_BASE_URL na
+#  http://127.0.0.1:8123/... (adresa `supervisor` v kontejneru neexistuje).
+#  Vzor se všemi proměnnými: zan-box/realtime.env.example.
+# =====================================================================
+
+# Debian (glibc), ne Alpine: pipecat si přitáhne llvmlite/numba, které mají
+# předpřipravené manylinux wheels jen pro glibc — na musl se kompilují ze
+# zdroje a build padá na verzi LLVM. Python 3.12 je v rozsahu pyproject
+# (>=3.11,<3.14).
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# tini  — init pro PID 1: přeposílá signály (docker stop = čistý konec, ne
+#         10 s čekání a SIGKILL) a sklízí zombie procesy,
+# ffmpeg/libsndfile1 — audio cesty pipecatu,
+# build-essential — pojistka pro ojedinělý balíček bez wheelu.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tini \
+        ffmpeg \
+        libsndfile1 \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalace aplikace i závislostí z pyproject (PEP 517 přes poetry-core),
+# stejně jako add-on image — ať se oba světy chovají identicky.
+COPY pyproject.toml /tmp/app_build/pyproject.toml
+COPY app/ /tmp/app_build/app/
+RUN pip install /tmp/app_build \
+    && rm -rf /tmp/app_build
+
+# Kód i do /app kvůli nahlédnutí zvenčí (`docker exec ... cat /app/main.py`).
+# Spouští se ale nainstalovaný balíček z site-packages — proto WORKDIR /,
+# přesně jako v add-onu.
+COPY app/ /app/
+
+# Knihovna přednahraných frází se hledá v /homeassistant/zan_data/fraze
+# (v add-onu to dělá `map: homeassistant_config:ro`) — v compose se sem
+# mountuje /opt/ha/config read-only. Když chybí, rychlá dráha se vypne sama.
+
+WORKDIR /
+
+# Hlasový WebSocket pro Voice PE. Při `network_mode: host` je to rovnou port
+# hostu; jinak si ho vystavit přes -p.
+EXPOSE 8080
+
+# Ověření je jen „port poslouchá" — plný WebSocket handshake by musel udělat
+# klient. Skutečný důkaz je promluvit na Voice PE.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,socket;p=int(os.environ.get('WEBSOCKET_PORT','8080'));socket.create_connection(('127.0.0.1',p),3).close()" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "app.main"]

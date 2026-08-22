@@ -17,6 +17,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
+from app import config_source
 from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
@@ -75,6 +76,18 @@ def _resolve_choice(env_var: str, custom_env_var: str, default: str) -> str:
     return choice or default
 
 dotenv.load_dotenv()
+
+# Konfigurace pro OBA světy jedním kódem (viz app/config_source.py):
+#   * add-on   — hodnoty z /data/options.json (tytéž, které dosud exportoval
+#                root/run.sh přes bashio; v add-onu se tedy nic nemění),
+#   * kontejner — env proměnné z docker `env_file` + výchozí hodnoty z config.yaml.
+# Zbytek aplikace čte dál os.environ, takže se nikde jinde nemuselo sahat.
+_CONFIG_APPLIED = config_source.apply_to_environ()
+logger.info(
+    "⚙️ Konfigurace: %s — nastaveno %d proměnných",
+    config_source.describe(),
+    len(_CONFIG_APPLIED),
+)
 
 
 class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
