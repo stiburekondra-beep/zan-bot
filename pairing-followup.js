@@ -66,6 +66,17 @@ async function runPairingCheck({ haGet, getKnown, setKnown }) {
   return { count: newEntities.length, entities };
 }
 
+// Baseline pro runPairingCheck: PREFERUJ zmražený snapshot z DOBY NAPLÁNOVÁNÍ
+// (action.known_snapshot), ne živé memory.known_entities. Živý baseline mezitím
+// přepíše periodická pollStates smyčka (à 5 min) a absorbuje právě spárované
+// zařízení → kontrola by ho po ~75 s okně už neviděla (race sc.65, ~25 % párování).
+// Snapshot je zmražený v naplánované akci, takže je proti tomu imunní. Fallback
+// na živý baseline drží zpětnou kompatibilitu se starými akcemi bez snapshotu.
+function resolvePairingBaseline(action, liveKnown) {
+  if (action && Array.isArray(action.known_snapshot)) return action.known_snapshot;
+  return Array.isArray(liveKnown) ? liveKnown : [];
+}
+
 // Zpráva z VÝSLEDKU reálné kontroly (ne slib). Nikdy netvrdí „hotovo/přidal
 // jsem" — jen co kontrola našla + konkrétní další krok.
 function buildPairingCheckMessage({ backend, count, entities = [] } = {}) {
@@ -83,5 +94,6 @@ module.exports = {
   buildPairingReminderMessage,
   pairingFollowupSuffix,
   runPairingCheck,
+  resolvePairingBaseline,
   buildPairingCheckMessage,
 };

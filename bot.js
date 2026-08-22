@@ -73,7 +73,7 @@ const { playMusic } = require('./play-music');
 const { playVideo, controlVideo, requiresVideoTool } = require('./play-video');
 const { handleCapabilityGap } = require('./capability-gap-repair');
 const { handleOnboardingRequest } = require('./service-onboarding');
-const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, buildPairingCheckMessage } = require('./pairing-followup');
+const { buildPairingNotification, buildPairingReminderMessage, pairingFollowupSuffix, runPairingCheck, resolvePairingBaseline, buildPairingCheckMessage } = require('./pairing-followup');
 const { resolveAuthConfig, isLimitError, subscriptionClientOptions, SubscriptionRouter } = require('./subscription-auth');
 const http = require('http');
 // Explicitní 'ws' knihovna, ne spoléhání na globální WebSocket — základní
@@ -983,7 +983,7 @@ function enrichHostsWithNeighborMacs(hosts, neighborMacs) {
   return hosts;
 }
 
-function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTool = 'get_new_entities' } = {}) {
+function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTool = 'get_new_entities', knownSnapshot } = {}) {
   const seconds = Math.max(20, Math.round(Number(duration) || 60) + 15);
   const due = new Date(Date.now() + seconds * 1000);
   const result = addScheduledAction(SCHEDULED_ACTIONS_FILE, {
@@ -996,6 +996,9 @@ function schedulePairingFollowup(chatId, userName, { backend, duration, verifyTo
     message: buildPairingReminderMessage({ backend, duration }),
     pairing_check: true,
     backend: backend || null,
+    // Zmraž baseline entit TEĎ (před spárováním), ať ho pozdější pollStates smyčka
+    // neabsorbuje a kontrola po doběhnutí okna nové zařízení opravdu uvidí (sc.65).
+    known_snapshot: Array.isArray(knownSnapshot) ? knownSnapshot.slice() : null,
     chat_id: chatId,
     created_by: userName || 'Žán',
   }, ALLOWED_DOMAINS);
@@ -2769,7 +2772,7 @@ async function executeTool(name, input, chatId) {
           if (pj) {
             await haPost(`services/${pj.entity_id.split('.')[0]}/turn_on`, { entity_id: pj.entity_id });
             logAction(chatId, user.name, 'permit_join', pj.entity_id, 'ok');
-            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt', duration });
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt', duration, knownSnapshot: memory.known_entities });
             return {
               success: true,
               backend: 'zigbee2mqtt',
@@ -2785,7 +2788,7 @@ async function executeTool(name, input, chatId) {
           if (domains.includes('zha')) {
             await haPost('services/zha/permit', { duration });
             logAction(chatId, user.name, 'permit_join', 'zha', 'ok');
-            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zha', duration });
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zha', duration, knownSnapshot: memory.known_entities });
             return {
               success: true,
               backend: 'zha',
@@ -2797,7 +2800,7 @@ async function executeTool(name, input, chatId) {
           if (domains.includes('mqtt')) {
             await haPost('services/mqtt/publish', { topic: 'zigbee2mqtt/bridge/request/permit_join', payload: JSON.stringify({ time: duration }) });
             logAction(chatId, user.name, 'permit_join', 'mqtt', 'ok');
-            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt/mqtt', duration });
+            const followup = schedulePairingFollowup(chatId, user.name, { backend: 'zigbee2mqtt/mqtt', duration, knownSnapshot: memory.known_entities });
             return {
               success: true,
               backend: 'zigbee2mqtt/mqtt',
@@ -5939,7 +5942,11 @@ async function executeDueScheduledActions() {
           try {
             const res = await runPairingCheck({
               haGet,
-              getKnown: () => memory.known_entities,
+              // Porovnávej proti ZMRAŽENÉMU snapshotu z doby naplánování, ne proti
+              // živému baseline, který mezitím mohla pollStates smyčka kontaminovat
+              // nově spárovaným zařízením (sc.65). setKnown dál aktualizuje živý
+              // baseline na aktuální stav (správná údržba pro další operace).
+              getKnown: () => resolvePairingBaseline(action, memory.known_entities),
               setKnown: (v) => { memory.known_entities = v; saveMemory(memory); },
             });
             text = buildPairingCheckMessage({ backend: action.backend, count: res.count, entities: res.entities });

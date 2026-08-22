@@ -2,14 +2,19 @@
 'use strict';
 
 const assert = require('assert');
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
 const {
   buildPairingNotification,
   buildPairingReminderMessage,
   pairingFollowupSuffix,
   runPairingCheck,
+  resolvePairingBaseline,
   buildPairingCheckMessage,
 } = require('../pairing-followup');
 const { buildOnboardDeviceRequest } = require('../onboard-device');
+const { addScheduledAction } = require('../schedule-action');
 
 const notification = buildPairingNotification({
   phase: 'config_flow',
@@ -81,7 +86,73 @@ assert(/zkontroluj/i.test(suffixFailed), 'nenaplánováno → dát konkrétní d
   assert(/zkontroluj/i.test(none), 'nulový nález → konkrétní další krok');
   assert(!/teď zkontroluju|ted zkontroluju/i.test(none), 'nulový nález nesmí slibovat budoucí kontrolu');
 
-  console.log('pairing-check (reálná kontrola) OK');
+  // === sc.65 RACE: zmražený snapshot vs. živý (pollStates kontaminovaný) baseline ===
+  // resolvePairingBaseline: snapshot z akce má přednost; bez něj fallback na živý.
+  assert.deepStrictEqual(
+    resolvePairingBaseline({ known_snapshot: ['light.a'] }, ['light.a', 'switch.b']),
+    ['light.a'],
+    'snapshot z akce má přednost před živým baseline',
+  );
+  assert.deepStrictEqual(
+    resolvePairingBaseline({ known_snapshot: null }, ['light.a']),
+    ['light.a'],
+    'bez snapshotu (stará akce) fallback na živý baseline',
+  );
+  assert.deepStrictEqual(resolvePairingBaseline(null, undefined), [], 'nic → []');
+
+  // Simulace race: dveře se spárovaly a jsou ve states; pollStera je mezitím
+  // absorbovala do ŽIVÉHO baseline. Snapshot z doby naplánování je NEMÁ.
+  const racedStates = [
+    { entity_id: 'light.kuchyne', attributes: { friendly_name: 'Kuchyň' } },
+    { entity_id: 'binary_sensor.dvere_garaz', attributes: { friendly_name: 'Dveře garáž' } }, // právě spárováno
+  ];
+  const frozenSnapshot = ['light.kuchyne']; // baseline PŘED spárováním (zmražený)
+  const contaminatedLive = ['light.kuchyne', 'binary_sensor.dvere_garaz']; // pollStates už absorbovala
+  const haGetRaced = async (p) => {
+    if (p === 'states') return racedStates;
+    const id = p.replace('states/', '');
+    return racedStates.find(s => s.entity_id === id) || { attributes: {} };
+  };
+
+  // FIX: getKnown přes resolvePairingBaseline se zmraženým snapshotem → dveře se najdou.
+  const fixed = await runPairingCheck({
+    haGet: haGetRaced,
+    getKnown: () => resolvePairingBaseline({ known_snapshot: frozenSnapshot }, contaminatedLive),
+    setKnown: () => {},
+  });
+  assert.strictEqual(fixed.count, 1, 'se zmraženým snapshotem se nové zařízení najde i po kontaminaci');
+  assert.strictEqual(fixed.entities[0].entity_id, 'binary_sensor.dvere_garaz');
+
+  // KONTROLA (diskriminace): kdyby se četl kontaminovaný živý baseline (starý bug) → 0 nálezů.
+  const buggy = await runPairingCheck({
+    haGet: haGetRaced,
+    getKnown: () => contaminatedLive,
+    setKnown: () => {},
+  });
+  assert.strictEqual(buggy.count, 0, 'kontrola: kontaminovaný živý baseline nové zařízení nevidí (starý bug)');
+
+  // addScheduledAction round-trip: known_snapshot přežije zápis do akce (whitelist).
+  const tmp = path.join(os.tmpdir(), `zan-sched-test-${process.pid}.json`);
+  try {
+    const due = new Date(Date.now() + 60_000).toISOString();
+    const r = addScheduledAction(tmp, {
+      due_at: due,
+      action_type: 'message',
+      message: 'kontrola párování',
+      pairing_check: true,
+      backend: 'zha',
+      known_snapshot: ['light.kuchyne', 'switch.b'],
+      chat_id: 123,
+      created_by: 'test',
+    }, []);
+    assert(r && r.success, 'akce se založí');
+    assert.deepStrictEqual(r.action.known_snapshot, ['light.kuchyne', 'switch.b'], 'known_snapshot přežije zápis do akce');
+    assert.strictEqual(r.action.pairing_check, true, 'pairing_check přežije');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* ok */ }
+  }
+
+  console.log('pairing-check (reálná kontrola + sc.65 race) OK');
 })().catch((e) => { console.error(e); process.exit(1); });
 
 const tvNeedsHandler = buildOnboardDeviceRequest({
