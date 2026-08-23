@@ -508,7 +508,11 @@ class Application:
         self.session_manager: Optional[SessionManager] = None
         self.current_task: Optional[PipelineTask] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
-        
+        # Health heartbeat: nezávislý task píše reálný stav OpenAI socketu do
+        # souboru, který čte Docker HEALTHCHECK (app/healthcheck.py). Nezávisí
+        # na toku device frames — poběží, i když se nikdy nepřipojí Voice PE.
+        self._health_task: Optional[asyncio.Task] = None
+
     async def initialize(self) -> None:
         """Initialize all components."""
         # Get configuration from environment
@@ -1075,9 +1079,44 @@ class Application:
             logger.info("✅ New OpenAI Session created")
             return self.openai_service
     
+    # Jak často heartbeat zapisuje stav. 5 s < MAX_AGE_S/6 v healthcheck.py, tj.
+    # i pár zmeškaných zápisů (GC, IO) status nerozbliká.
+    HEALTH_HEARTBEAT_S = 5.0
+
+    async def _health_heartbeat_loop(self) -> None:
+        """Píše reálný stav OpenAI spojení do heartbeat souboru pro Docker
+        HEALTHCHECK. Zdroj pravdy je `openai_service._websocket is not None`
+        (stejný signál, na kterém stojí reconnect watchdog), NE „port naslouchá".
+        Zapisuje atomicky (tmp + os.replace), takže healthcheck nikdy nečte
+        půlku řádku. Task je odolný: jakákoli chyba zápisu se zaloguje a smyčka
+        běží dál (radši žádný nový heartbeat → healthcheck zestárne → unhealthy,
+        než že by pád smyčky shodil celý proces)."""
+        path = os.environ.get("REALTIME_HEALTH_FILE", "/tmp/zan-realtime-health")
+        tmp = path + ".tmp"
+        while True:
+            try:
+                svc = self.openai_service
+                if svc is None:
+                    state = "idle"  # služba ještě nevznikla (krátké startovní okno)
+                elif getattr(svc, "_websocket", None) is not None:
+                    state = "connected"  # živý OpenAI Realtime socket
+                else:
+                    state = "disconnected"  # služba je, socket ne = hluchý dům
+                with open(tmp, "w") as f:
+                    f.write(f"{state} {int(time.time())}\n")
+                os.replace(tmp, path)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"health heartbeat write failed: {e!r}")
+            await asyncio.sleep(self.HEALTH_HEARTBEAT_S)
+
     async def run(self) -> None:
         """Run the application."""
         await self.initialize()
+        # Health heartbeat běží nezávisle na pipeline i na připojení zařízení.
+        if self._health_task is None:
+            self._health_task = asyncio.create_task(self._health_heartbeat_loop())
         
         # Create initial OpenAI service (will be replaced per connection)
         await self._ensure_openai_service()
@@ -1177,7 +1216,11 @@ class Application:
     async def cleanup(self) -> None:
         """Cleanup resources."""
         logger.info("Cleaning up application...")
-        
+
+        if self._health_task is not None:
+            self._health_task.cancel()
+            self._health_task = None
+
         if self.runner:
             try:
                 await self.runner.cancel()
