@@ -1,43 +1,88 @@
 # =====================================================================
-#  zan-realtime jako OBYCEJNY KONTEJNER (ne HA add-on)
+#  Hlasový most jako OBYČEJNÝ DOCKER KONTEJNER (ne HA add-on).
 #
-#  Proc vznikl (23. 8. 2026): docker-compose zan-boxu na tenhle soubor
-#  odkazuje od 22. 8., ale v repu NIKDY NEEXISTOVAL -- plan se zapsal do
-#  komentare compose, ale kod k nemu nevznikl. Po migraci z HAOS na Ubuntu
-#  tak hlasovy most neslo vubec postavit a Voice PE svitil cervene.
+#  Proč druhý Dockerfile: `Dockerfile` vedle je add-on image — staví se na
+#  HA base image se s6-overlay a spouští `root/run.sh`, který konfiguraci
+#  tahá přes `bashio::config` ze Supervisoru. Na Ubuntu krabici (migrace
+#  TRIGKEY z HAOS, 23. 8. 2026) žádný Supervisor ani bashio není, takže
+#  tady je čistý python image: init = tini, aplikace se spouští přímo a
+#  konfigurace přijde z env proměnných (docker `env_file`).
 #
-#  Rozdil proti add-on `Dockerfile`:
-#    - zadne s6-overlay ani bashio (potrebuji Supervisor, ten na Ubuntu neni)
-#    - konfigurace jde PRIMO z promennych prostredi (env_file v compose)
+#  Kód je pro oba světy JEDEN: `app/config_source.py` čte /data/options.json
+#  (add-on), a když neexistuje, bere env proměnné + výchozí hodnoty
+#  z config.yaml. V add-onu se tím nemění nic.
 #
-#  Klicove zjisteni: `app/` uz cte konfiguraci z `os.environ` sam
-#  (app/main.py: os.environ.get(...)). Add-on `run.sh` byl jen prekladac
-#  z bashio do prostredi. Proto NENI potreba zadny `config_source.py` --
-#  staci promenne predat a spustit `python3 -m app.main`, presne jak to
-#  dela posledni radek run.sh.
+#  Build a běh (na krabici; kompletní compose je v repu CHoS-,
+#  projects/baklazan/zan/zan-box/docker-compose.yml):
+#
+#     docker build -f Dockerfile.container -t zan-realtime .
+#     docker run -d --name zan-realtime --restart unless-stopped \
+#        --network host --env-file /etc/zan/realtime.env \
+#        -v /opt/ha/config:/homeassistant:ro zan-realtime
+#
+#  Povinné proměnné: OPENAI_API_KEY, LONGLIVED_TOKEN (v add-onu ho zastupuje
+#  SUPERVISOR_TOKEN, ten tu neexistuje), HA_MCP_URL a HA_BASE_URL na
+#  http://127.0.0.1:8123/... (adresa `supervisor` v kontejneru neexistuje).
+#  Vzor se všemi proměnnými: zan-box/realtime.env.example.
 # =====================================================================
+
+# Debian (glibc), ne Alpine: pipecat si přitáhne llvmlite/numba, které mají
+# předpřipravené manylinux wheels jen pro glibc — na musl se kompilují ze
+# zdroje a build padá na verzi LLVM. Python 3.12 je v rozsahu pyproject
+# (>=3.11,<3.14).
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ffmpeg + libsndfile1 = audio cesty pipecatu (stejne jako add-on image).
-# build-essential/python3-dev jen jako pojistka pro balicek bez wheelu.
-# tini = spravny PID 1 (v add-onu tuhle roli delal s6).
+# tini  — init pro PID 1: přeposílá signály (docker stop = čistý konec, ne
+#         10 s čekání a SIGKILL) a sklízí zombie procesy,
+# ffmpeg/libsndfile1 — audio cesty pipecatu,
+# build-essential — pojistka pro ojedinělý balíček bez wheelu.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg libsndfile1 tini build-essential python3-dev \
+        tini \
+        ffmpeg \
+        libsndfile1 \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalace aplikace z pyproject (PEP 517 pres poetry-core) -- stejny postup
-# jako add-on image, aby se chovani balicku nelisilo.
+# Instalace aplikace i závislostí z pyproject (PEP 517 přes poetry-core),
+# stejně jako add-on image — ať se oba světy chovají identicky.
 COPY pyproject.toml /tmp/app_build/pyproject.toml
 COPY app/ /tmp/app_build/app/
-RUN pip install /tmp/app_build && rm -rf /tmp/app_build
+RUN pip install /tmp/app_build \
+    && rm -rf /tmp/app_build
 
-# Kod aplikace i pro `python3 -m app.main` a snadne nahlednuti
+# Kód i do /app kvůli nahlédnutí zvenčí (`docker exec ... cat /app/main.py`).
+# Spouští se ale nainstalovaný balíček z site-packages — proto WORKDIR /,
+# přesně jako v add-onu.
 COPY app/ /app/
 
+# Knihovna přednahraných frází se hledá v /homeassistant/zan_data/fraze
+# (v add-onu to dělá `map: homeassistant_config:ro`) — v compose se sem
+# mountuje /opt/ha/config read-only. Když chybí, rychlá dráha se vypne sama.
+
 WORKDIR /
+
+# Hlasový WebSocket pro Voice PE. Při `network_mode: host` je to rovnou port
+# hostu; jinak si ho vystavit přes -p.
+EXPOSE 8080
+
+# Ověření: JEN že port poslouchá — a to BEZ připojení.
+#
+# Původní verze dělala `socket.create_connection(...)`, což je sice
+# nejjednodušší test, ale websockets server dostane spojení, které se zavře
+# před HTTP request line, a **vypíše kvůli tomu traceback**. Při intervalu
+# 30 s to znamenalo výjimku v logu každou půlminutu — doloženo živě 23. 8.
+# (EOFError v 11:43:07 a 11:43:37). Log, ve kterém se pravidelně objevuje
+# chyba, přestane být místem, kam se dá kouknout, když se něco opravdu pokazí.
+#
+# Čtení /proc/net/tcp(6) hledá naslouchající socket (stav 0A = LISTEN) na
+# daném portu. Nikam se nepřipojuje, takže server o kontrole vůbec neví.
+# Skutečný důkaz, že hlas jede, je stejně promluvit na Voice PE.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3     CMD python -c "import os;p=int(os.environ.get('WEBSOCKET_PORT','8080'));h=':%04X'%p;ls=[l.split() for f in ('/proc/net/tcp','/proc/net/tcp6') for l in open(f).readlines()[1:]];raise SystemExit(0 if any(c[1].endswith(h) and c[3]=='0A' for c in ls) else 1)"
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python3", "-m", "app.main"]
+CMD ["python", "-m", "app.main"]

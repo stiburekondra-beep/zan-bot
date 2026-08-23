@@ -21,3 +21,7 @@ zan_conversation.log
 
 # Node
 node_modules/
+
+# Python (bajtkód testů a mostu — v gitu nemá co dělat)
+__pycache__/
+*.pyc
