@@ -160,7 +160,24 @@ class ConnectionRecovery(FrameProcessor):
         "session_expired",
         "maximum duration",
     )
+    # pipecat's `_connect()` failing (DNS down, handshake timeout, OpenAI
+    # unreachable at container start) surfaces as exactly one ErrorFrame
+    # "Error connecting: …" and leaves `_websocket = None`. From then on
+    # `_ws_send` drops EVERY frame silently — no further ErrorFrame ever
+    # appears, so the markers above never fire and the house stays deaf
+    # until someone restarts the container (observed 2026-08-23: container
+    # came up during a LAN/DNS outage, 4 wake words in a row went into a
+    # void, LED ring red). Treat it as connection death AND keep retrying
+    # from the watchdog below, because this failure is silent afterwards.
+    _CONNECT_FAILED_MARKERS = (
+        "Error connecting",
+    )
     RECONNECT_COOLDOWN_S = 5.0
+    # Watchdog for the silent "never connected / connect failed" state:
+    # poll cadence and the exponential backoff between attempts.
+    WATCH_CHECK_S = 2.0
+    WATCH_BACKOFF_MIN_S = 5.0
+    WATCH_BACKOFF_MAX_S = 60.0
     IDLE_UNSTICK_COOLDOWN_S = 2.0
     # Proactive refresh: reconnect BEFORE OpenAI's 60-min session cap, but only
     # while the house is genuinely quiet, so the cap practically never lands
@@ -192,11 +209,16 @@ class ConnectionRecovery(FrameProcessor):
         # mic during an active turn or the follow-up window).
         self._last_input_audio = time.monotonic()
         self._refresh_task = None
+        self._watch_task = None
+        self._watch_backoff = self.WATCH_BACKOFF_MIN_S
+        self._watch_next_attempt = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if self._refresh_task is None:
             self._refresh_task = asyncio.create_task(self._proactive_refresh_loop())
+        if self._watch_task is None:
+            self._watch_task = asyncio.create_task(self._connection_watch_loop())
         if isinstance(frame, InputAudioRawFrame):
             # Only kept for the proactive-refresh "is anyone interacting?" check.
             # (Stale-audio clearing is now done at the cut-off source — the device
@@ -223,7 +245,10 @@ class ConnectionRecovery(FrameProcessor):
             #     reports them with this message. Without it the session sat
             #     deaf for hours until the next utterance hit the dead socket.
             reader_dead = "realtime receive loop" in msg
-            if send_flood or session_dead or reader_dead:
+            # (d) the initial/any `_connect()` failed — silent death afterwards,
+            #     see _CONNECT_FAILED_MARKERS. The watchdog keeps retrying.
+            connect_failed = any(m in msg for m in self._CONNECT_FAILED_MARKERS)
+            if send_flood or session_dead or reader_dead or connect_failed:
                 now = time.monotonic()
                 if now - self._last_attempt >= self.RECONNECT_COOLDOWN_S:
                     self._reconnecting = True
@@ -262,15 +287,69 @@ class ConnectionRecovery(FrameProcessor):
                 logger.error("❌ service has no reset_conversation(); cannot reconnect in place")
                 return
             await reset()
+            # reset_conversation() does NOT raise when `_connect()` fails —
+            # pipecat swallows it into an ErrorFrame and leaves `_websocket`
+            # None. Only a real socket counts as success.
+            if not self._service_connected():
+                self._watch_backoff = min(self._watch_backoff * 2, self.WATCH_BACKOFF_MAX_S)
+                self._watch_next_attempt = time.monotonic() + self._watch_backoff
+                logger.error(
+                    f"❌ OpenAI reconnect attempt failed (no websocket after reconnect) — "
+                    f"watchdog retries in {self._watch_backoff:.0f}s"
+                )
+                return
             self._connected_at = time.monotonic()
+            self._watch_backoff = self.WATCH_BACKOFF_MIN_S
             logger.info(
                 f"✅ OpenAI Realtime session reconnected in {self._connected_at - t0:.1f}s "
                 f"(gap the user may have heard)"
             )
         except Exception as e:
-            logger.error(f"❌ OpenAI reconnect attempt failed: {e!r}")
+            self._watch_backoff = min(self._watch_backoff * 2, self.WATCH_BACKOFF_MAX_S)
+            self._watch_next_attempt = time.monotonic() + self._watch_backoff
+            logger.error(f"❌ OpenAI reconnect attempt failed: {e!r} — watchdog retries in {self._watch_backoff:.0f}s")
         finally:
             self._reconnecting = False
+
+    def _service_connected(self) -> bool:
+        """True when the service holds a live OpenAI websocket object.
+
+        pipecat keeps `_websocket = None` whenever it is not connected (initial
+        connect failed, or after `_disconnect`). That attribute is the only
+        cheap truth we have — "session created" log lines are not.
+        """
+        return getattr(self._service, "_websocket", None) is not None
+
+    async def _connection_watch_loop(self):
+        """Keep trying to connect while there is NO OpenAI websocket at all.
+
+        Covers the silent failure mode the ErrorFrame triggers cannot: once
+        `_connect()` has failed, nothing in the pipeline produces errors any
+        more (audio is dropped in `_ws_send`), so no event would ever call
+        `_recover`. This loop polls the socket state and retries with
+        exponential backoff (5 s → 60 s) until the socket exists again —
+        e.g. after the LAN/DNS comes back. Fail-closed: a house that cannot
+        reach OpenAI keeps *trying*, not waiting for a human restart.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self.WATCH_CHECK_S)
+                if self._reconnecting or self._service_connected():
+                    continue
+                now = time.monotonic()
+                if now < self._watch_next_attempt or now - self._last_attempt < self.RECONNECT_COOLDOWN_S:
+                    continue
+                self._reconnecting = True
+                self._last_attempt = now
+                logger.warning(
+                    f"🩺 connection watchdog: no OpenAI websocket — attempting connect "
+                    f"(backoff {self._watch_backoff:.0f}s)"
+                )
+                await self._recover("watchdog: no OpenAI websocket")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"⚠️ connection watchdog loop error: {e!r}")
 
     async def _proactive_refresh_loop(self):
         """Refresh the OpenAI session BEFORE the 60-min cap, during real idle.

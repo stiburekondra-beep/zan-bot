@@ -748,11 +748,19 @@ class Application:
             # osobnost/kontext přidává volba instructions za ním.
             instructions = (
                 "ROUTING (řiď se tímto přednostně):\n"
+                "• TELEVIZE — VOLBA Z NABÍDKY: když uživatel řekne JEN číslo "
+                "nebo číslovku (jedna, dvojku, tři, čtyřku, ... deset), je to "
+                "volba z nabídky videí na televizi. Nekomentuj ji, nevolej HA "
+                "nástroje — zavolej ask_zan s přesným zněním toho, co uživatel "
+                "řekl. Totéž povely o televizi: pust na televizi X, najdi na "
+                "televizi X, zastav televizi — vždy ask_zan.\n"
                 "• JEDNODUCHÉ OVLÁDÁNÍ DOMU udělej SÁM svými HA nástroji, HNED, "
                 "bez ask_zan: rozsvítit/zhasnout světla, zapnout/vypnout zásuvku "
                 "nebo spotřebič, hudba a hlasitost (play/pause/další/ztlumit), "
-                "čtení stavů a teploty. Zavolej nástroj rovnou a pak řekni jednu "
-                "krátkou větu s výsledkem.\n"
+                "čtení stavů a teploty. U AKCÍ zavolej nástroj a SÁM K TOMU NIC "
+                "NEŘÍKEJ — průběžnou hlášku i potvrzení přehraje systém z knihovny; "
+                "kdybys mluvil taky, zazní to dvakrát. Jen u čtení stavů a teplot "
+                "odpověz sám jednou krátkou větou.\n"
                 "• ask_zan zavolej JEN když jde o: psaní nebo změnu automatizací "
                 "a konfigurace, diagnostiku typu „proč něco nejede\", tvorbu "
                 "dashboardu, cokoli na víc než dvě věty přemýšlení, nebo když si "
@@ -762,11 +770,12 @@ class Application:
                 "— vždy přes ask_zan: zámky, alarm, brány a garážová vrata, "
                 "kotel/topný okruh, mazání, restart. Když by povel spadl sem, "
                 "místo provedení zavolej ask_zan.\n"
-                "• RYCHLÁ PUSA: u jednoduchých povelů řekne průběh („Rozsvěcuju.\") "
-                "a po ověření stavu pípne krátký tón sám systém, z přednahrané "
-                "knihovny — TY UŽ K TOMU NIC NEŘÍKEJ. Když nástroj vrátí "
-                "status verified_success / unconfirmed / ha_unreachable, uživatel "
-                "to už slyšel: mlč a čekej na další povel.\n"
+                "• KRÁTKÉ HLÁŠENÍ: u jednoduchého povelu řekni jen krátce, co "
+                "právě děláš („Rozsvěcuju.\"). Výsledek potvrdí krátký tón, "
+                "který systém přehraje sám z přednahrané knihovny — výsledek už "
+                "slovy nekomentuj. Když nástroj vrátí status verified_success, "
+                "unconfirmed nebo ha_unreachable, uživatel už odpověď slyšel: "
+                "nic nedodávej a čekej na další povel.\n"
                 "• POCTIVOST: nikdy netvrď VÝSLEDEK („rozsvíceno\", „hotovo\") bez "
                 "ověřeného stavu a nevymýšlej si, co je v domě. Průběh („dělám to\") "
                 "smí zaznít hned. Když ověřit nejde, řekni přesně to.\n"
@@ -1085,6 +1094,15 @@ class Application:
         # Build pipeline - based on pipecat-examples, one pipeline handles all connections
         # The transport manages multiple connections internally
         self._build_pipeline_for_transport(self.websocket_transport, "server")
+
+        # Zanova obrazovka (LAB 23. 8.): HTTP 127.0.0.1:8791/follow_up ->
+        # broadcast {"type":"request_follow_up"} -> Voice PE otevre mikrofon
+        # bez wake wordu (nabidka videi na TV ceka na cislo od ditete).
+        try:
+            from app.tv_control import start_tv_control
+            await start_tv_control(self.websocket_handler.broadcast_json)
+        except OSError as e:
+            logger.warning(f"tv_control se nespustil (port obsazeny?): {e!r}")
 
         # Consume pipecat's FIRST-context auto-response ONCE at startup — SILENTLY.
         # WHY: pipecat 0.0.97's OpenAIRealtimeLLMService._handle_context does
