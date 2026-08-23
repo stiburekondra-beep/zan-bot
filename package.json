@@ -33,6 +33,7 @@
     "test:service-onboarding": "node scripts/check-service-onboarding.js",
     "test:voice-response": "node scripts/check-voice-response.js",
     "test:voice-confirmation": "node scripts/check-voice-confirmation.js",
+    "test:hra-most": "node --test test-hra-most.js",
     "test:play-music": "node scripts/check-play-music.js",
     "test:conversation-quality": "node scripts/check-conversation-quality.js",
     "test:recall-days": "node scripts/check-recall-days.js",

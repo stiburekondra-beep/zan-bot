@@ -21,6 +21,8 @@ export ZAN_VOICE_TOKEN=$(jq --raw-output '.ZAN_VOICE_TOKEN // ""' /data/options.
 export ZAN_APP_TOKEN=$(jq --raw-output '.ZAN_APP_TOKEN // ""' /data/options.json)
 export ZAN_VOICE_HTTP_HOST=$(jq --raw-output '.ZAN_VOICE_HTTP_HOST // "0.0.0.0"' /data/options.json)
 export ZAN_VOICE_CHAT_ID=$(jq --raw-output '.ZAN_VOICE_CHAT_ID // 0' /data/options.json)
+# Hry (dětský režim): výchozí chat pomocníka pro POST /hra, když HA input_text.hra_pomocnik_chat je prázdné (0 = Ondra)
+export ZAN_HRA_CHAT_ID=$(jq --raw-output '.ZAN_HRA_CHAT_ID // 0' /data/options.json)
 export ZAN_MUSIC_PLAYER_ENTITY_ID=$(jq --raw-output '.ZAN_MUSIC_PLAYER_ENTITY_ID // "media_player.zan_media_player"' /data/options.json)
 
 # Model routing z HA UI (5.12.7). Prázdná hodnota = fallback na default v bot.js

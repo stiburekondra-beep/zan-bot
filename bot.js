@@ -65,6 +65,8 @@ const {
 const { resolveProfile, filterToolsByProfile } = require('./tool-profiles');
 const { createVoiceHandler, createNarratorHandler } = require('./voice-channel');
 const { pickNarratorFiller } = require('./narrator');
+// Most HA ↔ Telegram pro pomocníka ve hrách (dětský režim) — POST /hra + callbacky hra:*
+const hraMost = require('./hra-most');
 const { sanitizeVoiceResponse } = require('./voice-response');
 const { buildVoiceFastConfirmation } = require('./voice-confirmation');
 const { getExpertiseLevel, setExpertiseLevel, setTon, tonRequestDisablesChildGuard, renderCommunicationInstruction } = require('./communication-profile');
@@ -494,6 +496,8 @@ const RATE_WINDOW = 60 * 1000;
 // na inline tlačítko ✅. Do té doby žije tady. Není to prosba v promptu,
 // je to závora v kódu.
 const pendingConfirm = new Map(); // chatId -> { name, input, desc, token, when }
+// Hra: pomocník, od kterého čekáme volnou textovou odpověď (po tlačítku hra:text / výzvě z HA)
+const hraCekani = hraMost.vytvorCekani();
 
 function isSensitiveAction(name, input) {
   // Vrací lidský popis akce, když vyžaduje potvrzení; jinak null.
@@ -4437,6 +4441,13 @@ bot.on('callback_query', async (q) => {
   try {
     const chatId = q.message?.chat?.id;
     if (!chatId || !ALLOWED_CHATS.includes(chatId)) { await bot.answerCallbackQuery(q.id); return; }
+    // ── HRA: tlačítka pomocníka (hra:ano / hra:ne / hra:hotovo / hra:ja / hra:konec …) ──
+    // Jde mimo pendingConfirm: není to potvrzení AI akce, ale vstup člověka do hry.
+    // HA volání jen z allowlistu v hra-most.js (žádná entita z callback_data).
+    if (hraMost.jeHerniCallback(q.data)) {
+      await zpracujHerniTlacitko(q, chatId);
+      return;
+    }
     const [act, token] = String(q.data || '').split(':');
     const p = pendingConfirm.get(chatId);
     if (!p || p.token !== token || Date.now() - p.when > 10 * 60 * 1000) {
@@ -4458,6 +4469,29 @@ bot.on('callback_query', async (q) => {
     logAction(chatId, getUser(chatId).name, 'confirm_execute', p.desc, result && result.error ? 'fail' : 'ok');
   } catch (e) { console.error('callback_query:', e.message); }
 });
+
+// Klik pomocníka na herní tlačítko → HA (allowlist) → odpověď do Telegramu
+// + úprava zprávy, ať je vidět, co bylo zmáčknuto (tlačítka zmizí, zůstane
+// jen „Konec hry"). hra:konec jde i při AI STOP — je to brzda, ne AI akce.
+async function zpracujHerniTlacitko(q, chatId) {
+  const r = await hraMost.zpracujHraCallback({
+    data: q.data, chatId, haPost, readState: readEntityState, cekani: hraCekani,
+  });
+  try { await bot.answerCallbackQuery(q.id, { text: r.text, show_alert: !r.ok }); } catch {}
+  const msgId = q.message?.message_id;
+  if (msgId) {
+    const zbytek = r.akce && r.akce.data === hraMost.TLACITKO_KONEC.data ? [] : [[{ text: hraMost.TLACITKO_KONEC.text, callback_data: hraMost.TLACITKO_KONEC.data }]];
+    const puvodni = q.message?.text || '';
+    try {
+      await bot.editMessageText(`${puvodni}\n\n→ ${r.znacka}`, {
+        chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: zbytek },
+      });
+    } catch (e) {
+      try { await bot.editMessageReplyMarkup({ inline_keyboard: zbytek }, { chat_id: chatId, message_id: msgId }); } catch {}
+    }
+  }
+  logAction(chatId, getUser(chatId).name, 'hra_callback', String(q.data || ''), r.ok ? 'ok' : 'fail');
+}
 
 async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, action) => bot.sendChatAction(chatId, action)) {
   const chatId = msg.chat.id;
@@ -4488,8 +4522,8 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
-  // AI stop check
-  if (cmdText !== '/start' && cmdText !== '/pamet' && await isAiStopped()) {
+  // AI stop check (/konec = brzda hry, projde i při STOP — stejně jako tlačítko hra:konec)
+  if (cmdText !== '/start' && cmdText !== '/pamet' && cmdText !== '/konec' && await isAiStopped()) {
     send(chatId, '🛑 *AI STOP je aktivní.* Deaktivuj ho v Home Assistant.', { parse_mode: 'Markdown' });
     return;
   }
@@ -4712,6 +4746,27 @@ async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, act
     return;
   }
 
+  // /konec = totéž co tlačítko „Konec hry" (README her §7b bod 3): script.hra_konec,
+  // idempotentní, bez AI. Jen z allowlistu chatů (výš už ověřeno).
+  if (cmdText === '/konec') {
+    const r = await hraMost.zpracujHraCallback({ data: hraMost.TLACITKO_KONEC.data, chatId, haPost, readState: readEntityState, cekani: hraCekani });
+    logAction(chatId, user.name, 'hra_konec_prikaz', 'script.hra_konec', r.ok ? 'ok' : 'fail');
+    send(chatId, r.ok ? '⏹ Konec hry — Žán vrací pokoj do normálu.' : `⚠️ ${r.text}`);
+    return;
+  }
+
+  // Volná odpověď pomocníka pro hru („sklenička v koupelně") — jen když na ni
+  // čekáme (výzva z HA / tlačítko hra:text) A běží hra (input_select.zan_rezim == hra).
+  // Jinak text jde normální cestou k Žánovi.
+  try {
+    const h = await hraMost.zpracujTextPomocnika({ chatId, text, cekani: hraCekani, readState: readEntityState, haPost });
+    if (h && h.zapsano) {
+      logAction(chatId, user.name, 'hra_odpoved_pomocnika', hraMost.ENTITA_POMOCNIK_ODPOVED, 'ok');
+      send(chatId, `📝 Zapsáno pro hru: „${h.value}"`);
+      return;
+    }
+  } catch (e) { console.error('hra odpověď pomocníka:', e.message); }
+
   sendChatAction(chatId, 'typing');
   try {
     const response = await processMessage(chatId, text);
@@ -4896,10 +4951,22 @@ function startVoiceChannel() {
   // checkStop: vypravěč nesmí mluvit, když je STOP aktivní (i bez mozku by
   // jinak řekl "makám na tom" a /voice hned potom mlčel/odmítl — matoucí).
   const narrate = token ? createNarratorHandler({ token, pickFiller: pickNarratorFiller, checkStop: isAiStopped }) : null;
+  // /hra: HA (script.hra_telegram → rest_command.hra_zan_bot) posílá pomocníkovi
+  // ve hře zprávu s inline tlačítky; stejný token jako /voice. Kdo je pomocník:
+  // HA input_text.hra_pomocnik_chat (musí být v ALLOWED_CHATS), jinak ZAN_HRA_CHAT_ID / Ondra.
+  const hraChatId = parseInt(process.env.ZAN_HRA_CHAT_ID || '', 10) || defaultChatId;
+  const hra = token
+    ? hraMost.createHraHandler({
+      token, allowedChats: ALLOWED_CHATS, defaultChatId: hraChatId,
+      readState: readEntityState, cekani: hraCekani,
+      sendMessage: (chatId, text, extra) => bot.sendMessage(chatId, text, extra),
+    })
+    : null;
   const server = http.createServer((req, res) => {
     if (handleOnboardingRequest(req, res, { token: appToken, stateFile: SERVICE_ONBOARDING_FILE })) return;
     const routeHandle = req.method === 'POST' && req.url === '/narrate' ? narrate
       : req.method === 'POST' && req.url === '/voice' ? handle
+      : req.method === 'POST' && req.url === '/hra' ? hra
       : null;
     if (!routeHandle) { res.writeHead(404); return res.end(); }
     let raw = '';
@@ -4918,7 +4985,7 @@ function startVoiceChannel() {
     });
   });
   server.on('error', (e) => console.error('Voice kanál error:', e.message));
-  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /narrate + /onboarding (bearer token)`));
+  server.listen(port, host, () => console.log(`🎙️ Žán HTTP kanál: http://${host}:${port}/voice + /narrate + /hra + /onboarding (bearer token)`));
 }
 startVoiceChannel();
 

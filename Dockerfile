@@ -62,6 +62,7 @@ COPY capability-gap-repair.js ./
 COPY pairing-followup.js ./
 COPY narrator.js ./
 COPY subscription-auth.js ./
+COPY hra-most.js ./
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 

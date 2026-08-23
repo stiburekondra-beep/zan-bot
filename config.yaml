@@ -36,6 +36,7 @@ options:
   ZAN_APP_TOKEN: ""
   ZAN_VOICE_HTTP_HOST: "0.0.0.0"
   ZAN_VOICE_CHAT_ID: 0
+  ZAN_HRA_CHAT_ID: 0
   ZAN_MUSIC_PLAYER_ENTITY_ID: "media_player.zan_media_player"
   # Model routing — přepínatelné z HA UI bez deploye (prázdné = default z bot.js).
   # FAST = běžný chat/hlas/ovládání, SMART = YAML a tvorba, SERVIS = údržba.
@@ -64,6 +65,7 @@ schema:
   ZAN_APP_TOKEN: str?
   ZAN_VOICE_HTTP_HOST: str?
   ZAN_VOICE_CHAT_ID: int?
+  ZAN_HRA_CHAT_ID: int?
   ZAN_MUSIC_PLAYER_ENTITY_ID: str?
   ZAN_VIDEO_PLAYER_ENTITY_ID: str?
   YOUTUBE_API_KEY: str?

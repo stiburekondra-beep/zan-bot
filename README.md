@@ -28,6 +28,7 @@ AI správce domu pro Home Assistant ovládaný přes Telegram.
 | ZAN_APP_TOKEN | Secret zákaznické onboarding stránky `/onboarding`; když je prázdný, použije se `ZAN_VOICE_TOKEN` (volitelné; bez tokenu je stránka vypnutá) |
 | ZAN_VOICE_HTTP_HOST | Bind adresa voice kanálu (default `0.0.0.0` kvůli dosažitelnosti z HA Core; volitelné) |
 | ZAN_VOICE_CHAT_ID | Telegram Chat ID, na které hlas mapuje (default = admin/Ondra; volitelné) |
+| ZAN_HRA_CHAT_ID | Telegram Chat ID výchozího pomocníka ve hrách (`POST /hra`), když HA `input_text.hra_pomocnik_chat` je prázdné (default = `ZAN_VOICE_CHAT_ID` / Ondra; volitelné) |
 
 ### Hlasový kanál (voice)
 
@@ -52,6 +53,51 @@ Pro cizí dům nepřenášej `/config/zan_data/` z jiné instalace. Prázdná
 instalace si vytvoří vlastní `rodina.md` a `home_memory.json` podle hodnot
 `ZAN_HOME_NAME`, `CHAT_NAME_ONDRA` a `CHAT_NAME_JANA`.
 
+### Hry — most pro pomocníka (dětský režim)
+
+Dětský režim Žána (HA balíček `zan_hry.yaml`, CHoS- `projects/baklazan/lab/ha/hry/`)
+potřebuje **pomocníka, který nehraje** (rodič / starší brácha): potvrdí v Telegramu,
+že děti úkol splnily, že je příprava hotová, nebo napíše, kam schoval předmět.
+Kanál pomocníka = Telegram (rozhodnuto 23. 8. 2026). Most je v `hra-most.js`,
+testy `npm run test:hra-most`.
+
+**HA → pomocník: `POST /hra`** na stejném portu a se stejným bearer tokenem jako
+`/voice` (`ZAN_VOICE_TOKEN`; bez tokenu route neexistuje). Volá ho HA
+`rest_command.hra_zan_bot` (kostka `script.hra_telegram`). Tělo:
+
+```json
+{ "text": "Přepnuli obě páky?",
+  "tlacitka": [{ "text": "✅ splnili", "data": "hra:ano" }, { "text": "❌ nesplnili", "data": "hra:ne" }],
+  "komu": "pomocnik" }
+```
+
+Odpověď `{ "ok": true, "message_id": 123, "chat_id": … }`. Ke každé herní zprávě bot
+**sám přidá tlačítko „⏹ Konec hry"** (`hra:konec`, bez duplikace, když ho HA už poslala).
+Komu: `komu: "pomocnik"` (výchozí) = chat z HA `input_text.hra_pomocnik_chat`, když je
+v allowlistu chatů; jinak `ZAN_HRA_CHAT_ID`, jinak admin. `komu: <chat id>` jen z allowlistu,
+cizí chat → 400. Neznámé tlačítko (`data` mimo tabulku níže) → 400, nic se neposílá.
+
+**Pomocník → HA: callback `hra:*`** (klik na tlačítko). Jediné HA volání podle allowlistu
+v `hra-most.js` — nic jiného herní callback volat nesmí (entita se nikdy nebere
+z `callback_data`):
+
+| `callback_data` | HA |
+|---|---|
+| `hra:ano` | `input_boolean.turn_on` → `input_boolean.hra_pomocnik_ano` |
+| `hra:ne` | `input_boolean.turn_on` → `input_boolean.hra_pomocnik_ne` |
+| `hra:hotovo` | `input_boolean.turn_on` → `input_boolean.hra_priprava_hotovo` |
+| `hra:ja` | `input_boolean.turn_on` → `input_boolean.hra_pomocnik_to_jsem_ja` |
+| `hra:konec` | `script.turn_on` → `script.hra_konec` (také příkaz `/konec`) |
+| `hra:pokoj:<slug>` | `input_text.set_value` → `input_text.hra_pomocnik_odpoved` = slug (`[a-z0-9_]`, P1 výběr pokoje) |
+| `hra:text` | bot čeká 10 min na **další textovou zprávu** pomocníka → `input_text.hra_pomocnik_odpoved` („sklenička v koupelně") |
+
+Po kliku se zpráva upraví (`→ ✅ splnili`), tlačítka zmizí, zůstane jen „Konec hry".
+U `input_boolean` bot stav přečte zpět a potvrdí jen, když je fakt `on` (HA vrací 200
+i když se nic nestalo). Volný text po `hra:text` se zapíše **jen když běží hra**
+(`input_select.zan_rezim == hra`); jinak jde zpráva normální cestou k Žánovi.
+Callbacky jdou mimo `pendingConfirm` (nejsou potvrzení AI akce) a jen z chatů
+v allowlistu. `hra:konec` / `/konec` je brzda: funguje i při AI STOP.
+
 ## Aktualizace
 
 Při nové verzi klikni **Update** v HA Add-on stránce.
@@ -67,4 +113,5 @@ Při nové verzi klikni **Update** v HA Add-on stránce.
 - `/navyky` — sledování návyků
 - `/analyza` — ruční analýza návyků
 - `/log` — log akcí (jen Ondra)
+- `/konec` — konec hry (dětský režim; totéž co tlačítko „⏹ Konec hry")
 - `/reset` — vymaž historii konverzace
