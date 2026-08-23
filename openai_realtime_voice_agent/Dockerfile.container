@@ -70,10 +70,15 @@ WORKDIR /
 # hostu; jinak si ho vystavit přes -p.
 EXPOSE 8080
 
-# Ověření je jen „port poslouchá" — plný WebSocket handshake by musel udělat
-# klient. Skutečný důkaz je promluvit na Voice PE.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD python -c "import os,socket;p=int(os.environ.get('WEBSOCKET_PORT','8080'));socket.create_connection(('127.0.0.1',p),3).close()" || exit 1
+# Ověření se ptá „existuje TEĎ platné spojení na OpenAI?", ne jen „port
+# naslouchá". Starý port-check zůstal zelený, i když byl dům hluchý (OpenAI
+# socket mrtvý, 2026-08-23). app/healthcheck.py čte heartbeat, který proces
+# píše podle reálného stavu `_websocket`. --retries=3 --interval=30s toleruje
+# krátkou reconnect mezeru; `unhealthy` znamená skutečně „hlas nefunguje".
+# (Docker HEALTHCHECK jen nastaví status v `docker ps`, sám nerestartuje —
+#  o znovupřipojení se stará reconnect watchdog uvnitř procesu.)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python -m app.healthcheck || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "app.main"]
