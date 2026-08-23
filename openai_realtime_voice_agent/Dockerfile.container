@@ -1,0 +1,43 @@
+# =====================================================================
+#  zan-realtime jako OBYCEJNY KONTEJNER (ne HA add-on)
+#
+#  Proc vznikl (23. 8. 2026): docker-compose zan-boxu na tenhle soubor
+#  odkazuje od 22. 8., ale v repu NIKDY NEEXISTOVAL -- plan se zapsal do
+#  komentare compose, ale kod k nemu nevznikl. Po migraci z HAOS na Ubuntu
+#  tak hlasovy most neslo vubec postavit a Voice PE svitil cervene.
+#
+#  Rozdil proti add-on `Dockerfile`:
+#    - zadne s6-overlay ani bashio (potrebuji Supervisor, ten na Ubuntu neni)
+#    - konfigurace jde PRIMO z promennych prostredi (env_file v compose)
+#
+#  Klicove zjisteni: `app/` uz cte konfiguraci z `os.environ` sam
+#  (app/main.py: os.environ.get(...)). Add-on `run.sh` byl jen prekladac
+#  z bashio do prostredi. Proto NENI potreba zadny `config_source.py` --
+#  staci promenne predat a spustit `python3 -m app.main`, presne jak to
+#  dela posledni radek run.sh.
+# =====================================================================
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# ffmpeg + libsndfile1 = audio cesty pipecatu (stejne jako add-on image).
+# build-essential/python3-dev jen jako pojistka pro balicek bez wheelu.
+# tini = spravny PID 1 (v add-onu tuhle roli delal s6).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg libsndfile1 tini build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalace aplikace z pyproject (PEP 517 pres poetry-core) -- stejny postup
+# jako add-on image, aby se chovani balicku nelisilo.
+COPY pyproject.toml /tmp/app_build/pyproject.toml
+COPY app/ /tmp/app_build/app/
+RUN pip install /tmp/app_build && rm -rf /tmp/app_build
+
+# Kod aplikace i pro `python3 -m app.main` a snadne nahlednuti
+COPY app/ /app/
+
+WORKDIR /
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "-m", "app.main"]
