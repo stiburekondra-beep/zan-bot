@@ -681,6 +681,18 @@ class WebSocketHandler:
 
         async def _on_device_interrupt():
             _interrupt_kill_until["t"] = time.monotonic() + INTERRUPT_KILL_WINDOW_S
+            # DVA MOZKY (25. 8. 2026): od téhle verze může na pozadí běžet
+            # dotaz na Žán-Code, který si svou odpověď sám vstříkne do session
+            # a nechá ji vyslovit — i za minutu. „Zmlkni" musí zabít i tohle,
+            # jinak by po stopce promluvil mozek. Časové okno ani
+            # _kill_next_response na to nestačí: podsunutí přijde mnohem
+            # později než 1,5 s a je to plnohodnotná nová odpověď.
+            zan_bridge = getattr(openai_service, "zan_bridge", None)
+            if zan_bridge is not None:
+                try:
+                    zan_bridge.cancel_all("device interrupt (STOP)")
+                except Exception as e:  # pragma: no cover - brzda nesmí spadnout
+                    logger.warning(f"🛑 zrušení běžících ask_zan selhalo: {e!r}")
             # Arm the next-response kill on EVERY stop (see the flag comment):
             # the 1.5 s time-window alone misses responses that land later —
             # OpenAI replying to the spoken "stop", or a slow tool's answer.

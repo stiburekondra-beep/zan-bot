@@ -22,7 +22,7 @@ from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
-from app.zan_bridge_tool import get_ask_zan_tool_definition, create_ask_zan_tool_handler
+from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
 from app.voice_safety import is_sensitive_actuation
 from app.voice_fastlane import (
     CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
@@ -766,6 +766,15 @@ class Application:
                 "dashboardu, cokoli na víc než dvě věty přemýšlení, nebo když si "
                 "nejsi jistý. Když deleguješ, řekni krátce „jdu na to, dám vědět\" "
                 "a pak zavolej ask_zan přesně jednou s textem uživatele.\n"
+                "• DELEGACE JE ASYNCHRONNÍ: ask_zan se vrátí HNED se stavem "
+                "„delegated\" — to NENÍ odpověď. Neodpovídej za mozek, nic si "
+                "nevymýšlej a nic neuzavírej; po tom výsledku už nemluv. Odpověď "
+                "ti dorazí sama jako systémová zpráva začínající „ŽÁN-CODE\" — "
+                "teprve tu řekni uživateli, česky, krátce a beze změny významu. "
+                "Když přijde „DÍLČÍ NÁLEZ\", řekni ho a čekej, že přijde další. "
+                "Když přijde „POŘÁD PRACUJE\", řekni jednou krátce, že na tom "
+                "ještě děláš. Mezitím se dá normálně mluvit dál — nové povely "
+                "obsluhuj, jako by nic neběželo.\n"
                 "• BEZPEČNOST: nevratné a rizikové akce NIKDY sám přes HA nástroje "
                 "— vždy přes ask_zan: zámky, alarm, brány a garážová vrata, "
                 "kotel/topný okruh, mazání, restart. Když by povel spadl sem, "
@@ -1046,13 +1055,17 @@ class Application:
             self.openai_service.zan_event_url = self.zan_event_url
             self.openai_service.zan_event_token = self.zan_event_token
             if self.zan_bridge_enabled:
-                self.openai_service.register_function(
-                    "ask_zan",
-                    create_ask_zan_tool_handler(
-                        self.zan_voice_url, self.zan_voice_token,
-                        self.zan_voice_chat_id, self.websocket_handler.broadcast_json,
-                    ),
+                # DVA MOZKY (25. 8. 2026): most se vrací HNED a odpověď mozku
+                # si pak sám vstřikuje do TÉHLE session. Instanci si drží
+                # služba, aby na ni dosáhl websocket_handler (STOP musí umět
+                # zrušit běžící dotazy) — služba se tvoří znovu při každém
+                # spojení, takže most nikdy nevstřikuje do staré session.
+                zan_bridge = ZanBridge(
+                    self.zan_voice_url, self.zan_voice_token,
+                    self.zan_voice_chat_id, self.websocket_handler.broadcast_json,
                 )
+                self.openai_service.zan_bridge = zan_bridge
+                self.openai_service.register_function("ask_zan", zan_bridge.handler)
             logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
             
             # Register disconnect tool handler (only when the tool is exposed)
@@ -1160,6 +1173,16 @@ class Application:
         
         def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
+            # DVA MOZKY: běžící dotaz na Žán-Code už nemá kam odpovědět —
+            # zrušíme ho hned, ať se zbytečně nedrží vlákno na HTTP. (I bez
+            # toho by se výsledek jen zalogoval a zahodil: most před každým
+            # vstříknutím kontroluje, že session žije.)
+            bridge = getattr(self.openai_service, "zan_bridge", None)
+            if bridge is not None:
+                try:
+                    bridge.cancel_all("odpojení zařízení")
+                except Exception as e:  # pragma: no cover
+                    logger.warning(f"⚠️ zrušení ask_zan při odpojení selhalo: {e!r}")
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
             if self.audio_recording_service:
