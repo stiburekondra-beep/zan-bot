@@ -31,6 +31,7 @@ from app.voice_fastlane import (
     VERIFY_TRIES,
     PhraseLibrary,
     build_event,
+    build_exchange_event,
     classify as fastlane_classify,
     event_url as fastlane_event_url,
     fetch_states,
@@ -361,6 +362,40 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
             asyncio.create_task(_send())
         except Exception as e:  # pragma: no cover
             logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
+
+    def mirror_exchange_to_zan(self, text_user: str, text_asistent: str, kdo: str = "voice") -> None:
+        """Zapíše JEDNU konverzační výměnu do Žán-Code (`POST /event`, `typ:
+        "vymena"`) — asynchronně, fail-safe, hovor na to nikdy nečeká a nikdy
+        kvůli tomu nespadne.
+
+        Karta 2026-08-25-programator-zana-12, tvrdý požadavek: co Realtime
+        vyřídí sám (small talk, žádný nástroj) se jinak do denní paměti
+        vůbec nedostane — noční kompilace pak má slepé skvrny. Volá se z
+        páru `TranscriptLogger` tapů ve `websocket_handler.build_pipeline`
+        po KAŽDÉ dokončené odpovědi, ne jen po akcích rychlé dráhy
+        (ty už zrcadlí `_mirror_to_zan` výše).
+        """
+        text_user = (text_user or "").strip()
+        text_asistent = (text_asistent or "").strip()
+        if not text_user and not text_asistent:
+            return  # prázdná výměna nemá co zapisovat
+        url = getattr(self, "zan_event_url", "")
+        if not url:
+            return
+        payload = build_exchange_event(kdo, text_user, text_asistent)
+        token = getattr(self, "zan_event_token", "")
+
+        async def _send():
+            try:
+                await asyncio.to_thread(_post_event_blocking, url, token, payload)
+                logger.debug("↪️ výměna zrcadlena do Žán-Code (kdo=%s)", kdo)
+            except Exception as e:
+                logger.info("ℹ️ zrcadlení výměny do Žán-Code neprošlo (hlas to neřeší): %r", e)
+
+        try:
+            asyncio.create_task(_send())
+        except Exception as e:  # pragma: no cover
+            logger.debug("zrcadlení výměny se nepodařilo naplánovat: %r", e)
 
     async def _run_fast_lane(self, plan, function_name, handler, params):
         """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
