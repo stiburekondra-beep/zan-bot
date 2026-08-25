@@ -562,19 +562,39 @@ class WebSocketHandler:
         # aggregator can consume it) — opposite directions, so they need taps on
         # opposite sides of the service (see transcript_logger.py): "user" before
         # the LLM, "assistant" after it.
+        #
+        # Karta 2026-08-25-programator-zana-12 (tvrdý požadavek): každá
+        # výměna — i ta, kterou Realtime vyřídí úplně sám (small talk, žádný
+        # nástroj) — musí dotéct do Žán-Code, jinak má noční paměťová
+        # kompilace slepé skvrny. Poslední user text se drží v `_posledni_user`
+        # (uzávěrka, ne fronta — jeden hovor je jedna sekvenční konverzace) a
+        # po KAŽDÉ dokončené assistant odpovědi se pár zrcadlí přes
+        # `openai_service.mirror_exchange_to_zan` (fail-safe, async, hovor na
+        # to nečeká). Akce rychlé dráhy (HA nástroje) se zrcadlí zvlášť přes
+        # `_mirror_to_zan` — tohle pokrývá to, co ten mechanismus nevidí.
+        _posledni_user = {"text": ""}
+
+        def _zapamatuj_user(text: str) -> None:
+            _posledni_user["text"] = text
+
+        def _zrcadli_vymenu(text_asistent: str) -> None:
+            text_user = _posledni_user["text"]
+            _posledni_user["text"] = ""
+            openai_service.mirror_exchange_to_zan(text_user, text_asistent)
+
         if context_aggregator:
             pipeline_components.extend([
                 context_aggregator.user(),
-                TranscriptLogger(capture="user"),
+                TranscriptLogger(capture="user", on_user_text=_zapamatuj_user),
                 openai_service,
-                TranscriptLogger(capture="assistant"),
+                TranscriptLogger(capture="assistant", on_assistant_text=_zrcadli_vymenu),
                 context_aggregator.assistant(),
             ])
         else:
             pipeline_components.extend([
-                TranscriptLogger(capture="user"),
+                TranscriptLogger(capture="user", on_user_text=_zapamatuj_user),
                 openai_service,
-                TranscriptLogger(capture="assistant"),
+                TranscriptLogger(capture="assistant", on_assistant_text=_zrcadli_vymenu),
             ])
 
         pipeline_components.append(output_activity_tracker)
