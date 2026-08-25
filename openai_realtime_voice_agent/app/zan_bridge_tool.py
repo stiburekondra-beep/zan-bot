@@ -306,6 +306,28 @@ ACK_NOTE = (
     "doby za mozek neodpovídej a nic si nevymýšlej."
 )
 
+# LIDSKÉ HLÁŠKY PŘI ČEKÁNÍ (Ondra, 25. 8.: „ať to zní lidsky, ne robot").
+#
+# KTERÁ VRSTVA MLUVÍ (poučení 2026-08-23_dva-zdroje-reci-a-protichudne-instrukce):
+#   1) souběh s voláním nástroje  → řídí ROUTING prompt v main.py
+#      („Moment, zamyslím se…" — varianty tam, ne tady)
+#   2) po výsledku tool callu     → run_llm=False, model MLČÍ (žádný dvojhlas)
+#   3) tenhle soubor              → text VSTŘÍKNUTÝ do běžící session; model
+#      ho vysloví, takže jsou varianty tady
+#   4) rychlá dráha               → knihovna přednahraných frází, nesaháme
+#
+# Střídání je tady v kódu (deterministicky podle kola), ne na modelu —
+# jedna a tatáž věta třikrát za sebou zní jako porucha.
+#
+# ŽÁDNÉ ČÍSLICE v textu, který model vysloví (poučení
+# 2026-08-05_ceske-tts-necist-cislice) — uplynulý čas jde do logu, ne do řeči.
+PROGRESS_HINTS = (
+    "Ještě na tom dělám, vydrž.",
+    "Pořád nad tím přemýšlím.",
+    "Chvilku to ještě potrvá, rozmýšlím to.",
+    "Vteřinku, ještě to skládám dohromady.",
+)
+
 
 class ZanBridge:
     """Asynchronní most na Žán-Code s podsouváním do běžící session."""
@@ -476,8 +498,11 @@ class ZanBridge:
                 logger.error("⏱️ ask_zan #%d: mozek se neozval do %.0f s", ask_id, self.timeout)
                 await self.deliver_text(
                     service,
-                    f"ŽÁN-CODE SE NEOZVAL do {int(self.timeout)} vteřin. Řekni uživateli "
-                    f"krátce, že se k tomu teď nedostaneš. Nic si nevymýšlej.",
+                    # bez číslic — model tenhle text vysloví (české TTS/číslovky)
+                    "ŽÁN-CODE SE NEOZVAL v čase. Řekni uživateli krátce a lidsky, "
+                    "že se ti to teď nepovedlo domyslet a ať to zkusí znovu — "
+                    "třeba „Promiň, tohle jsem teď nedal dohromady, zkus to prosím "
+                    "znovu.\" Žádná čísla. Nic si nevymýšlej.",
                     label=f"ask #{ask_id} timeout",
                 )
                 return
@@ -486,8 +511,9 @@ class ZanBridge:
                 logger.error("❌ ask_zan #%d: most na mozek selhal: %r", ask_id, exc)
                 await self.deliver_text(
                     service,
-                    "ŽÁN-CODE JE TEĎ NEDOSTUPNÝ. Řekni uživateli krátce, že se "
-                    "nedostaneš ke svému mozku a ať to zkusí znovu. Nic si nevymýšlej.",
+                    "ŽÁN-CODE JE TEĎ NEDOSTUPNÝ. Řekni uživateli krátce a lidsky, "
+                    "že se teď nedostaneš ke svému mozku a ať to zkusí za chvilku "
+                    "znovu. Nic si nevymýšlej.",
                     label=f"ask #{ask_id} chyba",
                 )
                 return
@@ -554,9 +580,12 @@ class ZanBridge:
                 "česky, krátce a beze změny významu — nic nepřidávej a nic si nedomýšlej"
             )
         else:
+            # BEZ pořadového čísla v textu, který model vysloví — index je
+            # v labelu/logu. („dílčí nález číslo dvě" = robot + číslovky.)
             head = (
-                f"ŽÁN-CODE POSÍLÁ DÍLČÍ NÁLEZ č. {index} — další ještě může přijít. "
-                "Řekni ho uživateli krátce a hovor neuzavírej"
+                "ŽÁN-CODE POSÍLÁ DÍLČÍ NÁLEZ — další ještě může přijít. Řekni ho "
+                "uživateli krátce, lidsky (klidně uveď „zatím to vypadá tak, že…\" "
+                "nebo „prozatím jsem zjistil…\") a hovor NEUZAVÍREJ. Žádná čísla"
             )
         await self.deliver_text(
             service, f"{head}:\n„{text}\"",
@@ -576,11 +605,17 @@ class ZanBridge:
             if not session_alive(service):
                 return
             elapsed = int(time.monotonic() - started)
+            hint = PROGRESS_HINTS[(round_no - 1) % len(PROGRESS_HINTS)]
+            logger.info(
+                "⏳ ask_zan #%d: %d. průběžná hláška po %d s → „%s\"",
+                ask_id, round_no, elapsed, hint,
+            )
             await self.deliver_text(
                 service,
-                f"ŽÁN-CODE NA TOM POŘÁD PRACUJE (už {elapsed} vteřin). Řekni uživateli "
-                f"JEDNOU a krátce, že na tom ještě děláš. Odpověď zatím NEMÁŠ — "
-                f"nic si nevymýšlej a nic neuzavírej.",
+                "ŽÁN-CODE NA TOM POŘÁD PRACUJE. Řekni uživateli JEDNOU, krátce "
+                f"a lidsky, že to ještě rozmýšlíš — přesně takhle: „{hint}\" "
+                "Neříkej žádná čísla ani jak dlouho to trvá. Odpověď zatím NEMÁŠ — "
+                "nic si nevymýšlej a nic neuzavírej.",
                 label=f"ask #{ask_id} průběh {round_no}",
             )
             wait = self.progress_every
