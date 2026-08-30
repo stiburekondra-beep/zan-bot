@@ -6,37 +6,22 @@ import logging
 import time
 from typing import Optional
 import dotenv
-from pipecat.frames.frames import (
-    FunctionCallResultProperties,
-    TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
-)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
+from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
 from app import config_source
+from app.fastlane_mixin import FastLaneMixin
+from app.gemini_tools import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_VOICE
 from app.mcp_service import HomeAssistantMCPService
-from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, create_ask_zan_tool_handler
-from app.voice_safety import is_sensitive_actuation
 from app.voice_fastlane import (
-    CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
-    SAMPLE_RATE as FASTLANE_SAMPLE_RATE,
-    VERIFY_DELAY_S,
-    VERIFY_TRIES,
     PhraseLibrary,
-    build_event,
-    classify as fastlane_classify,
     event_url as fastlane_event_url,
-    fetch_states,
-    judge as fastlane_judge,
-    room_variant,
-    _post_event_blocking,
 )
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
@@ -90,8 +75,27 @@ logger.info(
 )
 
 
-class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
+#: Kterou „pusou" Žán mluví: ``openai`` (výchozí, beze změny chování) nebo
+#: ``gemini`` (Gemini Live, viz ``app/gemini_safety.py``). Čte se přímo z env,
+#: NE přes ``config_source`` — add-on o téhle volbě nic neví a nemá se měnit;
+#: přepínač patří do světa kontejneru (docker ``env_file`` / ``.env``).
+def _resolve_pusa() -> str:
+    """``ZAN_PUSA`` → ``openai`` | ``gemini``; nesmysl spadne na ``openai``."""
+    pusa = os.environ.get("ZAN_PUSA", "openai").strip().lower()
+    if pusa not in ("openai", "gemini"):
+        logger.warning("⚠️ Neznámá ZAN_PUSA %r — jedu na 'openai'", pusa)
+        return "openai"
+    return pusa
+
+
+class SafeRealtimeLLMService(FastLaneMixin, OpenAIRealtimeLLMService):
     """OpenAIRealtimeLLMService with audio-truncation-on-interruption disabled.
+
+    Rychlá dráha (bezpečnostní brzda, přednahraná pusa, ověření stavu v HA)
+    žije od 30. 8. 2026 v ``app/fastlane_mixin.FastLaneMixin``, ať se
+    neudržuje zvlášť tady a zvlášť v Gemini pusa
+    (``app/gemini_safety.SafeGeminiLiveLLMService``). Zbytek téhle třídy jsou
+    záplaty specifické pro OpenAI Realtime protokol.
 
     pipecat's `_truncate_current_audio_response()` (called by `_handle_interruption`
     on EVERY interruption — both our device "stop" AND pipecat's own server-VAD
@@ -217,257 +221,6 @@ class SafeRealtimeLLMService(OpenAIRealtimeLLMService):
             return True
         return False
 
-    def register_function(self, function_name, handler, start_callback=None, *,
-                          cancel_on_interruption: bool = True):  # type: ignore[override]
-        """Force cancel_on_interruption=False for every tool registration.
-
-        pipecat cancels in-flight function-call tasks on EVERY user-speech
-        interruption — and semantic_vad fires one per utterance fragment, so
-        merely continuing your own sentence kills the tool call your previous
-        fragment started. By then the HTTP request to Home Assistant has
-        usually already been SENT: the action executes, but its result never
-        reaches the model, which then tells the user it failed (observed
-        live: the lights turned ON while the assistant claimed they
-        wouldn't). Our tools are all short-lived (HA service calls, one web
-        search), so letting them finish and report the truth always beats
-        killing them halfway. This single override covers every registration
-        path (MCP tools via pipecat's MCPClient, web_search, disconnect).
-
-        The handler is also wrapped to tick TURN_LIVENESS around its run, so
-        the PhaseEmitter's thinking-watchdog knows a tool is in flight and a
-        slow tool (web search: 10-20 s of pipeline silence) is never mistaken
-        for a dead turn. All our handlers use the single-param
-        FunctionCallParams signature, so the wrapper does too (pipecat
-        inspects the signature to pick the calling convention).
-        """
-        async def liveness_tracked(params):
-            # HARD BEZPEČNOSTNÍ BRZDA (2026-08-22): nevratné/rizikové cíle
-            # (zámky, alarm, brány/garážová vrata, kotel) se na rychlé dráze
-            # NEPROVÁDĚJÍ — vždy přes ask_zan (elevace + potvrzení v Žán-Code).
-            # Vynuceno kódem, ne jen promptem; čtení (GetLiveContext) a vlastní
-            # mosty (ask_zan/web_search) jsou vyňaté ve voice_safety.
-            try:
-                if is_sensitive_actuation(function_name, getattr(params, "arguments", None)):
-                    logger.warning(
-                        "🛑 fast-lane blokoval citlivý úkon %s(%r) → přesměruj na ask_zan",
-                        function_name, getattr(params, "arguments", None),
-                    )
-                    await params.result_callback(
-                        "Tohle je bezpečnostní úkon — zámek, alarm, vrata nebo kotel. "
-                        "Neprovedu ho napřímo. Zavolej ask_zan s přesným zněním, ať to potvrdíme."
-                    )
-                    return
-            except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
-                logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
-
-            # RYCHLÁ DRÁHA (2026-08-22): u jednoduchých povelů, kde víme, co má
-            # být po akci vidět ve stavu, jede tok „průběhová fráze HNED +
-            # akce souběžně → ověření → tón". Cokoli jiného (a všechno, co
-            # projde bezpečnostní brzdou výš) jde beze změny starou cestou.
-            plan = None
-            if getattr(self, "fastlane_enabled", False):
-                try:
-                    plan = fastlane_classify(function_name, getattr(params, "arguments", None))
-                except Exception as e:  # pragma: no cover
-                    logger.warning(f"⚠️ fast-lane klasifikace selhala: {e!r}")
-
-            TURN_LIVENESS.tool_started()
-            try:
-                if plan is not None:
-                    return await self._run_fast_lane(plan, function_name, handler, params)
-                return await handler(params)
-            finally:
-                TURN_LIVENESS.tool_finished()
-
-        super().register_function(
-            function_name, liveness_tracked, start_callback, cancel_on_interruption=False
-        )
-
-    # -----------------------------------------------------------------------
-    # Rychlá dráha: přednahraná pusa místo modelu
-    # -----------------------------------------------------------------------
-
-    async def play_phrase(self, zamer: str) -> bool:
-        """Pustí přednahranou frázi/tón rovnou do pipeline — bez modelu.
-
-        Audio jde jako `TTSAudioRawFrame` po 20 ms kusech, tedy přesně tak,
-        jak do pipeline padá řeč z OpenAI. Pro zařízení je to k nerozeznání
-        od normální odpovědi, jen nestála nic a nečekalo se na model.
-        """
-        lib = getattr(self, "phrase_library", None)
-        if lib is None:
-            return False
-        pcm = lib.get(zamer)
-        if not pcm:
-            logger.info("🔇 fráze %r není v knihovně — nechávám mluvit model", zamer)
-            return False
-        try:
-            await self.push_frame(TTSStartedFrame())
-            for i in range(0, len(pcm), FASTLANE_CHUNK_BYTES):
-                await self.push_frame(
-                    TTSAudioRawFrame(
-                        audio=pcm[i:i + FASTLANE_CHUNK_BYTES],
-                        sample_rate=FASTLANE_SAMPLE_RATE,
-                        num_channels=1,
-                    )
-                )
-            await self.push_frame(TTSStoppedFrame())
-            logger.info("🔊 přehráno z knihovny: %s (%d B)", zamer, len(pcm))
-            return True
-        except Exception as e:  # pragma: no cover - přehrání nesmí shodit tool
-            logger.warning("⚠️ přehrání fráze %s selhalo: %r", zamer, e)
-            return False
-
-    async def _verify_after_action(self, pre, plan) -> str:
-        """Přečte stav PO akci a vrátí verdikt: ok / fail / unconfirmed / ha_down.
-
-        Čte se opakovaně (HA stav se propíše se zpožděním), ale krátce —
-        maximálně ~1,4 s. `unavailable`/`unknown` se nikdy nepovažuje za úspěch.
-        """
-        verdict = "unconfirmed"
-        for attempt in range(VERIFY_TRIES):
-            try:
-                post = await asyncio.to_thread(fetch_states, plan.domains)
-            except Exception as e:
-                logger.warning("⚠️ fast-lane: HA stav nejde přečíst: %r", e)
-                return "ha_down"
-            verdict = fastlane_judge(pre, post, plan)
-            if verdict == "ok":
-                return "ok"
-            if attempt < VERIFY_TRIES - 1:
-                await asyncio.sleep(VERIFY_DELAY_S)
-        return verdict
-
-    def _mirror_to_zan(self, plan, function_name, args, verdict, note="") -> None:
-        """Pošle událost do Žán-Code (`POST /event`) — asynchronně, hlas nečeká.
-
-        Mozek má vědět, co se v domě dělo, i když to sám neprováděl: rychlá
-        dráha jinak zůstane pro Žán-Code neviditelná.
-        """
-        url = getattr(self, "zan_event_url", "")
-        if not url:
-            return
-        payload = build_event(plan, function_name, args, verdict, note)
-        token = getattr(self, "zan_event_token", "")
-
-        async def _send():
-            try:
-                await asyncio.to_thread(_post_event_blocking, url, token, payload)
-                logger.debug("↪️ zrcadleno do Žán-Code: %s/%s", payload["action"], verdict)
-            except Exception as e:
-                logger.info("ℹ️ zrcadlení do Žán-Code neprošlo (hlas to neřeší): %r", e)
-
-        try:
-            asyncio.create_task(_send())
-        except Exception as e:  # pragma: no cover
-            logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
-
-    async def _run_fast_lane(self, plan, function_name, handler, params):
-        """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
-        lib = getattr(self, "phrase_library", None)
-        args = dict(getattr(params, "arguments", None) or {})
-        real_cb = params.result_callback
-        captured = []
-
-        async def capture(result, *, properties=None):
-            captured.append(result)
-
-        # Stav PŘED akcí — jen jako referenční snímek na porovnání.
-        try:
-            pre = await asyncio.to_thread(fetch_states, plan.domains)
-        except Exception as e:
-            logger.warning("⚠️ fast-lane: stav PŘED se nepodařilo přečíst: %r", e)
-            pre = {}
-
-        # SOUČASNĚ: pusť průběhovou frázi a odpal HA akci. Žádné čekání jednoho
-        # na druhé — uživatel má slyšet „Rozsvěcuju." v tomtéž okamžiku, kdy
-        # povel odchází do Home Assistanta.
-        params.result_callback = capture
-        zamer = room_variant(lib, plan) if lib else plan.progress
-        started = time.time()
-        speak_task = asyncio.create_task(self.play_phrase(zamer))
-        action_task = asyncio.create_task(handler(params))
-        spoke, action_res = await asyncio.gather(
-            speak_task, action_task, return_exceptions=True
-        )
-        spoke = spoke is True
-        if isinstance(action_res, Exception):
-            logger.warning("⚠️ fast-lane: HA akce selhala: %r", action_res)
-        logger.info(
-            "⚡ fast-lane %s: fráze %s (%s), akce hotová za %.0f ms",
-            function_name, zamer, "přehrána" if spoke else "chybí v knihovně",
-            (time.time() - started) * 1000,
-        )
-
-        verdict = await self._verify_after_action(pre, plan)
-
-        # Neúspěch → JEDEN pokus znovu (ústava, Princip 2 bod 4).
-        if verdict == "fail":
-            logger.info("🔁 fast-lane: %s neprošlo, zkouším jednou znovu", function_name)
-            await self.play_phrase("vysledek_fail")
-            try:
-                await handler(params)
-            except Exception as e:
-                logger.warning("⚠️ fast-lane: druhý pokus selhal: %r", e)
-            verdict = await self._verify_after_action(pre, plan)
-
-        self._mirror_to_zan(plan, function_name, args, verdict)
-
-        # Knihovna nemá čím mluvit → ať mluví model, ale jen ověřenou pravdu.
-        if not spoke:
-            params.result_callback = real_cb
-            await real_cb(self._verdict_text(verdict, plan, captured))
-            return
-
-        if verdict == "ok":
-            await self.play_phrase("vysledek_ok")   # krátký tón „tadá"
-            await real_cb(
-                {"status": "verified_success", "spoken_locally": "tón + průběhová fráze"},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            return
-
-        if verdict == "unconfirmed":
-            # Poctivě: povel odešel, ale nemáme důkaz. Nikdy ne tón úspěchu.
-            await self.play_phrase("nepotvrdilo_stav")
-            await real_cb(
-                {"status": "unconfirmed", "spoken_locally": "povel odešel, stav nepotvrzen"},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            return
-
-        if verdict == "ha_down":
-            await self.play_phrase("ha_neodpovida")
-            await real_cb(
-                {"status": "ha_unreachable", "spoken_locally": "Home Assistant neodpovídá"},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            return
-
-        # Selhalo i podruhé → poctivá věta + diagnostiku převezme Žán-Code.
-        await self.play_phrase("nepovedlo_se")
-        cil = plan.target or plan.area or "to"
-        await real_cb(
-            "Akce se nepovedla ani na druhý pokus a ověřený stav to potvrzuje. "
-            f"Uživatel UŽ SLYŠEL „Nepovedlo se mi to, zjišťuju proč.\" — nic o "
-            "výsledku už neopakuj a hlavně netvrď, že se to povedlo. Rovnou "
-            f"zavolej ask_zan s textem „proč nejde {cil}\" a nech Žán-Code najít příčinu."
-        )
-
-    @staticmethod
-    def _verdict_text(verdict: str, plan, captured) -> str:
-        """Text pro model, když knihovna frází chybí — pořád jen ověřená pravda."""
-        cil = plan.target or plan.area or "to"
-        if verdict == "ok":
-            return f"Ověřeno: {plan.label} — {cil} je v požadovaném stavu. Řekni jednu krátkou větu."
-        if verdict == "unconfirmed":
-            return ("Povel odešel, ale zařízení stav nepotvrdilo. Řekni přesně tohle, "
-                    "netvrď úspěch.")
-        if verdict == "ha_down":
-            return "Home Assistant neodpovídá. Řekni to na rovinu, nic neslibuj."
-        return (f"Nepovedlo se to ani napodruhé ({cil}). Řekni „Nepovedlo se mi to, "
-                f"zjišťuju proč.\" a zavolej ask_zan s textem „proč nejde {cil}\".")
-
     async def _receive_task_handler(self):  # type: ignore[override]
         """Surface OpenAI reader death as an ErrorFrame so recovery can act.
 
@@ -502,7 +255,10 @@ class Application:
         self.runner: Optional[PipelineRunner] = None
         self.websocket_handler: Optional[WebSocketHandler] = None
         self.websocket_transport: Optional[WebsocketServerTransport] = None
-        self.openai_service: Optional[OpenAIRealtimeLLMService] = None
+        # Pusa (OpenAI Realtime NEBO Gemini Live). Jméno atributu zůstává
+        # `openai_service`, aby se nemuselo přepisovat půl mostu; typ je od
+        # 30. 8. 2026 obecná pipecat LLM služba.
+        self.openai_service: Optional[LLMService] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
@@ -511,8 +267,15 @@ class Application:
         
     async def initialize(self) -> None:
         """Initialize all components."""
+        # PŘEPÍNAČ PUSY (2026-08-30). `openai` = dosavadní chování bit po bitu;
+        # `gemini` = Gemini Live přes app/gemini_safety.py. Rozhoduje se tady
+        # jednou a zbytek initialize() se podle toho jen větví.
+        self.pusa = _resolve_pusa()
+        logger.info("👄 Pusa: %s (ZAN_PUSA)", self.pusa)
+
         # Get configuration from environment
         openai_api_key = os.environ.get("OPENAI_API_KEY")
+        gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         websocket_port = int(os.environ.get("WEBSOCKET_PORT", "8080"))
         websocket_host = os.environ.get("WEBSOCKET_HOST", "0.0.0.0")
         
@@ -580,6 +343,13 @@ class Application:
         # returns the custom value when the dropdown is "custom", else the dropdown.
         openai_model = _resolve_choice("OPENAI_MODEL", "OPENAI_MODEL_CUSTOM", "gpt-realtime-2")
         openai_voice = _resolve_choice("OPENAI_VOICE", "OPENAI_VOICE_CUSTOM", "marin")
+
+        # GEMINI PUSA — model a hlas jen z env (add-on o téhle větvi neví, viz
+        # _resolve_pusa). Výchozí model je ten, na kterém proběhla sonda
+        # 30. 8. 2026 (function calling ověřeno: 11 úspěšných toolCallů ze 14
+        # běhů, nejrychleji 525 ms z audia). Hlas Fenrir je Ondrova volba.
+        gemini_model = os.environ.get("ZAN_GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+        gemini_voice = os.environ.get("ZAN_GEMINI_VOICE", "").strip() or DEFAULT_GEMINI_VOICE
 
         # Playback speed (post-generation rate): 0.25-1.5, 1.0 = normal. Clamped.
         try:
@@ -685,9 +455,22 @@ class Application:
             f"max restored messages: {max_context_messages or 'unlimited'}"
         )
         
-        if not openai_api_key:
+        # Klíče podle pusy. `openai` větev je beze změny (bez klíče nemá smysl
+        # startovat). V `gemini` větvi je povinný GEMINI_API_KEY; OPENAI_API_KEY
+        # zůstává volitelný, protože ho pořád používá nástroj web_search —
+        # když chybí, web_search se tiše vypne místo pádu celého mostu.
+        if self.pusa == "gemini":
+            if not gemini_api_key:
+                raise ValueError("GEMINI_API_KEY environment variable is required when ZAN_PUSA=gemini")
+            if enable_web_search and not openai_api_key:
+                logger.warning(
+                    "⚠️ ZAN_PUSA=gemini bez OPENAI_API_KEY — nástroj web_search vypínám "
+                    "(běží přes OpenAI Responses API)"
+                )
+                enable_web_search = False
+        elif not openai_api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
-        
+
         # Initialize Home Assistant MCP Service
         mcp_client = None
         try:
@@ -719,6 +502,7 @@ class Application:
             follow_up_open_delay_ms=follow_up_open_delay_ms,
             wake_open_delay_ms=wake_open_delay_ms,
             playback_prebuffer_ms=playback_prebuffer_ms,
+            provider=self.pusa,
         )
         logger.info(
             f"🔁 Follow-up window: {follow_up_listen_seconds}s "
@@ -731,6 +515,9 @@ class Application:
         
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
+        self.gemini_api_key = gemini_api_key
+        self.gemini_model = gemini_model
+        self.gemini_voice = gemini_voice
         self.vad_threshold = vad_threshold
         self.vad_prefix_padding_ms = vad_prefix_padding_ms
         self.vad_silence_duration_ms = vad_silence_duration_ms
@@ -873,18 +660,6 @@ class Application:
                 except Exception as e:
                     logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
             
-            # Create session properties with audio configuration
-            from pipecat.services.openai.realtime.events import (
-                SessionProperties,
-                AudioConfiguration,
-                AudioInput,
-                AudioOutput,
-                TurnDetection,
-                SemanticTurnDetection,
-                InputAudioTranscription,
-                InputAudioNoiseReduction,
-            )
-            
             # Collect all tool definitions for session properties. The
             # disconnect_client tool is opt-in (see enable_disconnect_tool): by
             # default we do NOT expose it, so the model can't hang up the device
@@ -935,100 +710,144 @@ class Application:
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
             
-            # Turn detection: semantic_vad (recommended — semantic end-of-turn,
-            # echo-resistant, doesn't cut the user off) or classic server_vad.
-            if self.turn_detection_type == "semantic_vad":
-                turn_detection = SemanticTurnDetection(
-                    eagerness=self.vad_eagerness,
-                    # create_response=True (default): the SERVER creates a
-                    # response on every detected end-of-turn. This is required for
-                    # multi-turn conversation. Pipecat 0.0.97's
-                    # OpenAIRealtimeLLMService._handle_context only auto-creates a
-                    # response for the FIRST context (turn 1) and after tool
-                    # results (its else-branch just updates the context); a plain
-                    # 2nd/3rd user turn therefore gets NO response unless the
-                    # server makes it. We previously set this False to stop a
-                    # turn-1 double-response (server + Pipecat first-context both
-                    # creating → `conversation_already_has_active_response`), but
-                    # that silently broke every turn after the first (device hung
-                    # in "thinking"). True is the correct trade: the server drives
-                    # all user-turn responses; Pipecat still creates the post-tool
-                    # response via _process_completed_function_calls. To stop the
-                    # turn-1 double (server + Pipecat-first-context both creating →
-                    # conversation_already_has_active_response), run() seeds
-                    # self._context once at startup with a kickoff LLMRunFrame, so
-                    # the user's first real turn hits the else-branch too.
-                    create_response=self.semantic_vad_create_response,
-                    interrupt_response=self.interrupt_response,
-                )
-            else:
-                turn_detection = TurnDetection(
-                    type="server_vad",
-                    threshold=self.vad_threshold,
-                    prefix_padding_ms=self.vad_prefix_padding_ms,
-                    silence_duration_ms=self.vad_silence_duration_ms,
-                )
+            # ------------------------------------------------------------------
+            # PUSA: GEMINI LIVE  (ZAN_PUSA=gemini)
+            # ------------------------------------------------------------------
+            # Import je AŽ tady schválně: tahá pipecat-ai[google] + google-genai,
+            # a v openai provozu se nesmí ani dotknout (kdyby extras chyběly,
+            # openai větev musí jet dál).
+            if self.pusa == "gemini":
+                from app.gemini_safety import build_gemini_service
 
-            # Optionally pin the input-transcription language to stop the model
-            # drifting between languages (e.g. "nl"). Empty -> auto-detect.
-            # transcription_model picks the STT used for the transcript text.
-            transcription = (
-                InputAudioTranscription(
-                    model=self.transcription_model,
-                    language=self.transcription_language,
+                logger.info(
+                    "🔧 Gemini session s %d nástroji: %s",
+                    len(all_tools), [t.get("name", "unknown") for t in all_tools],
                 )
-                if self.transcription_language
-                else None
-            )
-
-            # Optional near/far-field input noise reduction (helps the VAD reject
-            # background noise / residual speaker leak). None = off (default).
-            noise_reduction = (
-                InputAudioNoiseReduction(type=self.noise_reduction)
-                if self.noise_reduction
-                else None
-            )
-
-            session_properties = SessionProperties(
-                instructions=self.instructions,
-                # Cap the reply length: bounds runaway monologues + per-response
-                # output-token cost. None = unlimited (the API default "inf").
-                max_output_tokens=self.max_output_tokens,
-                audio=AudioConfiguration(
-                    input=AudioInput(
-                        turn_detection=turn_detection,
-                        transcription=transcription,
-                        noise_reduction=noise_reduction,
+                self.openai_service = build_gemini_service(
+                    api_key=self.gemini_api_key,
+                    model=self.gemini_model,
+                    voice=self.gemini_voice,
+                    instructions=self.instructions,
+                    openai_tools=all_tools,
+                    # Gemini nemá sémantický VAD — VAD_EAGERNESS se překládá na
+                    # citlivost konce řeči + délku ticha (app/gemini_tools.py).
+                    vad_eagerness=self.vad_eagerness,
+                    vad_silence_duration_ms=(
+                        self.vad_silence_duration_ms
+                        if self.turn_detection_type == "server_vad" else None
                     ),
-                    # speed is a post-generation playback rate (0.25-1.5, 1.0 = normal).
-                    output=AudioOutput(voice=self.voice, speed=self.openai_speed)
-                ),
-                tools=all_tools
-            )
-
-            if self.turn_detection_type == "semantic_vad":
-                logger.info(
-                    f"🎚️ Turn detection: semantic_vad (eagerness={self.vad_eagerness}, "
-                    f"create_response={self.semantic_vad_create_response}, "
-                    f"interrupt_response={self.interrupt_response})"
-                    + (f", transcription={self.transcription_model} (lang={self.transcription_language})" if self.transcription_language else " (transcription off)")
+                    vad_prefix_padding_ms=self.vad_prefix_padding_ms,
+                    max_output_tokens=self.max_output_tokens,
                 )
             else:
-                logger.info(
-                    f"🎚️ Turn detection: server_vad (threshold={self.vad_threshold}, "
-                    f"silence_duration_ms={self.vad_silence_duration_ms})"
-                    + (f", transcription={self.transcription_model} (lang={self.transcription_language})" if self.transcription_language else " (transcription off)")
+                # ------------------------------------------------------------------
+                # PUSA: OPENAI REALTIME  (výchozí, beze změny chování)
+                # ------------------------------------------------------------------
+                from pipecat.services.openai.realtime.events import (
+                    SessionProperties,
+                    AudioConfiguration,
+                    AudioInput,
+                    AudioOutput,
+                    TurnDetection,
+                    SemanticTurnDetection,
+                    InputAudioTranscription,
+                    InputAudioNoiseReduction,
                 )
 
-            logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
+                # Turn detection: semantic_vad (recommended — semantic end-of-turn,
+                # echo-resistant, doesn't cut the user off) or classic server_vad.
+                if self.turn_detection_type == "semantic_vad":
+                    turn_detection = SemanticTurnDetection(
+                        eagerness=self.vad_eagerness,
+                        # create_response=True (default): the SERVER creates a
+                        # response on every detected end-of-turn. This is required for
+                        # multi-turn conversation. Pipecat 0.0.97's
+                        # OpenAIRealtimeLLMService._handle_context only auto-creates a
+                        # response for the FIRST context (turn 1) and after tool
+                        # results (its else-branch just updates the context); a plain
+                        # 2nd/3rd user turn therefore gets NO response unless the
+                        # server makes it. We previously set this False to stop a
+                        # turn-1 double-response (server + Pipecat first-context both
+                        # creating → `conversation_already_has_active_response`), but
+                        # that silently broke every turn after the first (device hung
+                        # in "thinking"). True is the correct trade: the server drives
+                        # all user-turn responses; Pipecat still creates the post-tool
+                        # response via _process_completed_function_calls. To stop the
+                        # turn-1 double (server + Pipecat-first-context both creating →
+                        # conversation_already_has_active_response), run() seeds
+                        # self._context once at startup with a kickoff LLMRunFrame, so
+                        # the user's first real turn hits the else-branch too.
+                        create_response=self.semantic_vad_create_response,
+                        interrupt_response=self.interrupt_response,
+                    )
+                else:
+                    turn_detection = TurnDetection(
+                        type="server_vad",
+                        threshold=self.vad_threshold,
+                        prefix_padding_ms=self.vad_prefix_padding_ms,
+                        silence_duration_ms=self.vad_silence_duration_ms,
+                    )
+
+                # Optionally pin the input-transcription language to stop the model
+                # drifting between languages (e.g. "nl"). Empty -> auto-detect.
+                # transcription_model picks the STT used for the transcript text.
+                transcription = (
+                    InputAudioTranscription(
+                        model=self.transcription_model,
+                        language=self.transcription_language,
+                    )
+                    if self.transcription_language
+                    else None
+                )
+
+                # Optional near/far-field input noise reduction (helps the VAD reject
+                # background noise / residual speaker leak). None = off (default).
+                noise_reduction = (
+                    InputAudioNoiseReduction(type=self.noise_reduction)
+                    if self.noise_reduction
+                    else None
+                )
+
+                session_properties = SessionProperties(
+                    instructions=self.instructions,
+                    # Cap the reply length: bounds runaway monologues + per-response
+                    # output-token cost. None = unlimited (the API default "inf").
+                    max_output_tokens=self.max_output_tokens,
+                    audio=AudioConfiguration(
+                        input=AudioInput(
+                            turn_detection=turn_detection,
+                            transcription=transcription,
+                            noise_reduction=noise_reduction,
+                        ),
+                        # speed is a post-generation playback rate (0.25-1.5, 1.0 = normal).
+                        output=AudioOutput(voice=self.voice, speed=self.openai_speed)
+                    ),
+                    tools=all_tools
+                )
+
+                if self.turn_detection_type == "semantic_vad":
+                    logger.info(
+                        f"🎚️ Turn detection: semantic_vad (eagerness={self.vad_eagerness}, "
+                        f"create_response={self.semantic_vad_create_response}, "
+                        f"interrupt_response={self.interrupt_response})"
+                        + (f", transcription={self.transcription_model} (lang={self.transcription_language})" if self.transcription_language else " (transcription off)")
+                    )
+                else:
+                    logger.info(
+                        f"🎚️ Turn detection: server_vad (threshold={self.vad_threshold}, "
+                        f"silence_duration_ms={self.vad_silence_duration_ms})"
+                        + (f", transcription={self.transcription_model} (lang={self.transcription_language})" if self.transcription_language else " (transcription off)")
+                    )
+
+                logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
             
-            # Create new service instance
-            self.openai_service = SafeRealtimeLLMService(
-                api_key=self.openai_api_key,
-                model=self.model,
-                session_properties=session_properties,
-                start_audio_paused=False
-            )
+                # Create new service instance
+                self.openai_service = SafeRealtimeLLMService(
+                    api_key=self.openai_api_key,
+                    model=self.model,
+                    session_properties=session_properties,
+                    start_audio_paused=False
+                )
             self.openai_service.zan_broadcast_json = self.websocket_handler.broadcast_json
             # Rychlá dráha potřebuje knihovnu frází a adresu pro zrcadlení —
             # služba se vytváří znovu při každém spojení, tak jí to předáme.
@@ -1044,7 +863,9 @@ class Application:
                         self.zan_voice_chat_id, self.websocket_handler.broadcast_json,
                     ),
                 )
-            logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
+            logger.info(
+                f"✅ Pusa '{self.pusa}' vytvořena: {type(self.openai_service).__name__}"
+            )
             
             # Register disconnect tool handler (only when the tool is exposed)
             if self.enable_disconnect_tool and not self.zan_bridge_enabled:
@@ -1108,7 +929,15 @@ class Application:
         # create_response=True), and there's no double — AND no startup speech.
         # The empty sentinel is harmlessly overwritten by the real context on the
         # first turn (both branches do `self._context = context`).
-        if self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response:
+        #
+        # GEMINI PUSA tuhle záplatu NEPOTŘEBUJE: tam se týž problém (samovolná
+        # řeč hned po startu) řeší přepínačem
+        # `inference_on_context_initialization=False` v build_gemini_service(),
+        # a `_context` je u pipecatí Gemini služby jiný objekt — předsazovat mu
+        # prázdný LLMContext by jen zamotalo první tah.
+        if (self.pusa == "openai"
+                and self.turn_detection_type == "semantic_vad"
+                and self.semantic_vad_create_response):
             try:
                 from pipecat.processors.aggregators.llm_context import LLMContext
                 if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
@@ -1147,9 +976,9 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
         
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> Optional[OpenAIRealtimeLLMService]:
-            """Get OpenAI service for a specific client."""
+        # Function to get the active pusa (OpenAI Realtime / Gemini Live) for a client
+        def get_openai_service_for_client(client_id: str) -> Optional[LLMService]:
+            """Get the LLM service (pusa) for a specific client."""
             if self.session_manager:
                 return self.session_manager.get_current_service(client_id)
             return self.openai_service
