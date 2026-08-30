@@ -6,8 +6,9 @@ a `MLUVENI-ZANA.md` §2 (karta `2026-08-27-programator-zana-04`).
 
 Čistý Python bez závislosti na pipecat/síti — jen datová struktura
 (`Tema`) a rozhodovací logika (`FrontaTemat`). Samotnou dispečerskou
-smyčku (čtení `phase_emitter`, volání `deliver_text` každých ~200 ms)
-tenhle modul NEobsahuje — to je práce volajícího v `zan_bridge_tool.py`.
+smyčku (čtení fáze z `phase_emitter`, vstřikování do session každých
+~200 ms) tenhle modul NEobsahuje — ta žije v `app/dispecer_reci.py`
+a napojení na pipecat v `app/zan_bridge_tool.py`.
 
 Proč fronta existuje: **mluví právě jeden**. Dokud pusa mluví (fáze
 `replying`), nic se nevstřikuje — žádné „po 15 s to risknu". Nová
@@ -42,7 +43,16 @@ WATCHDOG_S = 30.0
 
 @dataclass
 class Tema:
-    """Jedna položka fronty — CO se má říct, ne hotová věta."""
+    """Jedna položka fronty — CO se má říct, ne hotová věta.
+
+    `druh` a `run_llm` jsou doplněk nad rámec specifikace §1: dispečer
+    (`app/dispecer_reci.py`) podle nich vybírá hlavičku podsunuté zprávy
+    a rozhoduje, jestli má pusa text vůbec vyslovit. Bez nich by rozlišení
+    „finální odpověď / dílčí nález / potvrzení už zaznělo z knihovny frází"
+    muselo žít v paralelní evidenci vedle fronty — a to je přesně ta
+    rozprostřenost, které se specifikace brání. Obojí má default, takže
+    `Tema(obsah, priorita, platnost_s, interaction_id)` zůstává platné.
+    """
 
     obsah: str
     priorita: int
@@ -50,6 +60,8 @@ class Tema:
     interaction_id: str
     vzniklo: float = field(default_factory=time.monotonic)
     znacka: str = ""
+    druh: str = ""
+    run_llm: bool = True
 
 
 class FrontaTemat:
@@ -94,6 +106,10 @@ class FrontaTemat:
 
     def je_prazdna(self) -> bool:
         return not self._polozky
+
+    def pocet(self) -> int:
+        """Kolik položek čeká na vyslovení (pro logy a watchdog)."""
+        return len(self._polozky)
 
     def dalsi(self, pusa_mluvi: bool, nyni: Optional[float] = None) -> Optional[Tema]:
         """Vrátí co vyslovit teď, nebo `None`.
