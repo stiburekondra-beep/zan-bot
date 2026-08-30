@@ -2,6 +2,38 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.9.0
+
+**Two voice satellites at once**
+
+- **The bridge now carries more than one device.** Until now exactly one satellite
+  could use it: when a second connected, the transport closed the first
+  (`Only one client allowed, using new connection`) and the two kept kicking each
+  other off, which broke the voice on both. The add-on now owns the listening
+  port itself and gives **every connected device its own transport, its own
+  OpenAI Realtime session and its own phase channel**.
+- **A command spoken to one device is handled there.** Phase messages
+  (listening / thinking / replying / idle), local confirmations and the usage
+  receipt are addressed to the device they belong to instead of being broadcast,
+  so the other satellite keeps its light ring off and its microphone closed.
+- **Unplugging one device no longer disturbs the other** — only its own pipeline
+  is torn down, and its conversation context is cached so it resumes where it
+  left off when it comes back.
+- **A device beyond the cap is refused, never swapped in.** `zan_max_klientu`
+  (default 2) sets the ceiling; an extra connection gets `{"type":"busy"}` and
+  close code `1013`, and the connected devices carry on untouched.
+- **One shared token budget for the whole house.** OpenAI's limit is per account,
+  so per-session accounting would have let two satellites burn through it twice
+  as fast while each reported half. New options `zan_tpm_limit`,
+  `zan_denni_strop_tokenu` and `zan_denni_strop_tvrdy`.
+- **One brain, still.** `ask_zan` keeps pointing at the same Žán channel and the
+  same chat — deliberately not a second bridge on a second port, which would have
+  produced two assistants with separate memories.
+- Fixed on the way: a device keepalive `ping` is now answered with `pong` (the
+  old handler sat on a transport event pipecat never fires), and the
+  "thinking" watchdog is per device, so a slow tool in one room can no longer
+  keep the other room's turn from timing out.
+
 ## 0.6.0
 
 > ⚠️ **This update has two parts — please update both:**

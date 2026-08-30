@@ -50,6 +50,11 @@ class RawAudioSerializer(FrameSerializer):
         # Resets the dangling-VAD guard's "speech since wake" tracker. Set by
         # WebSocketHandler.build_pipeline.
         self._on_wake = None
+        # Async callback pro {"type":"ping"} — keepalive od zařízení. Odpověď
+        # `pong` musí jít NA TENTO satelit; dřív na ni čekala obsluha
+        # `on_client_message`, kterou pipecat vůbec nezná (BaseObject na ni jen
+        # zaloguje „Event handler ... not registered"), takže byla mrtvá.
+        self._on_ping = None
 
     def set_interrupt_handler(self, handler):
         """Register the async no-arg callback fired on a device 'interrupt'."""
@@ -66,6 +71,10 @@ class RawAudioSerializer(FrameSerializer):
     def set_wake_handler(self, handler):
         """Register the async no-arg callback fired on a device 'wake'."""
         self._on_wake = handler
+
+    def set_ping_handler(self, handler):
+        """Register the async no-arg callback fired on a device 'ping'."""
+        self._on_ping = handler
 
     @property
     def type(self) -> FrameSerializerType:
@@ -133,6 +142,13 @@ class RawAudioSerializer(FrameSerializer):
                         await self._on_wake()
                     except Exception as e:
                         logger.warning(f"⚠️ device wake handler failed: {e!r}")
+            elif isinstance(data, dict) and data.get("type") == "ping":
+                # Keepalive: odpověď `pong` míří zpátky JEN na tenhle satelit.
+                if self._on_ping is not None:
+                    try:
+                        await self._on_ping()
+                    except Exception as e:
+                        logger.warning(f"⚠️ device ping handler failed: {e!r}")
             # interrupt / ping / start / other control frames: nothing to inject.
             return None
 

@@ -1,15 +1,43 @@
-"""WebSocket handler for managing WebSocket connections and pipelines."""
+"""WebSocket handler for managing WebSocket connections and pipelines.
+
+MOST PRO VÍC SATELITŮ (2026-08-30)
+----------------------------------
+Do 26. 8. držel port sám pipecat: ``WebsocketServerTransport`` si uvnitř
+otevřel ``websockets.serve`` a povolil PRÁVĚ JEDNO spojení — druhý satelit
+to první zavřel (``server.py:191`` a ``:284``, hláška
+``Only one client allowed, using new connection``). Voice PE a reSpeaker se
+pak střídavě odkopávaly (74 přepnutí za 90 s) a hlas přestal fungovat i tomu,
+kdo předtím jel.
+
+Teď je to obráceně: **port drží vstupní brána tohohle modulu**
+(``WebSocketHandler.serve_forever``) a každé přijaté spojení dostane svůj
+vlastní pipecatí transport (``SingleClientTransport``), který port neotvírá —
+jen obslouží ten JEDEN předaný websocket. Nad ním stojí vlastní pipeline,
+vlastní OpenAI Realtime relace a vlastní fázový kanál. Důsledky:
+
+* povel řečený do jednoho satelitu se odbaví na něm (fáze míří adresně,
+  ne broadcastem),
+* odpojení jednoho satelitu se druhého vůbec nedotkne (padá jen jeho task),
+* strop je věcí registru (``ZAN_MAX_KLIENTU``, výchozí 2) — třetí satelit se
+  ODMÍTNE a nikdo se neodkopává,
+* žádný druhý most na jiném portu (to by byli dva Žáni s oddělenou pamětí).
+"""
 import asyncio
 import json
 import logging
 import time
 import uuid
-from typing import Optional, Callable, Awaitable, Dict
+from typing import Optional, Callable, Awaitable
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
+from pipecat.transports.websocket.server import (
+    WebsocketServerTransport,
+    WebsocketServerParams,
+    WebsocketServerInputTransport,
+    WebsocketServerOutputTransport,
+)
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -17,11 +45,19 @@ from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.services.openai.realtime import events as openai_rt_events
 
+from websockets.asyncio.server import serve as websocket_serve
+
 from app.raw_audio_serializer import RawAudioSerializer
 from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.transcript_logger import TranscriptLogger
+from app.client_registry import (
+    ClientRegistry,
+    ClientSlot,
+    DEFAULT_MAX_CLIENTS,
+    REJECTED_FULL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -325,9 +361,99 @@ class ConnectionRecovery(FrameProcessor):
             logger.warning(f"⚠️ could not emit idle after turn-ending error: {e!r}")
 
 
+class SingleClientInputTransport(WebsocketServerInputTransport):
+    """Pipecatí vstup pro JEDEN předaný websocket — port sám neotvírá.
+
+    Rodičovská třída si v ``_server_task_handler`` otevře ``websockets.serve``
+    a v ``_client_handler`` povolí jen jedno spojení (druhé to první zavře).
+    Tady je port cizí věc: drží ho vstupní brána ``WebSocketHandler`` a nám
+    předá hotový websocket přes ``attach()``. Čtecí smyčku, deserializaci
+    i oznámení o (od)pojení pak dělá beze změny rodičovský ``_client_handler``
+    — jen nad jedním jediným spojením, takže nemá koho odkopávat.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._attached_ws = None
+        self._attached_event = asyncio.Event()
+        self._finished_event = asyncio.Event()
+
+    def attach(self, websocket) -> None:
+        """Předat spojení, které má tenhle transport obsloužit."""
+        self._attached_ws = websocket
+        self._attached_event.set()
+
+    async def wait_finished(self) -> None:
+        """Počkat, až čtecí smyčka tohohle spojení doběhne."""
+        await self._finished_event.wait()
+
+    @property
+    def finished(self) -> bool:
+        """Doběhla už čtecí smyčka?"""
+        return self._finished_event.is_set()
+
+    async def _server_task_handler(self):
+        """Místo poslouchání na portu obsloužit ten jeden přidělený websocket."""
+        try:
+            await self._attached_event.wait()
+            await self._client_handler(self._attached_ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - obrana, ať nepadne celý most
+            logger.error(f"❌ chyba obsluhy spojení satelitu: {e!r}", exc_info=True)
+        finally:
+            self._finished_event.set()
+
+
+class SingleClientOutputTransport(WebsocketServerOutputTransport):
+    """Pipecatí výstup pro JEDEN websocket — nikoho neodkopává.
+
+    Rodičovský ``set_client_connection`` zavře dosavadní spojení a zaloguje
+    ``Only one client allowed, using new connection`` (``server.py:284``).
+    V režimu 1:1 je to jednak zbytečné, jednak zavádějící: ta hláška padá
+    i při ÚPLNĚ běžném odpojení (transport si volá ``set_client_connection(None)``),
+    takže by ji log obsahoval, i kdyby žádná kolize nebyla — a akceptační
+    kritérium karty zní „nula ``Only one client allowed`` v logu".
+    Zavření socketu si obstará čtecí smyčka v ``_client_handler``.
+    """
+
+    async def set_client_connection(self, websocket):
+        """Nastavit/zrušit spojení bez zavírání cizího socketu a bez varování."""
+        self._websocket = websocket
+
+
+class SingleClientTransport(WebsocketServerTransport):
+    """Transport jednoho satelitu: vlastní vstup, výstup i serializér."""
+
+    def input(self) -> SingleClientInputTransport:
+        """Vstupní transport (bez vlastního serveru)."""
+        if not self._input:
+            self._input = SingleClientInputTransport(
+                self, self._host, self._port, self._params, self._callbacks,
+                name=self._input_name,
+            )
+        return self._input
+
+    def output(self) -> SingleClientOutputTransport:
+        """Výstupní transport (bez odkopávání)."""
+        if not self._output:
+            self._output = SingleClientOutputTransport(
+                self, self._params, name=self._output_name
+            )
+        return self._output
+
+    def attach(self, websocket) -> None:
+        """Předat přijaté spojení pipeline tohohle satelitu."""
+        self.input().attach(websocket)
+
+    async def wait_finished(self) -> None:
+        """Počkat, až spojení tohohle satelitu skončí."""
+        await self.input().wait_finished()
+
+
 class WebSocketHandler:
     """Handles WebSocket transport initialization, pipeline building, and event management."""
-    
+
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -338,6 +464,8 @@ class WebSocketHandler:
         follow_up_open_delay_ms: int = 700,
         wake_open_delay_ms: int = 700,
         playback_prebuffer_ms: int = 0,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        budget=None,
     ):
         """
         Initialize WebSocket handler.
@@ -356,6 +484,9 @@ class WebSocketHandler:
             wake_open_delay_ms: How long (ms) the device waits after the wake
                 chime before opening the mic, so the chime's hardware tail can't
                 leak into the fresh mic as a ghost turn. Sent in `hello`.
+            max_clients: Kolik satelitů most unese současně (ZAN_MAX_KLIENTU).
+                Další se ODMÍTNE — nikdo se neodkopává.
+            budget: Volitelný `SharedBudget` — sdílená peněženka všech satelitů.
         """
         self.host = host
         self.port = port
@@ -366,36 +497,33 @@ class WebSocketHandler:
         self.wake_open_delay_ms = max(0, int(wake_open_delay_ms))
         self.playback_prebuffer_ms = max(0, int(playback_prebuffer_ms))
 
-        self.transport: Optional[WebsocketServerTransport] = None
-        self.pipeline: Optional[Pipeline] = None
-        self.runner: Optional[PipelineRunner] = None
-        self.current_task: Optional[PipelineTask] = None
-        # The serializer instance the transport reads through. Kept so
-        # build_pipeline can wire its device-interrupt callback to the OpenAI
-        # service.
-        self._serializer: Optional[RawAudioSerializer] = None
-        # Connected device websockets, used to push va_client control/phase
-        # messages as TEXT frames (the audio path uses the binary serializer).
-        self._websockets: set = set()
-    
-    def create_transport(self) -> WebsocketServerTransport:
-        """
-        Create and initialize WebSocket transport.
-        
-        Returns:
-            WebsocketServerTransport instance
-        """
-        logger.info("Initializing WebSocket transport...")
-        
-        # Use RawAudioSerializer for binary PCM audio. It tags incoming frames
-        # with the device mic rate (16 kHz for Voice PE); the transport
-        # resamples in/out to the 24 kHz pipeline rate below.
-        serializer = RawAudioSerializer()
-        self._serializer = serializer
+        # Registr satelitů: mapa client_id -> ClientSlot se stropem. Tohle je
+        # celé jádro multiklientního mostu — každý satelit má svůj transport,
+        # svou pipeline a svou OpenAI relaci, nic z toho se nesdílí.
+        self.clients = ClientRegistry(max_clients=max_clients)
+        self.budget = budget
+        # Vstupní brána (websockets server) a signál k jejímu zastavení.
+        self._server = None
+        self._stop_event: Optional[asyncio.Event] = None
+        # Callback z main.py: dostane ClientSlot a doplní do něj transport,
+        # OpenAI relaci a rozběhnutou pipeline.
+        self._build_client_session: Optional[Callable[[ClientSlot], Awaitable[None]]] = None
+        # Volitelný callback po úklidu satelitu (nahrávání apod.).
+        self._on_client_gone: Optional[Callable[[str], None]] = None
 
-        # Create WebsocketServerTransport with WebsocketServerParams
-        # The transport will start its own server automatically
-        self.transport = WebsocketServerTransport(
+    def create_client_transport(self, client_id: str):
+        """Postavit transport + serializér pro JEDEN satelit.
+
+        Vlastní serializér je nutnost, ne kosmetika: drží callbacky
+        (``interrupt``/``wake``/``flush``/``start``) navázané na konkrétní
+        OpenAI relaci. Sdílený serializér by „stop" řečený u televize poslal
+        do relace toho druhého satelitu.
+
+        Returns:
+            Dvojice ``(SingleClientTransport, RawAudioSerializer)``.
+        """
+        serializer = RawAudioSerializer()
+        transport = SingleClientTransport(
             host=self.host,
             port=self.port,
             params=WebsocketServerParams(
@@ -404,32 +532,49 @@ class WebSocketHandler:
                 audio_out_enabled=True,
                 audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
                 audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
-            )
+            ),
         )
-        
-        logger.info(f"✅ WebSocket transport created - will listen on ws://{self.host}:{self.port}/")
-        return self.transport
-    
+        logger.info(f"🔧 transport pro satelit {client_id} připraven (bez vlastního portu)")
+        return transport, serializer
+
     def build_pipeline(
         self,
         transport: WebsocketServerTransport,
         openai_service: OpenAIRealtimeLLMService,
         client_id: str,
-        activity_callback: Optional[Callable[[], None]] = None
-    ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
+        activity_callback: Optional[Callable[[], None]] = None,
+        serializer: Optional[RawAudioSerializer] = None,
+        turn_liveness=None,
+        enable_recorders: bool = True,
+    ) -> tuple:
         """
         Build pipeline for a WebSocket transport connection.
-        
+
         Args:
             transport: The WebSocket transport instance
             openai_service: The OpenAI service instance
             client_id: Unique identifier for the client device
             activity_callback: Optional callback for session activity tracking
-            
+            serializer: Serializér TOHOTO satelitu (drží jeho device callbacky).
+            turn_liveness: `TurnLiveness` tohoto satelitu — hlídač „myslím"
+                se nesmí dívat na nástroje běžící u druhého satelitu.
+            enable_recorders: zapojit do pipeline nahrávací procesory.
+                `AudioRecordingService` vrací POŘÁD TYTÉŽ instance
+                `AudioFrameRecorder`, a jeden FrameProcessor nesmí být ve dvou
+                pipeline (pipecat si na něm přepisuje sousedy). Nahrávat proto
+                smí jen jeden satelit — rozhoduje main.py.
+
         Returns:
-            Tuple of (Pipeline, PipelineRunner, PipelineTask)
+            Tuple of (Pipeline, PipelineRunner, PipelineTask, PhaseEmitter, runner_task)
         """
         logger.info(f"🔗 Building pipeline for client: {client_id}")
+        if serializer is None:
+            raise RuntimeError("build_pipeline vyžaduje serializér daného satelitu")
+        # Fázový kanál MÍŘÍ NA JEDNO ZAŘÍZENÍ. Dřív se fáze rozesílaly
+        # broadcastem všem — druhý satelit by tedy rozsvítil prstenec a otevřel
+        # mikrofon kvůli povelu, který zazněl v jiné místnosti.
+        phase_send = self.phase_sender(client_id)
+        json_send = self.json_sender(client_id)
         
         if openai_service is None:
             raise RuntimeError("OpenAI service must be created before building pipeline")
@@ -459,21 +604,22 @@ class WebSocketHandler:
         # idle through PhaseEmitter.force_idle() (consistent phase state +
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
-        phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
+        phase_emitter = PhaseEmitter(send_phase=phase_send, turn_liveness=turn_liveness)
 
         pipeline_components = [
             transport.input(),
             # Watch for OpenAI connection-death ErrorFrames (they travel upstream
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
-            ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
+            ConnectionRecovery(openai_service=openai_service, emit_idle=phase_send,
                                phase_emitter=phase_emitter),
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
         
         # Add input audio recorder to capture ONLY InputAudioRawFrame
-        input_recorder = self.audio_recording_service.get_input_recorder() if self.audio_recording_service else None
+        input_recorder = (self.audio_recording_service.get_input_recorder()
+                          if (self.audio_recording_service and enable_recorders) else None)
         if input_recorder:
             pipeline_components.append(input_recorder)
         
@@ -508,7 +654,8 @@ class WebSocketHandler:
         pipeline_components.append(phase_emitter)
 
         # Add output audio recorder to capture ONLY OutputAudioRawFrame
-        output_recorder = self.audio_recording_service.get_output_recorder() if self.audio_recording_service else None
+        output_recorder = (self.audio_recording_service.get_output_recorder()
+                           if (self.audio_recording_service and enable_recorders) else None)
         if output_recorder:
             pipeline_components.append(output_recorder)
 
@@ -522,18 +669,19 @@ class WebSocketHandler:
         logger.info("✅ Pipeline created for WebSocket connection")
         
         # Audio recording is handled by AudioFrameRecorder processors in the pipeline
-        if self.audio_recording_service:
+        if self.audio_recording_service and enable_recorders:
             logger.info("🎙️ Audio recording enabled - will record input and output audio")
         
         # Create pipeline runner and task
         # Disable idle timeout - server should always stay ready for connections
-        runner = PipelineRunner()
+        # handle_sigint=False: běhounů je teď víc (jeden na satelit) a signály
+        # patří hlavní aplikaci, ne každé pipeline zvlášť.
+        runner = PipelineRunner(handle_sigint=False)
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
-        
+
         # Start pipeline in background
-        asyncio.create_task(runner.run(task))
-        logger.info("✅ Pipeline started for WebSocket connection")
-        logger.info("✅ Pipeline initialized successfully")
+        runner_task = asyncio.create_task(runner.run(task), name=f"pipeline-{client_id}")
+        logger.info(f"✅ Pipeline started for client {client_id}")
 
         # Wire the device "stop" interrupt. The serializer calls this when it
         # sees {"type":"interrupt"} from the device.
@@ -700,14 +848,22 @@ class WebSocketHandler:
             on_real_speech=_clear_kill_window,
         )
 
-        if self._serializer is not None:
-            self._serializer.set_interrupt_handler(_on_device_interrupt)
-            self._serializer.set_session_start_handler(_on_device_session_start)
-            self._serializer.set_mic_flush_handler(_on_device_mic_flush)
-            self._serializer.set_wake_handler(_on_device_wake)
+        async def _on_device_ping():
+            # Keepalive od zařízení. Dřív na něj neodpovídal NIKDO: obsluha
+            # seděla v `setup_event_handlers` na události `on_client_message`,
+            # kterou pipecat nezná (BaseObject ji jen zaloguje jako
+            # „Event handler on_client_message not registered") — takže to byl
+            # mrtvý kód. Teď odpověď míří adresně na ten satelit, co se ptal.
+            await json_send({"type": "pong"})
 
-        return pipeline, runner, task
-    
+        serializer.set_interrupt_handler(_on_device_interrupt)
+        serializer.set_session_start_handler(_on_device_session_start)
+        serializer.set_mic_flush_handler(_on_device_mic_flush)
+        serializer.set_wake_handler(_on_device_wake)
+        serializer.set_ping_handler(_on_device_ping)
+
+        return pipeline, runner, task, phase_emitter, runner_task
+
     def extract_client_id(self, websocket) -> str:
         """
         Extract client ID from websocket connection.
@@ -746,47 +902,138 @@ class WebSocketHandler:
         except Exception as e:
             logger.warning(f"⚠️ Could not send {obj.get('type')} to device: {e!r}")
 
+    async def send_json_to(self, client_id: str, obj: dict) -> None:
+        """Poslat JSON JEDNOMU satelitu (adresný kanál).
+
+        Tohle je jádro pravidla „povel na jednom nechá druhý v klidu":
+        fáze, potvrzení i účtenka o spotřebě míří na to zařízení, kterého se
+        týkají. Když satelit mezitím zmizel, jen se to zaloguje — mlčky
+        zahodit zprávu je správně, křičet do prázdna ne.
+        """
+        slot = self.clients.get(client_id)
+        if slot is None or slot.websocket is None:
+            logger.debug(f"↩️ {obj.get('type')} pro {client_id} zahozeno — satelit není připojený")
+            return
+        await self._send_json(slot.websocket, obj)
+
+    async def send_phase_to(self, client_id: str, value: str) -> None:
+        """Poslat fázi (listening/thinking/replying/idle) jednomu satelitu."""
+        logger.info(f"➡️ fáze '{value}' → {client_id}")
+        await self.send_json_to(client_id, {"type": "phase", "value": value})
+
+    def phase_sender(self, client_id: str) -> Callable[[str], Awaitable[None]]:
+        """Vrátit `async (value) -> None` navázané na jeden satelit."""
+        async def send(value: str) -> None:
+            await self.send_phase_to(client_id, value)
+        return send
+
+    def json_sender(self, client_id: str) -> Callable[[dict], Awaitable[None]]:
+        """Vrátit `async (obj) -> None` navázané na jeden satelit."""
+        async def send(obj: dict) -> None:
+            await self.send_json_to(client_id, obj)
+        return send
+
     async def broadcast_json(self, obj: dict) -> None:
-        """Send a JSON object to every connected device as a TEXT frame."""
-        for ws in list(self._websockets):
-            await self._send_json(ws, obj)
+        """Poslat JSON VŠEM satelitům.
+
+        Zůstává jen pro zprávy, které se opravdu týkají celého domu. Fáze
+        a potvrzení tudy NECHODÍ — od 2026-08-30 mají adresný kanál
+        (`send_json_to`), protože broadcast rozsvěcoval prstenec i satelitu,
+        na který nikdo nemluvil.
+        """
+        for slot in self.clients.all():
+            if slot.websocket is not None:
+                await self._send_json(slot.websocket, obj)
 
     async def broadcast_phase(self, value: str) -> None:
-        """Send a va_client phase message to every connected device."""
-        # TEMP instrumentation: log the broadcast + how many device sockets we
-        # think are connected (was debug).
-        logger.info(f"➡️ broadcast phase '{value}' to {len(self._websockets)} device(s)")
+        """Fáze všem — jen pro zpětnou kompatibilitu, provoz ji nepoužívá."""
+        logger.info(f"➡️ broadcast phase '{value}' to {self.clients.count} device(s)")
         await self.broadcast_json({"type": "phase", "value": value})
-    
-    def setup_event_handlers(
+
+    # ------------------------------------------------------------------
+    # Vstupní brána: jeden port, víc satelitů
+    # ------------------------------------------------------------------
+
+    async def serve_forever(
         self,
-        transport: WebsocketServerTransport,
-        on_client_connected_callback: Callable[[str], Awaitable[None]],
-        on_client_disconnected_callback: Optional[Callable[[str], None]] = None,
-        openai_service_getter: Optional[Callable[[str], Optional[OpenAIRealtimeLLMService]]] = None
-    ):
-        """
-        Setup WebSocket event handlers.
-        
+        build_client_session: Callable[[ClientSlot], Awaitable[None]],
+        on_client_gone: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Otevřít port a obsluhovat satelity, dokud nás někdo nezastaví.
+
+        Port drží tahle brána (ne pipecat), takže se dá o přijatém spojení
+        rozhodnout DŘÍV, než se ho zmocní transport, který umí jen jednoho.
+
         Args:
-            transport: The WebSocket transport instance
-            on_client_connected_callback: Async callback function(client_id) called when client connects
-            on_client_disconnected_callback: Optional callback function(client_id) called when client disconnects
-            openai_service_getter: Optional function(client_id) -> OpenAIRealtimeLLMService to get service for interrupt
+            build_client_session: `async (slot) -> None`, které do slotu
+                doplní transport, OpenAI relaci a rozběhnutou pipeline.
+            on_client_gone: volitelný `(client_id) -> None` po úklidu satelitu.
         """
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport: WebsocketServerTransport, websocket):
-            """Handle new WebSocket client connection."""
-            client_id = self.extract_client_id(websocket)
-            logger.info(f"🔗 New WebSocket connection from IP: {client_id}")
-            # Track the raw connection so we can push phase/control TEXT frames.
-            self._websockets.add(websocket)
+        self._build_client_session = build_client_session
+        self._on_client_gone = on_client_gone
+        self._stop_event = asyncio.Event()
+        async with websocket_serve(self._front_door, self.host, self.port) as server:
+            self._server = server
+            logger.info(
+                f"✅ most poslouchá na ws://{self.host}:{self.port}/ "
+                f"— strop {self.clients.max_clients} satelit(y) současně"
+            )
+            await self._stop_event.wait()
+        logger.info("🛑 vstupní brána mostu zavřena")
+
+    def stop(self) -> None:
+        """Požádat vstupní bránu o ukončení."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    async def _front_door(self, websocket) -> None:
+        """Obsluha JEDNOHO přijatého spojení od začátku do konce.
+
+        Dokud tahle korutina běží, spojení žije — proto se v ní čeká na
+        konec čtecí smyčky satelitu. Nikdy tu nesaháme na spojení někoho
+        jiného: strop se řeší ODMÍTNUTÍM nového, ne odkopnutím starého.
+        """
+        client_id = self.extract_client_id(websocket)
+        logger.info(f"🔗 nové spojení od {client_id}")
+
+        # Rozpočet: v tvrdém režimu se po vyčerpání denního stropu nepouští
+        # DALŠÍ satelit. Ten, kdo už mluví, se nikdy neumlčuje.
+        if self.budget is not None:
+            allowed, reason = self.budget.allow_new_client()
+            if not allowed:
+                logger.warning(f"💸 odmítám {client_id}: {reason}")
+                await self._reject(websocket, "budget", reason)
+                return
+
+        verdict, slot, old = self.clients.reserve(client_id)
+        if verdict == REJECTED_FULL:
+            await self._reject(
+                websocket, "max_clients",
+                f"most unese {self.clients.max_clients} satelit(y): {', '.join(self.clients.ids())}",
+            )
+            return
+
+        if old is not None:
+            # Totéž zařízení se připojilo znovu — uklidíme JEHO starou relaci.
+            await self._teardown(old, reason="reconnect téhož zařízení")
+
+        try:
+            slot.websocket = websocket
+            await self._build_client_session(slot)
+        except Exception as e:
+            logger.error(f"❌ nepodařilo se postavit relaci pro {client_id}: {e!r}", exc_info=True)
+            self.clients.release(slot)
+            try:
+                await websocket.close(code=1011, reason="relace se nepodarila")
+            except Exception:
+                pass
+            return
+
+        try:
             # Handshake ack expected by the va_client protocol (server -> device
-            # "hello"). The Voice PE firmware tolerates its absence, but sending
-            # it keeps both sides in lockstep with the documented protocol.
-            # follow_up_ms tells the device how long to keep the mic open after a
-            # reply (post-reply follow-up window); 0/absent = turn-based. Sent on
-            # every connect so an add-on config change takes effect on reconnect.
+            # "hello"). follow_up_ms tells the device how long to keep the mic
+            # open after a reply; 0/absent = turn-based. Sent on every connect so
+            # an add-on config change takes effect on reconnect.
             await self._send_json(
                 websocket,
                 {
@@ -798,94 +1045,90 @@ class WebSocketHandler:
                     "playback_prebuffer_ms": self.playback_prebuffer_ms,
                 },
             )
-            await on_client_connected_callback(client_id)
+            # Teprve teď dostane pipeline satelitu jeho spojení do ruky.
+            slot.transport.attach(websocket)
+            await self._wait_until_gone(slot, websocket)
+        finally:
+            await self._teardown(slot, reason="satelit se odpojil")
 
-        @transport.event_handler("on_client_disconnected")
-        async def on_client_disconnected(transport: WebsocketServerTransport, websocket, *args, **kwargs):
-            """Handle client disconnection."""
-            self._websockets.discard(websocket)
-            client_id = self.extract_client_id(websocket)
-            if client_id:
-                logger.info(f"🔌 Client {client_id} disconnected")
-                if on_client_disconnected_callback:
-                    on_client_disconnected_callback(client_id)
-        
-        # Handle text messages from client (e.g., interrupt messages)
-        @transport.event_handler("on_client_message")
-        async def on_client_message(transport: WebsocketServerTransport, websocket, message):
-            """Handle text messages from WebSocket client."""
+    async def _reject(self, websocket, reason_code: str, detail: str) -> None:
+        """Slušně odmítnout spojení, aniž bychom sáhli na ostatní satelity."""
+        try:
+            await self._send_json(
+                websocket,
+                {"type": "busy", "reason": reason_code, "detail": detail,
+                 "max_clients": self.clients.max_clients},
+            )
+        except Exception:
+            pass
+        try:
+            # 1013 = "try again later". Odmítnutí je VĚDOMÉ a viditelné —
+            # tiché odkopnutí někoho jiného byl přesně ten starý problém.
+            await websocket.close(code=1013, reason="most je plny")
+        except Exception:
+            pass
+
+    async def _wait_until_gone(self, slot: ClientSlot, websocket) -> None:
+        """Čekat, dokud satelit mluví — buď doběhne čtecí smyčka, nebo socket."""
+        waiters = [asyncio.create_task(slot.transport.wait_finished())]
+        wait_closed = getattr(websocket, "wait_closed", None)
+        if wait_closed is not None:
+            waiters.append(asyncio.create_task(wait_closed()))
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+
+    async def _teardown(self, slot: ClientSlot, reason: str) -> None:
+        """Uklidit JEDEN satelit — ostatních se to nesmí dotknout.
+
+        Pořadí je důležité: nejdřív se uschová kontext (aby relace přežila
+        odpojení a satelit navázal tam, kde skončil), pak se zruší JEHO
+        pipeline a nakonec se uvolní slot.
+        """
+        if slot.torn_down:
+            return
+        slot.torn_down = True
+        logger.info(f"🧹 uklízím satelit {slot.client_id} ({reason})")
+
+        if self.session_manager is not None and slot.service is not None:
             try:
-                client_id = self.extract_client_id(websocket)
-                
-                # Try to parse as JSON
-                if isinstance(message, bytes):
-                    message = message.decode('utf-8')
-                
-                try:
-                    data = json.loads(message)
-                    message_type = data.get("type")
-                    
-                    if message_type == "interrupt":
-                        logger.info(f"🛑 Interrupt received from client {client_id}")
-                        
-                        # Get OpenAI service for this client
-                        openai_service = None
-                        if openai_service_getter:
-                            openai_service = openai_service_getter(client_id)
-                        
-                        if openai_service:
-                            # Send interrupt event to OpenAI Realtime API
-                            # The interrupt event tells OpenAI to stop speaking and listen for user input
-                            try:
-                                # Try to send interrupt event directly to the service
-                                # OpenAI Realtime API expects: {"type": "response.interrupt"}
-                                if hasattr(openai_service, 'send_interrupt'):
-                                    await openai_service.send_interrupt()
-                                    logger.info(f"✅ Interrupt sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, 'push_event'):
-                                    # Send interrupt event via push_event
-                                    await openai_service.push_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt event sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, '_send_event'):
-                                    # Try private method if available
-                                    await openai_service._send_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt sent via _send_event to OpenAI service for client {client_id}")
-                                else:
-                                    # Fallback: log warning
-                                    logger.warning(f"⚠️ Could not find method to send interrupt to OpenAI service. Available methods: {[m for m in dir(openai_service) if not m.startswith('__')]}")
-                            except Exception as e:
-                                logger.error(f"❌ Error sending interrupt to OpenAI service: {e}", exc_info=True)
-                        else:
-                            logger.warning(f"⚠️ No OpenAI service found for client {client_id}, cannot send interrupt")
-                    elif message_type == "start":
-                        # va_client sends {"type":"start"} on connect. The
-                        # pipeline already streams continuously with server VAD,
-                        # so there's nothing to start here — just acknowledge.
-                        logger.debug(f"▶️ start from client {client_id}")
-                    elif message_type == "ping":
-                        # Keepalive. Reply with pong on the same connection.
-                        await self._send_json(websocket, {"type": "pong"})
-                    else:
-                        logger.debug(f"📨 Received message from client {client_id}: {message_type}")
-                        
-                except json.JSONDecodeError:
-                    logger.debug(f"📨 Received non-JSON message from client {client_id}: {message[:100]}")
-                    
+                self.session_manager.handle_client_disconnect(slot.client_id, slot.service)
             except Exception as e:
-                logger.error(f"❌ Error handling client message: {e}", exc_info=True)
-    
+                logger.warning(f"⚠️ kontext satelitu {slot.client_id} se nepodařilo uschovat: {e!r}")
+
+        if slot.task is not None:
+            try:
+                await slot.task.cancel()
+            except Exception as e:
+                logger.warning(f"⚠️ pipeline satelitu {slot.client_id} nešla zrušit: {e!r}")
+
+        if slot.runner_task is not None and not slot.runner_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(slot.runner_task), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ pipeline satelitu {slot.client_id} se do 5 s neukončila")
+            except Exception:
+                pass
+
+        if slot.websocket is not None:
+            try:
+                await slot.websocket.close()
+            except Exception:
+                pass
+
+        self.clients.release(slot)
+
+        if self._on_client_gone is not None:
+            try:
+                self._on_client_gone(slot.client_id)
+            except Exception as e:
+                logger.warning(f"⚠️ úklidový callback selhal pro {slot.client_id}: {e!r}")
+
     async def cleanup(self):
         """Cleanup WebSocket handler resources."""
-        if self.runner:
-            try:
-                await self.runner.cancel()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cancelling runner: {e}")
-        
-        if self.transport:
-            try:
-                if hasattr(self.transport, 'stop'):
-                    await self.transport.stop()
-            except Exception as e:
-                logger.warning(f"⚠️ Error stopping transport: {e}")
-
+        self.stop()
+        for slot in self.clients.all():
+            await self._teardown(slot, reason="most se vypíná")

@@ -76,6 +76,11 @@ OPTION_DEFAULTS: Dict[str, str] = {
     'session_reuse_timeout_seconds': '300',
     'max_context_messages': '12',
     'transcription_model': 'gpt-4o-transcribe',
+    # Multiklient + sdílený rozpočet (2026-08-30, karta …-programator-zana-23).
+    'zan_max_klientu': '2',
+    'zan_tpm_limit': '40000',
+    'zan_denni_strop_tokenu': '0',
+    'zan_denni_strop_tvrdy': 'false',
     # --- Debug ---
     'enable_recording': 'false',
 }

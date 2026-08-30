@@ -185,6 +185,32 @@ configuration:
       conversation. More = better memory, but every answer re-bills the whole
       history, so long chats get expensive and can hit OpenAI rate limits.
       12 is a good balance; 0 = unlimited.
+  zan_max_klientu:
+    name: "⚙️ Advanced · Voice devices at the same time"
+    description: >-
+      How many voice satellites may use this add-on at once (default 2, e.g.
+      one in the living room and one by the TV). Each gets its own
+      conversation and its own light ring, so a command spoken to one is
+      handled there and the other stays idle. A device beyond this number is
+      politely refused — nobody who is already connected gets kicked off.
+  zan_tpm_limit:
+    name: "⚙️ Advanced · Token limit per minute (all devices)"
+    description: >-
+      The per-minute token budget shared by ALL voice devices, used for the
+      "remaining" figure sent to them. OpenAI counts tokens per account, not
+      per device, so this is deliberately one shared number (default 40000).
+  zan_denni_strop_tokenu:
+    name: "⚙️ Advanced · Daily token budget (all devices)"
+    description: >-
+      Daily token budget shared by all voice devices. 0 (default) = off, usage
+      is only logged. With a value set, the log warns at 80 % and at 100 %, so
+      two devices can't quietly spend twice as fast.
+  zan_denni_strop_tvrdy:
+    name: "⚙️ Advanced · Enforce the daily budget"
+    description: >-
+      When on, a NEW voice device is refused once the daily budget is spent.
+      A device that is already connected is never cut off mid-sentence. Off by
+      default — the budget then only warns.
   transcription_model:
     name: "⚙️ Advanced · Transcript model"
     description: >-
