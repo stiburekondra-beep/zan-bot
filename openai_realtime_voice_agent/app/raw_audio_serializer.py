@@ -50,6 +50,21 @@ class RawAudioSerializer(FrameSerializer):
         # Resets the dangling-VAD guard's "speech since wake" tracker. Set by
         # WebSocketHandler.build_pipeline.
         self._on_wake = None
+        # Async callback pro {"type":"ping"} — keepalive od zařízení. Odpověď
+        # `pong` musí jít NA TENTO satelit; dřív na ni čekala obsluha
+        # `on_client_message`, kterou pipecat vůbec nezná (BaseObject na ni jen
+        # zaloguje „Event handler ... not registered"), takže byla mrtvá.
+        self._on_ping = None
+        # Async callback pro {"type":"mute"} / {"type":"mic_mute"} — satelit
+        # hlásí FYZICKY (od)mutovaný mikrofon; zrcadlí se na plátno
+        # (`session_klient.mute`). Bere jeden argument (bool).
+        #
+        # POZOR, tohle je jediná cesta: do 30. 8. 2026 se `mute` četlo
+        # v `setup_event_handlers` z pipecatí události `on_client_message`,
+        # kterou pipecat NEZNÁ — byl to mrtvý kód, stejně jako `ping` vedle.
+        # Multiklientní brána tu obsluhu zrušila, takže hlášení mute musí
+        # téct sem, přes serializér toho satelitu.
+        self._on_mute = None
 
     def set_interrupt_handler(self, handler):
         """Register the async no-arg callback fired on a device 'interrupt'."""
@@ -66,6 +81,14 @@ class RawAudioSerializer(FrameSerializer):
     def set_wake_handler(self, handler):
         """Register the async no-arg callback fired on a device 'wake'."""
         self._on_wake = handler
+
+    def set_ping_handler(self, handler):
+        """Register the async no-arg callback fired on a device 'ping'."""
+        self._on_ping = handler
+
+    def set_mute_handler(self, handler):
+        """Register the async `(muted: bool)` callback fired on 'mute'/'mic_mute'."""
+        self._on_mute = handler
 
     @property
     def type(self) -> FrameSerializerType:
@@ -133,7 +156,27 @@ class RawAudioSerializer(FrameSerializer):
                         await self._on_wake()
                     except Exception as e:
                         logger.warning(f"⚠️ device wake handler failed: {e!r}")
-            # interrupt / ping / start / other control frames: nothing to inject.
+            elif isinstance(data, dict) and data.get("type") == "ping":
+                # Keepalive: odpověď `pong` míří zpátky JEN na tenhle satelit.
+                if self._on_ping is not None:
+                    try:
+                        await self._on_ping()
+                    except Exception as e:
+                        logger.warning(f"⚠️ device ping handler failed: {e!r}")
+            elif isinstance(data, dict) and data.get("type") in ("mute", "mic_mute"):
+                # Satelit hlásí fyzicky (od)mutovaný mikrofon. Snese obě
+                # pojmenování pole (`muted` i `value`), ať se kvůli tomu
+                # nemusí ladit firmware. Software mute se tím nevyrábí ani
+                # neruší — jen se zrcadlí na plátno.
+                raw = data.get("muted", data.get("value"))
+                muted = raw is True or str(raw).strip().lower() in ("1", "true", "on", "yes")
+                logger.info(f"🔇 device mute={muted} received")
+                if self._on_mute is not None:
+                    try:
+                        await self._on_mute(muted)
+                    except Exception as e:
+                        logger.warning(f"⚠️ device mute handler failed: {e!r}")
+            # interrupt / ping / mute / start / other control frames: nothing to inject.
             return None
 
         if not isinstance(message, bytes):

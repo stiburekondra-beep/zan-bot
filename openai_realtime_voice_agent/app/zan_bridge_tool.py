@@ -360,9 +360,16 @@ class ZanBridge:
     def pripoj(self, service: Any, faze_getter: Optional[Callable[[], Optional[str]]] = None) -> None:
         """Přepne most na novou realtime session a nastartuje dispečera.
 
-        Volá se při každém `_ensure_openai_service` — služba se vytváří
+        Volá se při každém `_create_openai_service` — služba se vytváří
         znovu pro každé připojení zařízení. Co viselo ve frontě pro starou
         session, se zahazuje: patřilo to k jinému rozhovoru.
+
+        POZOR (multiklient, 30. 8. 2026): most je JEDEN na celý běh, ale
+        satelitů může být víc a každý má vlastní relaci. `pripoj()` proto
+        přepne frontu na tu NAPOSLEDY připojenou — dispečer mluví jednou
+        pusou, ne dvěma. Dokud jsou satelity dva a mozek jeden, je to
+        záměr; kdyby měl každý satelit mluvit vlastní frontou, musel by
+        být `ZanBridge` per slot (nezavedeno — jeden mozek, jedna paměť).
         """
         if self._service is not service:
             self.dispecer.vyprazdni("nová realtime session")
@@ -374,7 +381,7 @@ class ZanBridge:
     def nastav_zdroj(self, client_id: Optional[str]) -> None:
         """Zapamatuj si, ze kterého satelitu teď hlas přichází.
 
-        Volá se z `_ensure_openai_service` (tam je client_id z transportu).
+        Volá se z `_create_openai_service` (tam je client_id ze slotu).
         Do payloadu `/voice` pak jde `zdroj_zarizeni` — server ho zatím
         ignoruje, takže je to čistě aditivní.
         """

@@ -41,6 +41,12 @@ WEBSOCKET_PORT=$(bashio::config 'websocket_port')
 SESSION_REUSE_TIMEOUT_SECONDS=$(bashio::config 'session_reuse_timeout_seconds')
 MAX_CONTEXT_MESSAGES=$(bashio::config 'max_context_messages')
 TRANSCRIPTION_MODEL=$(bashio::config 'transcription_model')
+# Multiklient + sdileny rozpocet (2026-08-30): kolik satelitu unese most
+# a jak se hlida spolecna penezenka.
+ZAN_MAX_KLIENTU=$(bashio::config 'zan_max_klientu')
+ZAN_TPM_LIMIT=$(bashio::config 'zan_tpm_limit')
+ZAN_DENNI_STROP_TOKENU=$(bashio::config 'zan_denni_strop_tokenu')
+ZAN_DENNI_STROP_TVRDY=$(bashio::config 'zan_denni_strop_tvrdy')
 
 # --- 🔍 Debug ---
 ENABLE_RECORDING=$(bashio::config 'enable_recording')
@@ -78,6 +84,10 @@ export WEBSOCKET_PORT
 export SESSION_REUSE_TIMEOUT_SECONDS
 export MAX_CONTEXT_MESSAGES
 export TRANSCRIPTION_MODEL
+export ZAN_MAX_KLIENTU
+export ZAN_TPM_LIMIT
+export ZAN_DENNI_STROP_TOKENU
+export ZAN_DENNI_STROP_TVRDY
 export ENABLE_RECORDING
 
 # The *_custom escape hatches (🗣️/🌐/⚙️) are optional WITHOUT defaults —

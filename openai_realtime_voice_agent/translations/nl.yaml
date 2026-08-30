@@ -189,6 +189,32 @@ configuration:
       Meer = beter geheugen, maar elk antwoord rekent de hele historie opnieuw
       af, dus lange gesprekken worden duurder en kunnen tegen OpenAI-limieten
       aanlopen. 12 is een goede balans; 0 = onbeperkt.
+  zan_max_klientu:
+    name: "⚙️ Geavanceerd · Spraakapparaten tegelijk"
+    description: >-
+      Hoeveel spraaksatellieten deze add-on tegelijk mogen gebruiken
+      (standaard 2). Elk apparaat krijgt een eigen gesprek en een eigen
+      lichtring, dus een opdracht aan het ene apparaat wordt daar afgehandeld
+      en het andere blijft rustig. Een apparaat boven dit aantal wordt netjes
+      geweigerd — wie al verbonden is, wordt nooit weggeduwd.
+  zan_tpm_limit:
+    name: "⚙️ Geavanceerd · Tokenlimiet per minuut (alle apparaten)"
+    description: >-
+      Het tokenbudget per minuut dat ALLE spraakapparaten delen; hieruit komt
+      het "resterend" dat naar de apparaten gaat. OpenAI telt tokens per
+      account, niet per apparaat (standaard 40000).
+  zan_denni_strop_tokenu:
+    name: "⚙️ Geavanceerd · Dagelijks tokenbudget (alle apparaten)"
+    description: >-
+      Dagelijks tokenbudget voor alle spraakapparaten samen. 0 (standaard) =
+      uit, verbruik wordt alleen gelogd. Met een waarde waarschuwt het log bij
+      80 % en bij 100 %.
+  zan_denni_strop_tvrdy:
+    name: "⚙️ Geavanceerd · Dagbudget afdwingen"
+    description: >-
+      Aan: een NIEUW spraakapparaat wordt geweigerd zodra het dagbudget op is.
+      Een apparaat dat al verbonden is, wordt nooit midden in een zin
+      afgekapt. Standaard uit — het budget waarschuwt dan alleen.
   transcription_model:
     name: "⚙️ Geavanceerd · Transcriptmodel"
     description: >-

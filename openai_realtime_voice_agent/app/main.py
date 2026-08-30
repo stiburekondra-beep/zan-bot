@@ -3,19 +3,26 @@ import os
 import sys
 import asyncio
 import logging
-import time
+# `time` se sem už neimportuje: jediný, kdo ho v main.py používal, bylo
+# per-relační okno spotřeby v `_handle_evt_response_done` — to od 30. 8. 2026
+# počítá sdílená peněženka (app/budget.py) a měření času je tam.
 from typing import Optional
 import dotenv
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask
+# Pipeline/PipelineRunner/PipelineTask se sem už neimportují: pipeline nestaví
+# aplikace, ale most pro každý satelit zvlášť (app/websocket_handler.py).
+# TTS rámce a FunctionCallResultProperties tu taky nejsou: rychlá dráha se
+# 30. 8. 2026 přestěhovala do app/fastlane_mixin.py, ať se neudržuje zvlášť
+# pro OpenAI a zvlášť pro Gemini pusu.
 from pipecat.services.llm_service import LLMService
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
 from app import config_source
+from app.budget import SharedBudget
+from app.client_registry import ClientSlot, DEFAULT_MAX_CLIENTS
 from app.fastlane_mixin import FastLaneMixin
 from app.gemini_tools import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_VOICE
 from app.mcp_service import HomeAssistantMCPService
+from app.phase_emitter import TurnLiveness
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
@@ -121,32 +128,46 @@ class SafeRealtimeLLMService(FastLaneMixin, OpenAIRealtimeLLMService):
         return
 
     async def _handle_evt_response_done(self, evt):  # type: ignore[override]
-        """Keep Pipecat metrics and expose cache + the local 40k/min budget."""
+        """Keep Pipecat metrics and report usage into the SHARED budget.
+
+        SDÍLENÁ PENĚŽENKA (2026-08-30). Účtování dřív viselo na instanci téhle
+        služby, což stačilo, dokud byla v procesu jedna. Se dvěma satelity má
+        každý vlastní relaci — a kdyby si každý počítal svoje okno, projely by
+        spolu limit dvojnásobnou rychlostí a obě relace by přitom hlásily
+        „jsem v polovině". Limit u OpenAI je na ÚČET, ne na relaci, takže se
+        počítá dohromady (`app/budget.py`).
+        """
         await super()._handle_evt_response_done(evt)
         usage = getattr(evt.response, "usage", None)
         if not usage:
             return
-        now = time.monotonic()
-        if not hasattr(self, "_zan_usage_window_start") or now - self._zan_usage_window_start >= 60:
-            self._zan_usage_window_start = now
-            self._zan_usage_window_tokens = 0
         total = int(getattr(usage, "total_tokens", 0) or 0)
-        self._zan_usage_window_tokens += total
         details = getattr(usage, "input_token_details", None)
         cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+
+        budget = getattr(self, "zan_budget", None)
+        client_id = getattr(self, "zan_client_id", "?")
+        if budget is None:
+            # Bez sdílené peněženky (starý/testovací kód) se aspoň nespadne.
+            snap = {"limit": 0, "remaining": 0, "window_tokens": total, "reset_seconds": 0}
+        else:
+            snap = budget.note_usage(client_id, total)
         logger.info(
-            "Žán usage: total=%d input=%d cached=%d cache_ratio=%.1f%% window=%d/40000",
-            total, input_tokens, cached, (100.0 * cached / input_tokens) if input_tokens else 0.0,
-            self._zan_usage_window_tokens,
+            "Žán usage [%s]: total=%d input=%d cached=%d cache_ratio=%.1f%% "
+            "okno_domu=%d/%s den=%d/%s",
+            client_id, total, input_tokens, cached,
+            (100.0 * cached / input_tokens) if input_tokens else 0.0,
+            snap.get("window_tokens", 0), snap.get("limit") or "∞",
+            snap.get("day_tokens", 0), snap.get("day_limit") or "∞",
         )
-        broadcaster = getattr(self, "zan_broadcast_json", None)
-        if broadcaster:
-            await broadcaster({
+        send = getattr(self, "zan_broadcast_json", None)
+        if send:
+            await send({
                 "type": "usage",
-                "remaining": max(0, 40000 - self._zan_usage_window_tokens),
-                "limit": 40000,
-                "reset_seconds": max(0, int(60 - (now - self._zan_usage_window_start))),
+                "remaining": snap.get("remaining", 0),
+                "limit": snap.get("limit", 0),
+                "reset_seconds": snap.get("reset_seconds", 0),
                 "cached_input_tokens": cached,
             })
 
@@ -253,18 +274,22 @@ class Application:
     
     def __init__(self):
         """Initialize application."""
-        self.pipeline: Optional[Pipeline] = None
-        self.runner: Optional[PipelineRunner] = None
         self.websocket_handler: Optional[WebSocketHandler] = None
-        self.websocket_transport: Optional[WebsocketServerTransport] = None
-        # Pusa (OpenAI Realtime NEBO Gemini Live). Jméno atributu zůstává
-        # `openai_service`, aby se nemuselo přepisovat půl mostu; typ je od
-        # 30. 8. 2026 obecná pipecat LLM služba.
+        # Od 2026-08-30 tu NENÍ jedna pipeline ani jedna OpenAI relace:
+        # každý satelit má svoje a drží si je `ClientSlot` v registru mostu
+        # (`websocket_handler.clients`) — proto zmizel i `websocket_transport`,
+        # transport se staví per satelit. Zůstává jen `openai_service` jako
+        # „naposledy vytvořená" — čte ji pár diagnostických cest.
+        #
+        # Pusa může být OpenAI Realtime NEBO Gemini Live, takže typ je obecná
+        # pipecat LLM služba; jméno atributu zůstává `openai_service`, aby se
+        # nemuselo přepisovat půl mostu.
         self.openai_service: Optional[LLMService] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
-        self.current_task: Optional[PipelineTask] = None
+        self.budget: Optional[SharedBudget] = None
+        self.max_clients: int = DEFAULT_MAX_CLIENTS
         self._pipeline_lock: Optional[asyncio.Lock] = None
         # Most na Žánův mozek (drží frontu témat + dispečera řeči) a task
         # endpointu /prubeh. Obojí vzniká až v initialize()/run(), ale
@@ -274,6 +299,9 @@ class Application:
         # Drát na plátnový session režim; vzniká v initialize(), ale
         # cleanup() na něj sahá i po havárii při startu.
         self.session_klient = None
+        # Kolik satelitů už mělo nahrávání — nahrávat se dá jen jeden (viz
+        # _build_client_session).
+        self._recording_client: Optional[str] = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -320,7 +348,7 @@ class Application:
         # service only auto-creates a response for the FIRST context (turn 1) and
         # after tool results; plain 2nd/3rd user turns get NO response unless the
         # server makes it. FALSE reproduces the old single-turn-only behaviour
-        # (turn 1 answers, turn 2 hangs in "thinking"). See _ensure_openai_service.
+        # (turn 1 answers, turn 2 hangs in "thinking"). See _create_openai_service.
         semantic_vad_create_response = os.environ.get("SEMANTIC_VAD_CREATE_RESPONSE", "true").strip().lower() == "true"
         # Expose the `disconnect_client` tool to the model. DEFAULT FALSE: on the
         # Voice PE the device owns its own session lifecycle (wake word starts a
@@ -519,6 +547,31 @@ class Application:
         except Exception as e:
             logger.warning(f"⚠️ Failed to initialize Home Assistant MCP Client: {e}")
         
+        # VÍC SATELITŮ NA JEDNOM MOSTĚ (2026-08-30). Strop je vědomý: dva
+        # satelity = Voice PE v domě + reSpeaker u televize. Třetí se ODMÍTNE
+        # (a zaloguje), místo aby někoho odkopl — přesně to se dělo do 26. 8.
+        try:
+            max_clients = int(os.environ.get("ZAN_MAX_KLIENTU", str(DEFAULT_MAX_CLIENTS)))
+        except (TypeError, ValueError):
+            max_clients = DEFAULT_MAX_CLIENTS
+        self.max_clients = max(1, max_clients)
+
+        # SDÍLENÝ ROZPOČET. Limit u OpenAI je na účet, ne na relaci — dva
+        # satelity by ho jinak vyčerpaly dvojnásobnou rychlostí bez varování.
+        try:
+            tpm_limit = int(os.environ.get("ZAN_TPM_LIMIT", "40000"))
+        except (TypeError, ValueError):
+            tpm_limit = 40000
+        try:
+            denni_strop = int(os.environ.get("ZAN_DENNI_STROP_TOKENU", "0"))
+        except (TypeError, ValueError):
+            denni_strop = 0
+        denni_tvrdy = os.environ.get("ZAN_DENNI_STROP_TVRDY", "false").strip().lower() == "true"
+        self.budget = SharedBudget(
+            tpm_limit=tpm_limit, daily_limit=denni_strop, hard_stop=denni_tvrdy
+        )
+        logger.info("💰 rozpočet mostu (sdílený všemi satelity): %s", self.budget.describe())
+
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
             host=websocket_host,
@@ -530,6 +583,8 @@ class Application:
             wake_open_delay_ms=wake_open_delay_ms,
             playback_prebuffer_ms=playback_prebuffer_ms,
             provider=self.pusa,
+            max_clients=self.max_clients,
+            budget=self.budget,
         )
         logger.info(
             f"🔁 Follow-up window: {follow_up_listen_seconds}s "
@@ -538,8 +593,7 @@ class Application:
             f"wake-open delay {wake_open_delay_ms}ms, "
             f"playback prebuffer {playback_prebuffer_ms}ms"
         )
-        self.websocket_transport = self.websocket_handler.create_transport()
-        
+
         # Store configuration for session creation
         self.openai_api_key = openai_api_key
         self.gemini_api_key = gemini_api_key
@@ -663,54 +717,96 @@ class Application:
         
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
     
-    def _build_pipeline_for_transport(self, transport: WebsocketServerTransport, client_id: str):
+    async def _build_client_session(self, slot: ClientSlot) -> None:
+        """Postavit CELOU relaci jednoho satelitu: transport → OpenAI → pipeline.
+
+        Tohle je jediné místo, kde se satelit „narodí". Všechno, co dostane, je
+        jeho vlastní — transport, serializér, OpenAI Realtime relace, fázový
+        kanál i hlídač otočky. Sdílené zůstává jen to, co sdílené BÝT MÁ:
+        mozek za `ask_zan`, HA nástroje, keš kontextu (klíčovaná per satelit)
+        a peněženka.
+
+        Volá to vstupní brána mostu (`WebSocketHandler._front_door`) pro každé
+        přijaté spojení, které prošlo stropem.
         """
-        Build pipeline for a WebSocket transport connection.
-        
-        Args:
-            transport: The WebSocket transport instance
-            client_id: Unique identifier for the client device
-        """
-        # Ensure OpenAI service exists
-        if self.openai_service is None:
-            raise RuntimeError("OpenAI service must be created before building pipeline")
-        
-        # Use WebSocket handler to build pipeline
-        self.pipeline, self.runner, self.current_task = self.websocket_handler.build_pipeline(
-            transport=transport,
-            openai_service=self.openai_service,
-            client_id=client_id,
-            activity_callback=self._update_session_activity
+        client_id = slot.client_id
+        transport, serializer = self.websocket_handler.create_client_transport(client_id)
+        slot.transport = transport
+        slot.serializer = serializer
+        slot.turn_liveness = TurnLiveness()
+
+        service = await self._create_openai_service(
+            client_id=client_id, transport=transport, turn_liveness=slot.turn_liveness
         )
-    
+        slot.service = service
+
+        # Nahrávání je diagnostický režim pro JEDEN kanál: `AudioRecordingService`
+        # vrací pořád tytéž instance `AudioFrameRecorder` a jeden FrameProcessor
+        # nesmí být ve dvou pipeline (pipecat si na něm přepisuje sousedy). Míchat
+        # dvě místnosti do jedné stopy by stejně nedávalo smysl — tak radši
+        # nahlas řekneme, že se nahrává jen ten první.
+        nahravat = False
+        if self.audio_recording_service and self.audio_recording_service.enable_recording:
+            if self._recording_client in (None, client_id):
+                self._recording_client = client_id
+                nahravat = True
+                self.audio_recording_service.start_new_session(client_id)
+            else:
+                logger.warning(
+                    "⚠️ nahrávání už běží pro %s — pro %s se NEzapíná "
+                    "(jeden zapisovač na proces)", self._recording_client, client_id,
+                )
+
+        (slot.pipeline, slot.runner, slot.task,
+         slot.phase_emitter, slot.runner_task) = self.websocket_handler.build_pipeline(
+            transport=transport,
+            openai_service=service,
+            client_id=client_id,
+            activity_callback=self._update_session_activity,
+            serializer=serializer,
+            turn_liveness=slot.turn_liveness,
+            enable_recorders=nahravat,
+        )
+
+    def _on_client_gone(self, client_id: str) -> None:
+        """Úklid po odpojeném satelitu, který nepatří do mostu samotného."""
+        if self.audio_recording_service and self._recording_client == client_id:
+            self.audio_recording_service.stop_recording()
+            self._recording_client = None
+
     def _update_session_activity(self):
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
-    
-    async def _ensure_openai_service(self, client_id: Optional[str] = None):
-        """Create a new OpenAI service instance for a client.
-        
+
+    async def _create_openai_service(
+        self,
+        client_id: str,
+        transport: Optional[WebsocketServerTransport] = None,
+        turn_liveness: Optional[TurnLiveness] = None,
+    ):
+        """Vyrobit NOVOU OpenAI Realtime relaci pro jeden satelit.
+
+        Vrací službu, nesahá na cizí. (Dřív se výsledek ukládal do
+        `self.openai_service`, což s víc satelity znamenalo, že poslední
+        připojený přebil relaci toho předchozího.)
+
         Args:
-            client_id: Optional client ID for session management
+            client_id: Unique identifier for the client device
+            transport: transport TOHOTO satelitu (pro `disconnect_client` tool)
+            turn_liveness: hlídač otočky tohoto satelitu
         """
         if self._pipeline_lock is None:
             self._pipeline_lock = asyncio.Lock()
-        
+
+        # Zámek drží jen SESTAVENÍ relace (načtení MCP schémat apod.), aby se
+        # dva souběžné connecty nervaly o tytéž zdroje. Běh pipeline už paralelní je.
         async with self._pipeline_lock:
-            if client_id is None:
-                logger.warning("⚠️ No client_id provided to _ensure_openai_service")
-            
-            # Create new session
-            if client_id:
-                logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
-            else:
-                logger.info("🆕 Creating new OpenAI Session...")
-            
+            logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
+
             # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
+            if self.session_manager is not None:
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
-                    logger.debug(f"Cached context from previous session for client {client_id}")
                 except Exception as e:
                     logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
             
@@ -777,7 +873,11 @@ class Application:
                     "🔧 Gemini session s %d nástroji: %s",
                     len(all_tools), [t.get("name", "unknown") for t in all_tools],
                 )
-                self.openai_service = build_gemini_service(
+                # Lokální `service`, ne `self.openai_service`: od multiklientu
+                # má KAŽDÝ satelit svou relaci (drží ji jeho `ClientSlot`).
+                # Přiřazení do `self.openai_service` („naposledy vytvořená",
+                # pro diagnostiku) je až na konci, společné pro obě pusy.
+                service = build_gemini_service(
                     api_key=self.gemini_api_key,
                     model=self.gemini_model,
                     voice=self.gemini_voice,
@@ -897,42 +997,51 @@ class Application:
                 logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
             
                 # Create new service instance
-                self.openai_service = SafeRealtimeLLMService(
+                service = SafeRealtimeLLMService(
                     api_key=self.openai_api_key,
                     model=self.model,
                     session_properties=session_properties,
                     start_audio_paused=False
                 )
-            self.openai_service.zan_broadcast_json = self.websocket_handler.broadcast_json
+            # ADRESNÝ KANÁL: účtenka o spotřebě i lokální potvrzení jdou na
+            # TENHLE satelit, ne broadcastem všem (jinak by se druhému satelitu
+            # rozsvítil prstenec kvůli povelu z jiné místnosti).
+            send_to_client = self.websocket_handler.json_sender(client_id)
+            service.zan_broadcast_json = send_to_client
+            service.zan_client_id = client_id
+            service.zan_budget = self.budget
+            service.turn_liveness = turn_liveness
             # Rychlá dráha potřebuje knihovnu frází a adresu pro zrcadlení —
             # služba se vytváří znovu při každém spojení, tak jí to předáme.
-            self.openai_service.fastlane_enabled = self.fastlane_enabled
-            self.openai_service.phrase_library = self.phrase_library
-            self.openai_service.zan_event_url = self.zan_event_url
-            self.openai_service.zan_event_token = self.zan_event_token
+            service.fastlane_enabled = self.fastlane_enabled
+            service.phrase_library = self.phrase_library
+            service.zan_event_url = self.zan_event_url
+            service.zan_event_token = self.zan_event_token
             if self.zan_bridge_enabled and self.zan_bridge is not None:
-                # Most přežívá spojení, mění se mu jen session pod rukama.
-                # `pripoj()` zároveň nastartuje dispečerskou smyčku a zahodí,
-                # co ve frontě zbylo po předchozím rozhovoru.
-                self.zan_bridge.pripoj(
-                    self.openai_service, self.websocket_handler.aktualni_faze
-                )
-                # Ze které krabice se ptají — jde do payloadu `/voice`.
+                # JEDEN MOZEK PRO CELÝ DŮM. `ask_zan` míří pořád na tentýž
+                # Žánův `/voice` (a tentýž chat) — dva satelity nesmí být dva
+                # Žáni s oddělenou pamětí. Most (`ZanBridge`) je proto taky
+                # JEDEN na celý běh: drží frontu témat a dispečera řeči, jen se
+                # mu `pripoj()` přepíná session pod rukama.
+                self.zan_bridge.pripoj(service, self.websocket_handler.aktualni_faze)
+                # Ze které krabice se ptají — jde do payloadu `/voice` jako
+                # `zdroj_zarizeni` (mapa IP → jméno v app/zdroj_zarizeni.py).
                 self.zan_bridge.nastav_zdroj(client_id)
-                self.openai_service.register_function("ask_zan", self.zan_bridge.handler)
+                service.register_function("ask_zan", self.zan_bridge.handler)
             logger.info(
-                f"✅ Pusa '{self.pusa}' vytvořena: {type(self.openai_service).__name__}"
+                f"✅ Pusa '{self.pusa}' vytvořena pro {client_id}: {type(service).__name__}"
             )
-            
+
+
             # Register disconnect tool handler (only when the tool is exposed)
-            if self.enable_disconnect_tool and not self.zan_bridge_enabled:
-                disconnect_tool_handler = create_disconnect_tool_handler(self.websocket_transport)
-                self.openai_service.register_function("disconnect_client", disconnect_tool_handler)
+            if self.enable_disconnect_tool and not self.zan_bridge_enabled and transport is not None:
+                disconnect_tool_handler = create_disconnect_tool_handler(transport)
+                service.register_function("disconnect_client", disconnect_tool_handler)
                 logger.info("✅ Registered disconnect tool handler")
 
             # Register web search tool handler (only when the tool is exposed)
             if self.enable_web_search:
-                self.openai_service.register_function(
+                service.register_function(
                     "web_search",
                     create_web_search_tool_handler(self.openai_api_key, self.web_search_model),
                 )
@@ -941,25 +1050,78 @@ class Application:
             # Register MCP tool handlers if available (rychlá dráha — i v bridge režimu)
             if self.mcp_client and mcp_tools_schema:
                 try:
-                    await self.mcp_client.register_tools_schema(mcp_tools_schema, self.openai_service)
+                    await self.mcp_client.register_tools_schema(mcp_tools_schema, service)
                     logger.info(f"✅ Registered {len(mcp_tools_schema.standard_tools)} MCP tool handlers")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to register MCP tool handlers: {e}")
-            
+
+            self._preseed_context(service)
+
             # Register service with session manager
             if client_id:
-                self.session_manager.set_current_service(client_id, self.openai_service)
-            
-            logger.info("✅ New OpenAI Session created")
-            return self.openai_service
-    
+                self.session_manager.set_current_service(client_id, service)
+
+            self.openai_service = service  # jen „naposledy vytvořená" (diagnostika)
+            logger.info(f"✅ New OpenAI Session created for {client_id}")
+            return service
+
+    def _preseed_context(self, service) -> None:
+        """Zabránit tomu, aby relace promluvila sama od sebe hned po spojení.
+
+        Pipecat 0.0.97 v `_handle_context` udělá `if not self._context: ...
+        await self._create_response()` — tedy PRVNÍ kontext, který kdy uvidí,
+        spustí skutečnou odpověď. Se `semantic_vad` + `create_response=True`
+        vyrábí odpověď i SERVER, takže první otočka uživatele by se zdvojila
+        (`conversation_already_has_active_response`: první otočka useknutá,
+        druhá zaseknutá). Předsazený prázdný kontext to spolkne za nás.
+
+        Dřív to bylo v `run()` jednou za start (byla jedna relace na proces).
+        Teď má relaci každý satelit, takže se to musí udělat KAŽDÉ z nich —
+        jinak by druhý satelit po připojení sám od sebe promluvil.
+
+        GEMINI PUSA tuhle záplatu NEPOTŘEBUJE: tam se týž problém (samovolná
+        řeč hned po startu) řeší přepínačem
+        `inference_on_context_initialization=False` v `build_gemini_service()`,
+        a `_context` je u pipecatí Gemini služby jiný objekt — předsazovat mu
+        prázdný LLMContext by jen zamotalo první tah.
+        """
+        if self.pusa != "openai":
+            return
+        if not (self.turn_detection_type == "semantic_vad" and self.semantic_vad_create_response):
+            return
+        try:
+            from pipecat.processors.aggregators.llm_context import LLMContext
+            if getattr(service, "_context", None) is None:
+                service._context = LLMContext()
+                # Pipecat navíc při PRVNÍM `_create_response` jednorázově
+                # „nastaví konverzaci" (znovu pošle zprávy kontextu jako
+                # ConversationItemCreate) — na čerstvé realtime relaci si ale
+                # OpenAI konverzaci staví samo z audia a volání nástrojů, takže
+                # by to jen zopakovalo, co už má, a první odpověď po nástroji
+                # vyjde jako nesmyslná vata. Vlajku proto shodíme rovnou.
+                if hasattr(service, "_llm_needs_conversation_setup"):
+                    service._llm_needs_conversation_setup = False
+                logger.info("🌱 relace předsazena prázdným kontextem (žádná řeč po připojení)")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
+
     async def run(self) -> None:
-        """Run the application."""
+        """Run the application.
+
+        Od 2026-08-30 se tu NESTAVÍ žádná pipeline dopředu. Dřív vznikla jedna
+        pipeline s klientem "server", protože port držel pipecatí transport —
+        a ten unese jen jednoho. Teď drží port vstupní brána mostu a pipeline
+        (i OpenAI relace) vzniká AŽ pro konkrétní připojený satelit, každému
+        vlastní. Vedlejší efekt: mizí i stará marnost, kdy se při každém
+        připojení vytvořila nová OpenAI relace, kterou už žádná pipeline
+        nepoužila.
+        """
         await self.initialize()
 
         # Endpoint `/prubeh` — kudy mozek posílá průběžné nálezy do fronty
         # témat (MLUVENI-ZANA-TECHNICKY.md §2). Fail-closed: bez tokenu se
-        # nespustí a jen se to zaloguje; hlas na něm nikdy nestojí.
+        # nespustí a jen se to zaloguje; hlas na něm nikdy nestojí. Je JEDEN
+        # na celý most, stejně jako fronta a dispečer — ne per satelit.
         if self.zan_bridge is not None:
             try:
                 self._prubeh_task = await spust_prubeh_server(self.zan_bridge.prijmi_prubeh)
@@ -971,101 +1133,12 @@ class Application:
         if self.session_klient is not None:
             self.session_klient.start()
 
-        # Create initial OpenAI service (will be replaced per connection)
-        await self._ensure_openai_service()
-        
-        # Build pipeline - based on pipecat-examples, one pipeline handles all connections
-        # The transport manages multiple connections internally
-        self._build_pipeline_for_transport(self.websocket_transport, "server")
-
-        # Consume pipecat's FIRST-context auto-response ONCE at startup — SILENTLY.
-        # WHY: pipecat 0.0.97's OpenAIRealtimeLLMService._handle_context does
-        # `if not self._context: ... await self._create_response()` — i.e. the
-        # very first context it ever sees triggers a real response. With
-        # semantic_vad create_response=True the SERVER also creates a response on
-        # every user turn, so the user's first turn would double-create →
-        # `conversation_already_has_active_response` (cut turn 1 short, hung
-        # turn 2). We previously consumed that path with a throwaway LLMRunFrame
-        # kickoff — but an LLMRunFrame runs `_create_response()`, producing a REAL
-        # (audible, tool-calling) reply. The old comment assumed it "goes to no
-        # device" because nothing is connected at startup; WRONG: when the user
-        # updates the add-on the device auto-reconnects within seconds and lands
-        # mid-kickoff (and its post-tool follow-up), so the device plays a
-        # spontaneous "answer" nobody asked for (observed: "Ik vond geen
-        # betrouwbare lamp in de gang" right after a restart).
-        #
-        # Fix: pre-set `self._context` to an empty LLMContext instead. Now the
-        # first REAL user turn hits the ELSE branch of _handle_context (no
-        # _create_response), the server creates that turn's response (semantic_vad
-        # create_response=True), and there's no double — AND no startup speech.
-        # The empty sentinel is harmlessly overwritten by the real context on the
-        # first turn (both branches do `self._context = context`).
-        #
-        # GEMINI PUSA tuhle záplatu NEPOTŘEBUJE: tam se týž problém (samovolná
-        # řeč hned po startu) řeší přepínačem
-        # `inference_on_context_initialization=False` v build_gemini_service(),
-        # a `_context` je u pipecatí Gemini služby jiný objekt — předsazovat mu
-        # prázdný LLMContext by jen zamotalo první tah.
-        if (self.pusa == "openai"
-                and self.turn_detection_type == "semantic_vad"
-                and self.semantic_vad_create_response):
-            try:
-                from pipecat.processors.aggregators.llm_context import LLMContext
-                if self.openai_service is not None and getattr(self.openai_service, "_context", None) is None:
-                    self.openai_service._context = LLMContext()
-                    # Also mark pipecat's one-time "conversation setup" as already
-                    # done. pipecat runs it on the FIRST _create_response: it
-                    # re-sends the context's messages as ConversationItemCreate
-                    # events, then flips _llm_needs_conversation_setup False. On a
-                    # fresh realtime session OpenAI already builds the conversation
-                    # from the live audio + tool-call flow, so that one-time setup
-                    # re-injects items OpenAI already has — which made the first
-                    # post-tool reply come out as a meaningless filler ("Ik ben
-                    # klaar om verder te gaan met het gesprek."). Instructions are
-                    # sent independently via _update_settings() on session.created,
-                    # so clearing this flag is safe and makes the first real turn a
-                    # normal reply.
-                    if hasattr(self.openai_service, "_llm_needs_conversation_setup"):
-                        self.openai_service._llm_needs_conversation_setup = False
-                    logger.info("🌱 Pre-seeded empty context + marked conversation setup done (no startup speech, no first-turn filler)")
-                else:
-                    logger.info("🌱 Startup context already set; skipping pre-seed")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not pre-seed startup context (turn-1 double may occur): {e}")
-
-        # Setup WebSocket event handlers
-        async def on_client_connected(client_id: str):
-            """Handle new client connection."""
-            await self._ensure_openai_service(client_id=client_id)
-            if self.audio_recording_service:
-                self.audio_recording_service.start_new_session(client_id)
-        
-        def on_client_disconnected(client_id: str):
-            """Handle client disconnection."""
-            if self.session_manager:
-                self.session_manager.handle_client_disconnect(client_id, self.openai_service)
-            if self.audio_recording_service:
-                self.audio_recording_service.stop_recording()
-        
-        # Function to get the active pusa (OpenAI Realtime / Gemini Live) for a client
-        def get_openai_service_for_client(client_id: str) -> Optional[LLMService]:
-            """Get the LLM service (pusa) for a specific client."""
-            if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
-            return self.openai_service
-        
-        self.websocket_handler.setup_event_handlers(
-            transport=self.websocket_transport,
-            on_client_connected_callback=on_client_connected,
-            on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
-        )
-        
         try:
-            # Start the pipeline runner - this will start the WebSocket server
-            # Based on pipecat-examples: PipelineRunner.run() starts the transport server
-            logger.info("✅ Starting WebSocket server and pipeline...")
-            await self.runner.run(self.current_task)
+            logger.info("✅ Starting WebSocket server (multiklient)...")
+            await self.websocket_handler.serve_forever(
+                build_client_session=self._build_client_session,
+                on_client_gone=self._on_client_gone,
+            )
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
         except Exception as e:
@@ -1073,7 +1146,7 @@ class Application:
             raise
         finally:
             await self.cleanup()
-    
+
     async def cleanup(self) -> None:
         """Cleanup resources."""
         logger.info("Cleaning up application...")
@@ -1096,12 +1169,9 @@ class Application:
         if prubeh_task is not None and not prubeh_task.done():
             prubeh_task.cancel()
 
-        if self.runner:
-            try:
-                await self.runner.cancel()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cancelling runner: {e}")
-        
+        # Pipeline už nepatří aplikaci, ale jednotlivým satelitům — zruší je
+        # úklid mostu (`WebSocketHandler.cleanup` → `_teardown` každého slotu);
+        # proto tu zmizelo `self.runner.cancel()`, žádný `self.runner` není.
         if self.websocket_handler:
             try:
                 await self.websocket_handler.cleanup()

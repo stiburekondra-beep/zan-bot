@@ -110,13 +110,19 @@ class FastLaneMixin:
                 except Exception as e:  # pragma: no cover
                     logger.warning(f"⚠️ fast-lane klasifikace selhala: {e!r}")
 
-            TURN_LIVENESS.tool_started()
+            # Hlídač „myslím" musí koukat na nástroje TOHOTO satelitu. Kdyby se
+            # sdílel (modulový TURN_LIVENESS), web search u televize by držel
+            # hlídače i satelitu v domě a jeho mrtvá otočka by se neodblokovala.
+            # `turn_liveness` na službu věší main.py při stavbě relace satelitu;
+            # bez něj (starý/testovací kód) se spadne na modulový.
+            liveness = getattr(self, "turn_liveness", None) or TURN_LIVENESS
+            liveness.tool_started()
             try:
                 if plan is not None:
                     return await self._run_fast_lane(plan, function_name, handler, params)
                 return await handler(params)
             finally:
-                TURN_LIVENESS.tool_finished()
+                liveness.tool_finished()
 
         super().register_function(
             function_name, liveness_tracked, start_callback, cancel_on_interruption=False

@@ -86,8 +86,14 @@ class TurnLiveness:
     main.py) to tick this on start/finish. The PhaseEmitter's thinking
     watchdog reads it so a slow tool — web search regularly takes 10-20 s with
     zero pipeline traffic — is never mistaken for a dead turn, and so each
-    step of a long tool chain refreshes the window. Module-level singleton:
-    one pipeline per process.
+    step of a long tool chain refreshes the window.
+
+    JEDNA INSTANCE NA SATELIT (2026-08-30). Dokud běžela jedna pipeline na
+    proces, stačil modulový singleton. S víc satelity by ale nástroj běžící
+    u televize držel hlídače „myslím" i tomu satelitu v domě — jeho zaseknutá
+    otočka by se nikdy neodblokovala, protože „nějaký tool přece běží".
+    Každý satelit proto dostane vlastní instanci (main.py) a `TURN_LIVENESS`
+    níž zůstává jen jako výchozí hodnota pro starý kód a testy.
     """
 
     def __init__(self) -> None:
@@ -120,19 +126,25 @@ class PhaseEmitter(FrameProcessor):
     # How often to log that we're deliberately waiting on a running tool.
     INFLIGHT_LOG_EVERY_S = 30.0
 
-    def __init__(self, send_phase, idle_debounce_s: float = None, **kwargs):
+    def __init__(self, send_phase, idle_debounce_s: float = None,
+                 turn_liveness: "TurnLiveness" = None, **kwargs):
         """
         Args:
             send_phase: async callable(value: str) that delivers the phase to
-                the connected device(s).
+                the connected device(s). Od 2026-08-30 je to ADRESNÝ kanál
+                jednoho satelitu (`WebSocketHandler.phase_sender`), ne broadcast.
             idle_debounce_s: seconds the bot must stay silent after a reply
                 before we declare the turn idle. Defaults to the
                 PHASE_IDLE_DEBOUNCE_MS env var (1500 ms) — long enough to bridge
                 the inter-sentence / tool-call gaps in OpenAI Realtime TTS so the
                 LED and the "stop" wake word stay active for the whole answer.
+            turn_liveness: `TurnLiveness` TOHOTO satelitu. Bez něj se použije
+                modulový singleton (zpětná kompatibilita) — s víc satelity by
+                ale hlídač koukal i na cizí nástroje, viz TurnLiveness.
         """
         super().__init__(**kwargs)
         self._send_phase = send_phase
+        self._liveness = turn_liveness if turn_liveness is not None else TURN_LIVENESS
         if idle_debounce_s is None:
             try:
                 idle_debounce_s = float(os.environ.get("PHASE_IDLE_DEBOUNCE_MS", "1500")) / 1000.0
@@ -259,7 +271,7 @@ class PhaseEmitter(FrameProcessor):
         # while a tool is in flight); the tool's result response then flips the
         # phase to `replying`. Fast tools never reach here — their result reply
         # cancels this debounce first.
-        if TURN_LIVENESS.in_flight > 0:
+        if self._liveness.in_flight > 0:
             await self._emit("thinking")
             self._arm_watchdog()
             return
@@ -275,8 +287,8 @@ class PhaseEmitter(FrameProcessor):
                 if self._current != "thinking":
                     return  # phase moved on — turn is alive, watchdog done
                 now = time.monotonic()
-                last = max(armed_at, TURN_LIVENESS.last_activity)
-                if TURN_LIVENESS.in_flight > 0:
+                last = max(armed_at, self._liveness.last_activity)
+                if self._liveness.in_flight > 0:
                     # A tool is running — the turn is alive by definition, and
                     # a long web search must get all the time it needs (no
                     # cap; see the module docstring). Log occasionally so a
@@ -284,7 +296,7 @@ class PhaseEmitter(FrameProcessor):
                     if now - last_inflight_log >= self.INFLIGHT_LOG_EVERY_S:
                         last_inflight_log = now
                         logger.info(
-                            f"⏳ thinking-watchdog: {TURN_LIVENESS.in_flight} tool(s) "
+                            f"⏳ thinking-watchdog: {self._liveness.in_flight} tool(s) "
                             f"running for {now - last:.0f}s — waiting (no cap)"
                         )
                     continue

@@ -115,6 +115,18 @@ Every option has a description on the **Configuration** tab. The ones worth know
   into the fresh follow-up mic and become a ghost turn (the assistant "answers
   nobody" or repeats itself); raise the prebuffer if you hear crackle at the
   start of replies.
+- **`zan_max_klientu`** (default `2`) — how many voice satellites may use the
+  bridge at the same time. Each one gets its own OpenAI Realtime session and its
+  own phase channel, so a command spoken in one room is handled there and the
+  other device stays idle. A connection beyond the cap is **refused** (the device
+  gets `{"type":"busy"}` and close code `1013`); nobody who is already connected
+  is ever kicked off.
+- **`zan_tpm_limit` / `zan_denni_strop_tokenu` / `zan_denni_strop_tvrdy`** — the
+  token budget is **shared by all satellites**, because OpenAI's limit is per
+  account, not per session. The daily cap defaults to `0` (off, usage is only
+  logged); crossing 80 % and 100 % is logged as a warning. With
+  `zan_denni_strop_tvrdy: true` a *new* satellite is refused once the daily cap
+  is spent — a satellite that is already connected is never cut off mid-sentence.
 
 ## 7. Reading the logs
 
@@ -133,6 +145,12 @@ The add-on log shows each turn: `🗣️ user:` (when transcription language is 
   rarely notice it, but a reconnect can occasionally cause a ~1–2 second pause.
 - **Rarely, the assistant may stop itself** on a word in its own reply that sounds
   like "stop" — just ask again.
+- **Satellites are told apart by IP address.** Two devices behind the same NAT
+  address would be treated as one (the second is seen as a reconnect of the
+  first). On a normal LAN, where each device has its own address, this is a
+  non-issue.
+- **Audio recording (debug) covers one satellite only** — the first one that
+  connects. The log says which.
 
 **Using "stop":** say "stop" (or press the center button) to interrupt the assistant
 *while it's speaking* — during a reply, or during the short listening window right
