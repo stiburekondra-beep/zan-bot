@@ -20,6 +20,7 @@ from app import config_source
 from app.budget import SharedBudget
 from app.client_registry import ClientSlot, DEFAULT_MAX_CLIENTS
 from app.fastlane_mixin import FastLaneMixin
+from app.pusa_fallback import read_fallback
 from app.gemini_tools import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_VOICE
 from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TurnLiveness
@@ -89,11 +90,27 @@ logger.info(
 #: NE přes ``config_source`` — add-on o téhle volbě nic neví a nemá se měnit;
 #: přepínač patří do světa kontejneru (docker ``env_file`` / ``.env``).
 def _resolve_pusa() -> str:
-    """``ZAN_PUSA`` → ``openai`` | ``gemini``; nesmysl spadne na ``openai``."""
+    """``ZAN_PUSA`` → ``openai`` | ``gemini``; nesmysl spadne na ``openai``.
+
+    Navíc respektuje značku po terminálním pádu gemini pusy
+    (``app/pusa_fallback.py``): když ji předchozí běh po sobě nechal, most
+    naběhne na openai, i když env pořád říká gemini. Bez toho by se most po
+    vlastní záchranné brzdě zvedl zpátky do gemini a zacyklil se v restartech.
+    """
     pusa = os.environ.get("ZAN_PUSA", "openai").strip().lower()
     if pusa not in ("openai", "gemini"):
         logger.warning("⚠️ Neznámá ZAN_PUSA %r — jedu na 'openai'", pusa)
         return "openai"
+    if pusa == "gemini":
+        duvod = read_fallback()
+        if duvod:
+            logger.warning(
+                "🛟 ZÁLOŽNÍ PUSA: env říká gemini, ale předchozí běh po sobě nechal "
+                "značku pádu (%s) — startuju na 'openai'. Značku zahodí až vědomý "
+                "recreate (docker compose up -d); prostý restart ji nechává platit.",
+                duvod,
+            )
+            return "openai"
     return pusa
 
 

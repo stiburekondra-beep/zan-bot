@@ -38,7 +38,9 @@ protože je do pipeline vrací výstupní transport (a ty jsou pro LED to hlavn�
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from google.genai.types import EndSensitivity
@@ -52,6 +54,7 @@ from pipecat.services.google.gemini_live.llm import (
 )
 
 from app.fastlane_mixin import FastLaneMixin
+from app.pusa_fallback import fallback_path, write_fallback
 from app.gemini_tools import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_VOICE,
@@ -68,6 +71,20 @@ logger = logging.getLogger(__name__)
 #: live-preview`` ho naopak přijme. Jméno modelu jde přes ``normalize_model_name``
 #: (prefix ``models/``), substring test to nerozhodí.
 _LANGUAGE_UNSUPPORTED_MARKERS = ("2.5", "native-audio")
+
+#: Kolik sekund necháme doznít oznámení, než proces ukončíme. Krátké schválně:
+#: cílem je RYCHLÉ čisté selhání, ne elegantní odchod.
+_EXIT_DELAY_S = 2.0
+
+#: Návratový kód "dočasné selhání" (EX_TEMPFAIL) — v ``docker inspect`` je pak
+#: vidět, že most odešel vlastní brzdou, ne že ho někdo zabil.
+_EXIT_CODE = 75
+
+
+def _tvrdy_konec() -> None:
+    """Doopravdy ukončí proces. ``sys.exit`` uvnitř tasku by zabil jen task."""
+    logging.shutdown()
+    os._exit(_EXIT_CODE)
 
 
 class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
@@ -94,6 +111,8 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
             **kwargs: Předává se beze změny do ``GeminiLiveLLMService``.
         """
         super().__init__(**kwargs)
+        # Brzda terminálního pádu smí proběhnout jen jednou za život služby.
+        self._pusa_brzda_spustena = False
         if not drop_language_code:
             return
         model_name = str(getattr(self, "_model_name", "") or "")
@@ -107,6 +126,93 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
             self._settings["language"] = "cs-CZ"
             self._language_code = "cs-CZ"
             logger.info("🌐 Gemini: languageCode=cs-CZ (%s)", model_name)
+
+    async def _handle_connection_error(self, error: Exception) -> bool:  # type: ignore[override]
+        """Terminální pád gemini pusy nesmí skončit smyčkou ``ErrorFrame``.
+
+        CO SE DĚJE BEZ TÉHLE BRZDY (incident 30. 8. 2026, 18:34 — Ondra stál
+        u němé krabičky): pipecat po třetím selhání v řadě
+        (``MAX_CONSECUTIVE_FAILURES``) vrátí z ``_handle_connection_error``
+        ``False``, čímž ``_connection_task_handler`` skončí ``break``. Tou
+        cestou se ale NIKDY nezavolá ``_disconnect()``, takže ``self._session``
+        zůstane viset jako ZAVŘENÝ, ale pravdivý objekt. Guardy
+        ``not self._session`` v ``_send_user_audio`` i ``_handle_send_error``
+        ho propustí, takže každý dvacetimilisekundový kus mikrofonu vyrobí
+        další ``push_error`` — tisíce ``ErrorFrame`` za minutu a most, který
+        už nikdy nepromluví.
+
+        CO DĚLÁME MÍSTO TOHO: (1) vynulujeme session, čímž se ty dva pipecatí
+        guardy začnou chytat a spam ustane u zdroje, (2) jednou poctivě
+        zalogujeme příčinu, (3) řekneme to člověku u krabičky, (4) necháme po
+        sobě značku a rychle a čistě spadneme — ``restart: unless-stopped``
+        most do ~15 s zvedne a ``_resolve_pusa()`` ho podle značky pustí na
+        openai pusu.
+
+        PROČ NE VÝMĚNA SLUŽBY ZA BĚHU: pipeline se v pipecatu 0.0.97 staví
+        jednou a instance služby je zadrátovaná v řetězu procesorů. Výměna za
+        provozu je řádově složitější než restart a most tu nemá co držet —
+        session je stejně po smrti. Jednoduchost je tady ta bezpečnější volba.
+        """
+        should_reconnect = await super()._handle_connection_error(error)
+        if should_reconnect:
+            return True
+        if self._pusa_brzda_spustena:
+            return False
+        self._pusa_brzda_spustena = True
+        try:
+            await self._predej_pusu_openai(error)
+        except Exception as e:  # pragma: no cover - brzda nesmí sama spadnout
+            logger.exception("💥 brzda gemini pusy sama selhala: %r", e)
+        return False
+
+    async def _predej_pusu_openai(self, error: Exception) -> None:
+        """Zastaví sesypání, oznámí to a předá pusu zpět OpenAI přes restart."""
+        # 1) ZASTAVIT SPAM HNED — musí být první, ještě než cokoli awaitneme.
+        self._session = None
+        self._disconnecting = True
+        logger.error(
+            "💀 Gemini pusa terminálně selhala (%s selhání v řadě, poslední: %s: %s). "
+            "Session vynulována, sesypání do ErrorFrame zastaveno.",
+            getattr(self, "_consecutive_failures", "?"),
+            type(error).__name__,
+            error,
+        )
+
+        # 2) Člověk u krabičky musí vědět, co se stalo. Obojí jde MIMO Gemini:
+        #    play_phrase tlačí PCM rovnou do výstupního transportu, takže
+        #    funguje i s mrtvou session. Když fráze nahraná není, jen se to
+        #    zaloguje — nic se nepředstírá.
+        try:
+            await self.play_phrase("zaloha_pusa")
+        except Exception as e:
+            logger.warning("⚠️ oznámení o přepnutí pusy se nepovedlo: %r", e)
+        try:
+            broadcast = getattr(self, "zan_broadcast_json", None)
+            if broadcast is not None:
+                # LED nesmí zůstat viset v "thinking" nad mrtvou session.
+                await broadcast({"type": "phase", "value": "idle"})
+        except Exception as e:
+            logger.warning("⚠️ fáze 'idle' po pádu pusy neodešla: %r", e)
+
+        # 3) Značka MUSÍ být ověřeně na disku, teprve pak smíme spadnout. Pád
+        #    bez značky = restart zpátky do gemini = restart-smyčka, což je
+        #    horší než němý most. Proto fail-closed směrem k "nepadat".
+        if not write_fallback("%s: %s" % (type(error).__name__, error)):
+            logger.error(
+                "🛑 POPLACH: značku pádu (%s) NEJDE zapsat — proto NEPADÁM, "
+                "restart by naběhl zpátky do gemini a zacyklil se. Most zůstává "
+                "stát potichu (bez ErrorFrame) a čeká na ruku: ZAN_PUSA=openai "
+                "v /etc/zan/realtime.env + recreate.",
+                fallback_path(),
+            )
+            return
+
+        logger.error(
+            "🛟 Značka zapsána (%s) — za %.1f s ukončuji proces (exit %d). "
+            "Docker mě zvedne a most naběhne na openai pusu.",
+            fallback_path(), _EXIT_DELAY_S, _EXIT_CODE,
+        )
+        asyncio.get_running_loop().call_later(_EXIT_DELAY_S, _tvrdy_konec)
 
     async def _handle_msg_usage_metadata(self, message):  # type: ignore[override]
         """Nechá pipecat spočítat metriky a k tomu jeden řádek do logu.
