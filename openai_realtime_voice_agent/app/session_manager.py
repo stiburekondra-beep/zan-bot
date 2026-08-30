@@ -1,10 +1,17 @@
-"""Session management with context caching for OpenAI Realtime API."""
+"""Session management with context caching for the active voice service.
+
+Typy jsou od 30. 8. 2026 psané na obecnou ``pipecat.services.llm_service.LLMService``,
+ne na ``OpenAIRealtimeLLMService``: most má dvě pusy (OpenAI Realtime a Gemini
+Live, přepínač ``ZAN_PUSA``) a obě sem chodí stejnou cestou. Logika sama je na
+poskytovateli nezávislá — pracuje jen s ``LLMContext`` a s atributem
+``_context``, který mají obě služby.
+"""
 import logging
 import time
 from typing import Optional, Dict
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.services.llm_service import LLMService
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, StartFrame, LLMMessagesUpdateFrame
 
@@ -48,7 +55,7 @@ class SessionManager:
         # Dictionary mapping client_id to ContextCacheEntry
         self.context_caches: Dict[str, ContextCacheEntry] = {}
         # Dictionary mapping client_id to current service
-        self.current_services: Dict[str, OpenAIRealtimeLLMService] = {}
+        self.current_services: Dict[str, LLMService] = {}
         # Dictionary mapping client_id to context aggregator pair
         self.context_aggregators: Dict[str, LLMContextAggregatorPair] = {}
     
@@ -76,7 +83,7 @@ class SessionManager:
             del self.context_caches[client_id]
             return None
     
-    def cache_context_from_service(self, client_id: str, service: OpenAIRealtimeLLMService):
+    def cache_context_from_service(self, client_id: str, service: LLMService):
         """Extract and cache context from a service before it's closed.
         
         Args:
@@ -167,18 +174,18 @@ class SessionManager:
             logger.info(f"🆕 Creating new empty context for client {client_id}")
             return LLMContext()
     
-    def get_current_service(self, client_id: str) -> Optional[OpenAIRealtimeLLMService]:
+    def get_current_service(self, client_id: str) -> Optional[LLMService]:
         """Get current OpenAI service for a specific client.
         
         Args:
             client_id: Unique identifier for the client device
             
         Returns:
-            Current OpenAIRealtimeLLMService if exists, None otherwise
+            Current LLMService if exists, None otherwise
         """
         return self.current_services.get(client_id)
     
-    def set_current_service(self, client_id: str, service: OpenAIRealtimeLLMService):
+    def set_current_service(self, client_id: str, service: LLMService):
         """Set the current active service for a client.
         
         Args:
@@ -255,7 +262,7 @@ class SessionManager:
             )
         return None
     
-    def handle_client_disconnect(self, client_id: str, service: Optional[OpenAIRealtimeLLMService] = None):
+    def handle_client_disconnect(self, client_id: str, service: Optional[LLMService] = None):
         """Handle client disconnection by caching context.
         
         Args:

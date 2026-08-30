@@ -10,7 +10,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.services.llm_service import LLMService
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame, EndFrame, ErrorFrame
@@ -33,6 +33,21 @@ logger = logging.getLogger(__name__)
 # 16 kHz frames would be read 1.5x too fast / pitched up, garbling the whole
 # transcript. The InputResampler below upsamples 16k->24k in the pipeline.
 PIPELINE_SAMPLE_RATE = 24000
+
+# GEMINI PUSA (ZAN_PUSA=gemini) chce vstup v 16 kHz. Na rozdíl od OpenAI, kde
+# je vstupní rychlost napevno 24 kHz (`PCMAudioFormat.rate = Literal[24000]`),
+# posílá pipecatí GeminiLiveLLMService rychlost s KAŽDÝM kusem zvuku
+# (`audio/pcm;rate={frame.sample_rate}`) a Live API očekává 16 kHz PCM16 — což
+# je přesně to, co Voice PE streamuje. V gemini větvi se tedy nepřevzorkovává
+# vůbec (InputResampler projde naprázdno) a ušetří se převod tam a zpět.
+# VÝSTUP zůstává v obou větvích 24 kHz: tolik vrací OpenAI Realtime i Gemini
+# Live a v 24 kHz je i knihovna přednahraných frází (voice_fastlane.SAMPLE_RATE).
+GEMINI_INPUT_SAMPLE_RATE = 16000
+
+
+def input_sample_rate_for(provider: str) -> int:
+    """Vstupní rychlost pipeline podle pusy (`openai` = 24k, `gemini` = 16k)."""
+    return GEMINI_INPUT_SAMPLE_RATE if provider == "gemini" else PIPELINE_SAMPLE_RATE
 
 
 class SessionActivityTracker(FrameProcessor):
@@ -338,6 +353,7 @@ class WebSocketHandler:
         follow_up_open_delay_ms: int = 700,
         wake_open_delay_ms: int = 700,
         playback_prebuffer_ms: int = 0,
+        provider: str = "openai",
     ):
         """
         Initialize WebSocket handler.
@@ -356,7 +372,11 @@ class WebSocketHandler:
             wake_open_delay_ms: How long (ms) the device waits after the wake
                 chime before opening the mic, so the chime's hardware tail can't
                 leak into the fresh mic as a ghost turn. Sent in `hello`.
+            provider: Která pusa jede — `openai` (výchozí) nebo `gemini`.
+                Řídí vstupní rychlost zvuku a to, jestli se do pipeline zapojí
+                ConnectionRecovery a OpenAI-specifické záchranné brzdy.
         """
+        self.provider = (provider or "openai").strip().lower()
         self.host = host
         self.port = port
         self.session_manager = session_manager
@@ -395,6 +415,7 @@ class WebSocketHandler:
 
         # Create WebsocketServerTransport with WebsocketServerParams
         # The transport will start its own server automatically
+        audio_in_rate = input_sample_rate_for(self.provider)
         self.transport = WebsocketServerTransport(
             host=self.host,
             port=self.port,
@@ -402,18 +423,21 @@ class WebSocketHandler:
                 serializer=serializer,
                 audio_in_enabled=True,
                 audio_out_enabled=True,
-                audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+                audio_in_sample_rate=audio_in_rate,
                 audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
             )
         )
-        
-        logger.info(f"✅ WebSocket transport created - will listen on ws://{self.host}:{self.port}/")
+
+        logger.info(
+            f"✅ WebSocket transport created - will listen on ws://{self.host}:{self.port}/ "
+            f"(pusa={self.provider}, vstup {audio_in_rate} Hz, výstup {PIPELINE_SAMPLE_RATE} Hz)"
+        )
         return self.transport
     
     def build_pipeline(
         self,
         transport: WebsocketServerTransport,
-        openai_service: OpenAIRealtimeLLMService,
+        openai_service: LLMService,
         client_id: str,
         activity_callback: Optional[Callable[[], None]] = None
     ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
@@ -461,16 +485,33 @@ class WebSocketHandler:
         # pipeline below, before transport.output().
         phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
 
-        pipeline_components = [
-            transport.input(),
+        pipeline_components = [transport.input()]
+
+        # ConnectionRecovery JEN pro openai pusu. Je celá postavená na OpenAI
+        # Realtime příznacích (`session_expired`, „maximum duration", 60minutový
+        # strop, `reset_conversation()`) — u Gemini by nic z toho nikdy
+        # nenamatchovalo, zato by jeho proaktivní „refresh" sahal na metodu,
+        # kterou Gemini služba nemá. Gemini Live má obnovu VESTAVĚNOU:
+        # `SessionResumptionConfig` v setupu + `_handle_connection_error()` /
+        # `_reconnect()` v pipecatu, které navazují na uložený resumption handle.
+        if self.provider == "openai":
             # Watch for OpenAI connection-death ErrorFrames (they travel upstream
             # to the task source, so place this upstream of the service) and
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
-            ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
-                               phase_emitter=phase_emitter),
-            InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
+            pipeline_components.append(
+                ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
+                                   phase_emitter=phase_emitter)
+            )
+        else:
+            logger.info(
+                "🔁 ConnectionRecovery vynechána (pusa=%s) — Gemini Live má session "
+                "resumption vestavěnou v pipecatu", self.provider
+            )
+
+        pipeline_components.extend([
+            InputResampler(out_rate=input_sample_rate_for(self.provider)),
             input_activity_tracker,
-        ]
+        ])
         
         # Add input audio recorder to capture ONLY InputAudioRawFrame
         input_recorder = self.audio_recording_service.get_input_recorder() if self.audio_recording_service else None
@@ -606,6 +647,20 @@ class WebSocketHandler:
             # the 1.5 s time-window alone misses responses that land later —
             # OpenAI replying to the spoken "stop", or a slow tool's answer.
             _kill_next_response["v"] = True
+            # GEMINI PUSA: Live API nemá protějšek `input_audio_buffer.clear`
+            # ani `response.cancel` — přerušení se na jeho straně řeší tím, že
+            # dorazí nový vstup, a zařízení si přehrávání umlčí samo. Uděláme
+            # tedy jen to, co jde: srovnáme pipeline (TTSStoppedFrame), ať
+            # navazující fáze/LED sedí. NEOVĚŘENO ŽIVĚ — jeden z bodů LAB A/B.
+            if self.provider != "openai":
+                try:
+                    handler = getattr(openai_service, "_handle_interruption", None)
+                    if handler is not None:
+                        await handler()
+                    logger.info("🛑 device interrupt (gemini) → pipeline srovnána, zařízení už mlčí")
+                except Exception as e:
+                    logger.info(f"🛑 device interrupt (gemini) no-op ({e!r})")
+                return
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
                 logger.info("🛑 device interrupt → input_audio_buffer.clear sent (drop in-flight user audio)")
@@ -620,29 +675,33 @@ class WebSocketHandler:
             except Exception as e:
                 logger.info(f"🛑 device interrupt → response.cancel no-op ({e!r})")
 
-        @openai_service.event_handler("on_conversation_item_created")
-        async def _kill_racing_response(service, item_id, item):
-            # Pipecat fires this for every conversation.item.added; only an
-            # ASSISTANT item right after a device interrupt is the racing
-            # response to the stop word the user just cancelled.
-            if getattr(item, "role", None) != "assistant":
-                return
-            within_window = time.monotonic() < _interrupt_kill_until["t"]
-            kill_armed = _kill_next_response["v"]
-            if not within_window and not kill_armed:
-                return
-            # Consume the flag: this assistant item is the unwanted response the
-            # user's stop pre-empted — a stop-acknowledgement ("Okay, I'll stop"),
-            # a stopped tool's answer, or the cancelled reply's tail.
-            _kill_next_response["v"] = False
-            try:
-                await openai_service.send_client_event(openai_rt_events.ResponseCancelEvent())
-                logger.info(
-                    "🛑 response raced in right after a device interrupt → "
-                    "response.cancel (post-stop)"
-                )
-            except Exception as e:
-                logger.info(f"🛑 post-interrupt racing-response cancel no-op ({e!r})")
+        # Post-stop „racing response“ killer je čistě OpenAI záležitost —
+        # visí na události `on_conversation_item_created`, kterou Gemini pusa
+        # vůbec nevydává (a `response.cancel` v Live API nemá protějšek).
+        if self.provider == "openai":
+            @openai_service.event_handler("on_conversation_item_created")
+            async def _kill_racing_response(service, item_id, item):
+                # Pipecat fires this for every conversation.item.added; only an
+                # ASSISTANT item right after a device interrupt is the racing
+                # response to the stop word the user just cancelled.
+                if getattr(item, "role", None) != "assistant":
+                    return
+                within_window = time.monotonic() < _interrupt_kill_until["t"]
+                kill_armed = _kill_next_response["v"]
+                if not within_window and not kill_armed:
+                    return
+                # Consume the flag: this assistant item is the unwanted response the
+                # user's stop pre-empted — a stop-acknowledgement ("Okay, I'll stop"),
+                # a stopped tool's answer, or the cancelled reply's tail.
+                _kill_next_response["v"] = False
+                try:
+                    await openai_service.send_client_event(openai_rt_events.ResponseCancelEvent())
+                    logger.info(
+                        "🛑 response raced in right after a device interrupt → "
+                        "response.cancel (post-stop)"
+                    )
+                except Exception as e:
+                    logger.info(f"🛑 post-interrupt racing-response cancel no-op ({e!r})")
 
         async def _on_device_session_start():
             # va_client sends {"type":"start"} once per WebSocket CONNECTION
@@ -651,6 +710,10 @@ class WebSocketHandler:
             # utterance in OpenAI's input buffer; start every (re)connection
             # with a clean one. The per-WAKE/follow-up stale-buffer case is
             # covered by the device's {"type":"flush"} on follow-up timeout.
+            # GEMINI: `input_audio_buffer.clear` v Live API neexistuje — vstup
+            # tam nemá klientem řízený buffer, server VAD si drží vlastní okno.
+            if self.provider != "openai":
+                return
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
                 logger.info("🎬 device (re)connected → input_audio_buffer.clear (clean start)")
@@ -666,6 +729,9 @@ class WebSocketHandler:
             # Also a turn boundary for the dangling-VAD guard: the follow-up
             # closed without speech, so any later server-VAD stop is dangling.
             phase_emitter.note_wake()
+            # GEMINI: viz _on_device_session_start — klientský buffer tam není.
+            if self.provider != "openai":
+                return
             try:
                 await openai_service.send_client_event(openai_rt_events.InputAudioBufferClearEvent())
                 logger.info("🧽 follow-up cut-off → input_audio_buffer.clear (drop partial utterance)")
@@ -763,7 +829,7 @@ class WebSocketHandler:
         transport: WebsocketServerTransport,
         on_client_connected_callback: Callable[[str], Awaitable[None]],
         on_client_disconnected_callback: Optional[Callable[[str], None]] = None,
-        openai_service_getter: Optional[Callable[[str], Optional[OpenAIRealtimeLLMService]]] = None
+        openai_service_getter: Optional[Callable[[str], Optional[LLMService]]] = None
     ):
         """
         Setup WebSocket event handlers.

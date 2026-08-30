@@ -12,7 +12,13 @@ python = ">=3.11,<3.14"
 # WebsocketServerParams). Without a lockfile pip otherwise resolves Pipecat
 # 1.x, whose changed API breaks the imports. 0.0.97 is the version this was
 # developed/tested against.
-pipecat-ai = {extras = ["mcp", "openai", "websocket"], version = "0.0.97"}
+# Extra "google" (2026-08-30) přidává google-genai a s ním
+# pipecat.services.google.gemini_live.GeminiLiveLLMService — druhou „pusu"
+# Žána, kterou zapíná env ZAN_PUSA=gemini (viz app/gemini_safety.py). Samotná
+# služba je v pipecatu 0.0.97 už obsažená; bez tohohle extra jen chybí
+# google-genai a import by spadl. Na openai pusu to nemá vliv — modul se
+# importuje až uvnitř gemini větve.
+pipecat-ai = {extras = ["mcp", "openai", "websocket", "google"], version = "0.0.97"}
 python-dotenv = ">=1.0.0"
 fastapi = ">=0.100.0"
 uvicorn = {extras = ["standard"], version = ">=0.23.0"}
