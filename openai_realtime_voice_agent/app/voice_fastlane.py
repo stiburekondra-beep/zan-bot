@@ -372,3 +372,27 @@ def build_event(plan: FastPlan, function_name: str, arguments: Optional[Dict[str
         "note": note,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+
+
+def build_exchange_event(kdo: str, text_user: str, text_asistent: str) -> dict:
+    """Zápis JEDNÉ konverzační výměny do denní paměti (karta -zana-12, bod
+    „most Realtime: … zapisovat i výměny vyřízené Realtime sám").
+
+    Realtime session je efemérní — co model vyřídí sám (small talk, žádný
+    `delegate_task`/HA nástroj), do denní paměti jinak vůbec nedoteče a
+    noční kompilace (`zan-code-server.js: runPametExtrakce`) má slepou
+    skvrnu. Tenhle záznam jde do stejného `POST /event` a stejného
+    `zan_data/udalosti.jsonl` jako akce rychlé dráhy (`build_event` výše),
+    jen s `typ: "vymena"` — server ho z večerního souhrnu akcí vyřadí
+    (viz `buildDenik` filtr `u.typ !== 'vymena'`), ale noční paměťová
+    extrakce čte celý soubor a výměnu uvidí.
+    """
+    return {
+        "typ": "vymena",
+        "source": "voice-realtime",
+        "kanal": "realtime",
+        "kdo": kdo or "voice",
+        "text_user": text_user or "",
+        "text_asistent": text_asistent or "",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
