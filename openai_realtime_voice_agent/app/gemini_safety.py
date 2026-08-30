@@ -10,10 +10,14 @@ Co tenhle soubor přidává nad pipecatí ``GeminiLiveLLMService``:
 1. **rychlou dráhu** (``FastLaneMixin``) — tatáž bezpečnostní brzda,
    přednahraná pusa a ověřování stavu v HA jako u OpenAI pusy. Sdílený kód,
    ne kopie: brzda na nevratné úkony se nesmí udržovat dvakrát,
-2. **vypnutý ``languageCode``** — Live API ho v ``speechConfig`` posílá vždy
-   (pipecat dosadí ``en-US``, když nic nenastavíš) a ``cs-CZ`` model 2.5
-   odmítá. Bez pole se čeština chová správně (sonda 30. 8. 2026: přepisy
-   i argumenty chodí v diakritice, ``{"mistnost": "obývák"}``),
+2. **``languageCode`` podle modelu** — Live API ho v ``speechConfig`` posílá
+   vždy (pipecat dosadí ``en-US``, když nic nenastavíš). Modely se v tomhle
+   chovají PROTICHŮDNĚ: ``2.5`` (native-audio) ho s ``cs-CZ`` odmítá chybou
+   1007 „Unsupported language code", zatímco ``3.1`` ho naopak PŘIJÍMÁ (sonda
+   30. 8. 2026: ``poc_1`` s ``gemini-3.1-flash-live-preview`` a
+   ``languageCode=cs-CZ`` prošel, přepisy i argumenty chodí v diakritice,
+   ``{"mistnost": "obývák"}``). Proto se u ``2.5``/``native-audio`` pole
+   zahazuje úplně a u ostatních (3.1) se posílá natvrdo ``cs-CZ``,
 3. **žádné ``audioStreamEnd``** — pipecat posílá mikrofon výhradně přes
    ``send_realtime_input(audio=…)`` a konec tahu nechává na server VAD. To je
    přesně varianta, která v sondě vyšla nejrychleji (běh D3: toolCall za
@@ -58,9 +62,16 @@ from app.gemini_tools import (
 
 logger = logging.getLogger(__name__)
 
+#: Podřetězce ve jméně modelu, které signalizují „``languageCode`` odmítá".
+#: Sonda 30. 8. 2026: ``gemini-2.5-flash-native-audio-preview…`` vrátí na
+#: ``cs-CZ`` chybu 1007 „Unsupported language code"; ``gemini-3.1-flash-
+#: live-preview`` ho naopak přijme. Jméno modelu jde přes ``normalize_model_name``
+#: (prefix ``models/``), substring test to nerozhodí.
+_LANGUAGE_UNSUPPORTED_MARKERS = ("2.5", "native-audio")
+
 
 class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
-    """Gemini Live se Žánovou rychlou dráhou a bez vnuceného ``languageCode``.
+    """Gemini Live se Žánovou rychlou dráhou a ``languageCode`` podle modelu.
 
     ``FastLaneMixin`` musí být v MRO PRVNÍ — jeho ``register_function``
     přebíjí ten z pipecatu a ``super()`` uvnitř pak míří na
@@ -69,18 +80,33 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
 
     def __init__(self, *, drop_language_code: bool = True, **kwargs):
         """Args:
-            drop_language_code: Nevkládat do ``speechConfig`` pole
-                ``languageCode``. Pipecat ho dosadí vždy (``en-US``, když
-                ``params.language`` nenastavíš) a ``cs-CZ`` model 2.5 odmítá.
-                Vynulováním ``_settings["language"]`` se z pydantic modelu
-                ``SpeechConfig`` pole při serializaci vypustí úplně.
+            drop_language_code: Zapíná chytrou volbu ``languageCode`` podle
+                modelu (výchozí). Live API posílá pole v ``speechConfig``
+                vždy (pipecat dosadí ``en-US``, když ``params.language``
+                nenastavíš) — a modely se k němu chovají protichůdně:
+                ``2.5``/``native-audio`` ho s ``cs-CZ`` ODMÍTAJÍ (chyba 1007),
+                ``3.1`` ho naopak BEROU. Pro model s markerem z
+                ``_LANGUAGE_UNSUPPORTED_MARKERS`` se pole vynuluje
+                (``_settings["language"] = None`` → pydantic ``SpeechConfig``
+                ho při serializaci vypustí úplně), pro ostatní se nastaví
+                natvrdo na ``"cs-CZ"``. ``False`` tuhle logiku úplně vypne
+                a nechá pipecatí výchozí chování (``en-US``).
             **kwargs: Předává se beze změny do ``GeminiLiveLLMService``.
         """
         super().__init__(**kwargs)
-        if drop_language_code:
+        if not drop_language_code:
+            return
+        model_name = str(getattr(self, "_model_name", "") or "")
+        if any(marker in model_name for marker in _LANGUAGE_UNSUPPORTED_MARKERS):
             self._settings["language"] = None
             self._language_code = None
-            logger.info("🌐 Gemini: languageCode se NEposílá (cs-CZ 2.5 odmítá)")
+            logger.info(
+                "🌐 Gemini: languageCode se NEposílá (%s odmítá cs-CZ)", model_name
+            )
+        else:
+            self._settings["language"] = "cs-CZ"
+            self._language_code = "cs-CZ"
+            logger.info("🌐 Gemini: languageCode=cs-CZ (%s)", model_name)
 
     async def _handle_msg_usage_metadata(self, message):  # type: ignore[override]
         """Nechá pipecat spočítat metriky a k tomu jeden řádek do logu.
