@@ -63,6 +63,41 @@ class SessionActivityTracker(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class SessionGate(FrameProcessor):
+    """Zavře cestu mikrofonu do pusy, když plátno hlásí `listening=false`.
+
+    Rozhodnutí NENÍ tady — je v `app/session_klient.SessionKlient.pusti_audio()`
+    (a je tam i otestované). Tenhle procesor jen zahazuje `InputAudioRawFrame`;
+    všechno ostatní (StartFrame, EndFrame, ErrorFrame, textové rámce) prochází
+    vždycky, jinak by se zavřeným uchem umřela i obnova spojení.
+
+    FAIL-SAFE: bez klienta se nezavírá nikdy. Výpadek plátna nesmí ohluchnout dům.
+    """
+
+    def __init__(self, klient, **kwargs):
+        super().__init__(**kwargs)
+        self._klient = klient
+        self._zavreno = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and self._klient is not None:
+            try:
+                pustit = self._klient.pusti_audio()
+            except Exception as e:  # noqa: BLE001 - brzda při nejistotě pouští
+                logger.warning(f"⚠️ session gate selhal ({e!r}) — pouštím audio dál")
+                pustit = True
+            if not pustit:
+                if not self._zavreno:
+                    logger.info("🔇 session gate: plátno hlásí listening=false → mikrofon do pusy nejde")
+                    self._zavreno = True
+                return
+            if self._zavreno:
+                logger.info("🔊 session gate: ucho zase otevřené")
+                self._zavreno = False
+        await self.push_frame(frame, direction)
+
+
 class InputResampler(FrameProcessor):
     """Upsample incoming device mic audio to the OpenAI Realtime input rate.
 
@@ -384,6 +419,10 @@ class WebSocketHandler:
         # kvůli STOP — po „zmlkni" se musí vyprázdnit fronta témat, jinak
         # promluví to, co do ní stihlo spadnout před stopkou.
         self.zan_bridge = None
+        # Drát na plátnový SESSION REŽIM (`app/session_klient.py`). Nastavuje
+        # ho main.py; bez něj se nic nemění — gate nepouští ani nezavírá,
+        # heard/mute se prostě neposílají.
+        self.session_klient = None
 
     def aktualni_faze(self) -> Optional[str]:
         """Poslední fáze poslaná zařízení (`replying` = pusa mluví), nebo None."""
@@ -484,6 +523,10 @@ class WebSocketHandler:
             # reconnect in place. Without it a 1011/1001 drop bricks the session.
             ConnectionRecovery(openai_service=openai_service, emit_idle=self.broadcast_phase,
                                phase_emitter=phase_emitter),
+            # Gate SESSION REŽIMU. Sedí PŘED resamplerem schválně: zavřené
+            # ucho nemá co převzorkovávat, a ConnectionRecovery nad ním pořád
+            # vidí ErrorFrames (ty jdou upstream, gate je nepustí do cesty).
+            SessionGate(self.session_klient),
             InputResampler(out_rate=PIPELINE_SAMPLE_RATE),
             input_activity_tracker,
         ]
@@ -499,17 +542,25 @@ class WebSocketHandler:
         # aggregator can consume it) — opposite directions, so they need taps on
         # opposite sides of the service (see transcript_logger.py): "user" before
         # the LLM, "assistant" after it.
+        #
+        # Na uživatelský tap se navíc věší drát na plátno: každý FINÁLNÍ
+        # přepis = „slyšeli jsme řeč" → POST {action:'heard'} (posune okno
+        # ticha session). POZOR: `TranscriptionFrame` vzniká jen když je
+        # zapnutá vstupní transkripce (TRANSCRIPTION_LANGUAGE) — bez ní se
+        # `heard` neposílá a session dojede na svůj timeout ticha.
+        session_klient = self.session_klient
+        na_prepis = (lambda _text: session_klient.heard()) if session_klient is not None else None
         if context_aggregator:
             pipeline_components.extend([
                 context_aggregator.user(),
-                TranscriptLogger(capture="user"),
+                TranscriptLogger(capture="user", on_user_final=na_prepis),
                 openai_service,
                 TranscriptLogger(capture="assistant"),
                 context_aggregator.assistant(),
             ])
         else:
             pipeline_components.extend([
-                TranscriptLogger(capture="user"),
+                TranscriptLogger(capture="user", on_user_final=na_prepis),
                 openai_service,
                 TranscriptLogger(capture="assistant"),
             ])
@@ -707,6 +758,11 @@ class WebSocketHandler:
             # New turn boundary: drop any pending post-tool kill so it can't
             # leak onto this fresh turn's response.
             _kill_next_response["v"] = False
+            # Wake word je výslovný lidský akt — otevři gate na `wake_grace`,
+            # i kdyby plátno hlásilo `listening=false` (režim SPÍ). Bez tohohle
+            # by zapnutý gate zabil normální wake-word tah.
+            if self.session_klient is not None:
+                self.session_klient.note_wake()
 
         # Wire the dangling-VAD guard's kill-window into the PhaseEmitter. It
         # reuses the SAME _interrupt_kill_until + _kill_racing_response machinery
@@ -887,6 +943,16 @@ class WebSocketHandler:
                         # pipeline already streams continuously with server VAD,
                         # so there's nothing to start here — just acknowledge.
                         logger.debug(f"▶️ start from client {client_id}")
+                    elif message_type in ("mute", "mic_mute"):
+                        # Satelit hlásí fyzicky (od)mutovaný mikrofon. Zrcadlí
+                        # se na plátno; software mute nevyrábí ani neruší.
+                        # Snese obě pojmenování pole (`muted` i `value`), ať
+                        # se kvůli tomu nemusí ladit firmware.
+                        raw = data.get("muted", data.get("value"))
+                        muted = raw is True or str(raw).strip().lower() in ("1", "true", "on", "yes")
+                        logger.info(f"🔇 mute={muted} hlášeno klientem {client_id}")
+                        if self.session_klient is not None:
+                            self.session_klient.mute(muted, reason="satelit")
                     elif message_type == "ping":
                         # Keepalive. Reply with pong on the same connection.
                         await self._send_json(websocket, {"type": "pong"})

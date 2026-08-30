@@ -72,6 +72,7 @@ from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.services.openai.realtime import events as rt_events
 
 from app.dispecer_reci import DispecerReci
+from app.zdroj_zarizeni import payload_voice, zdroj_zarizeni
 
 if TYPE_CHECKING:
     from pipecat.services.llm_service import FunctionCallParams
@@ -336,6 +337,9 @@ class ZanBridge:
         # připojením zařízení, proto `pripoj()`.
         self._service: Any = None
         self._faze_getter: Optional[Callable[[], Optional[str]]] = None
+        # Ze které krabice se ptali (`app/zdroj_zarizeni.py`). Mění se
+        # s připojeným zařízením, proto `nastav_zdroj()`.
+        self._zdroj: Optional[str] = None
         self.dispecer = DispecerReci(
             vyslov=self._vyslov,
             pusa_mluvi=self.pusa_mluvi,
@@ -366,6 +370,26 @@ class ZanBridge:
         if faze_getter is not None:
             self._faze_getter = faze_getter
         self.dispecer.spust()
+
+    def nastav_zdroj(self, client_id: Optional[str]) -> None:
+        """Zapamatuj si, ze kterého satelitu teď hlas přichází.
+
+        Volá se z `_ensure_openai_service` (tam je client_id z transportu).
+        Do payloadu `/voice` pak jde `zdroj_zarizeni` — server ho zatím
+        ignoruje, takže je to čistě aditivní.
+        """
+        novy = zdroj_zarizeni(client_id)
+        if novy != self._zdroj:
+            logger.info("📍 zdroj hlasu: %s (klient %s)", novy or "neznámý", client_id)
+        self._zdroj = novy
+
+    def _payload(self, text: str) -> Dict[str, Any]:
+        """Tělo POSTu na `/voice` — obálka nad `zdroj_zarizeni.payload_voice`.
+
+        Skládání je schválně mimo tenhle modul, aby šlo testovat bez
+        pipecatu (`tests/test_session_klient.py`).
+        """
+        return payload_voice(text, self.chat_id, self._zdroj)
 
     def nastav_faze_getter(self, faze_getter: Callable[[], Optional[str]]) -> None:
         """Zdroj fáze (`listening`/`thinking`/`replying`/`idle`) z PhaseEmitteru."""
@@ -503,9 +527,7 @@ class ZanBridge:
 
     async def _blocking(self, params: "FunctionCallParams", text: str) -> None:
         """Původní chování: počkej na celou odpověď a vrať ji jako výsledek."""
-        payload: Dict[str, Any] = {"text": text}
-        if self.chat_id is not None:
-            payload["chat_id"] = self.chat_id
+        payload = self._payload(text)
         try:
             result = await asyncio.to_thread(_post_json, self.url, self.token, payload, self.timeout)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
@@ -639,9 +661,7 @@ class ZanBridge:
         Vlákno se zrušit nedá; při zrušení (STOP) se prostě přestane číst
         a jeho výsledek nikdo nepřevezme — dojede si do timeoutu samo.
         """
-        payload: Dict[str, Any] = {"text": text}
-        if self.chat_id is not None:
-            payload["chat_id"] = self.chat_id
+        payload = self._payload(text)
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         done = object()

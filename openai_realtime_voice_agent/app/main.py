@@ -23,6 +23,7 @@ from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
+from app.session_klient import SessionKlient
 from app.prubeh_server import spust_prubeh_server
 from app.voice_safety import is_sensitive_actuation
 from app.voice_fastlane import (
@@ -514,6 +515,9 @@ class Application:
         # cleanup() na ně sahá i po havárii při startu.
         self.zan_bridge = None
         self._prubeh_task = None
+        # Drát na plátnový session režim; vzniká v initialize(), ale
+        # cleanup() na něj sahá i po havárii při startu.
+        self.session_klient = None
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -837,6 +841,13 @@ class Application:
             # `websocket_handler._on_device_interrupt`.
             self.websocket_handler.zan_bridge = self.zan_bridge
 
+        # DRÁT NA PLÁTNO — session režim (kdy Žanvis poslouchá). Jedna
+        # instance na běh, stejně jako most: drží poslední známé `listening`
+        # a rozhoduje gate na vstupu. Musí vzniknout PŘED `_build_pipeline…`,
+        # protože `SessionGate` si ho bere při stavbě roury.
+        self.session_klient = SessionKlient()
+        self.websocket_handler.session_klient = self.session_klient
+
         # Initialize audio recording service (optional)
         self.audio_recording_service = AudioRecordingService(
             enable_recording=enable_recording,
@@ -1068,6 +1079,8 @@ class Application:
                 self.zan_bridge.pripoj(
                     self.openai_service, self.websocket_handler.aktualni_faze
                 )
+                # Ze které krabice se ptají — jde do payloadu `/voice`.
+                self.zan_bridge.nastav_zdroj(client_id)
                 self.openai_service.register_function("ask_zan", self.zan_bridge.handler)
             logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
             
@@ -1112,6 +1125,11 @@ class Application:
                 self._prubeh_task = await spust_prubeh_server(self.zan_bridge.prijmi_prubeh)
             except Exception as e:
                 logger.warning(f"⚠️ /prubeh se nepodařilo nastartovat: {e!r}")
+
+        # Periodické čtení session režimu z plátna (30 s). Fail-safe uvnitř:
+        # když plátno neběží, klient drží `listening=True` a nic se nemění.
+        if self.session_klient is not None:
+            self.session_klient.start()
 
         # Create initial OpenAI service (will be replaced per connection)
         await self._ensure_openai_service()
@@ -1218,6 +1236,13 @@ class Application:
                 await self.zan_bridge.dispecer.zastav()
             except Exception as e:
                 logger.warning(f"⚠️ Error stopping Žán bridge dispatcher: {e}")
+
+        klient = getattr(self, "session_klient", None)
+        if klient is not None:
+            try:
+                await klient.zastav()
+            except Exception as e:
+                logger.warning(f"⚠️ Error stopping session klient: {e}")
 
         prubeh_task = getattr(self, "_prubeh_task", None)
         if prubeh_task is not None and not prubeh_task.done():
