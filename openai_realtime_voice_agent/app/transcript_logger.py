@@ -54,10 +54,16 @@ class TranscriptLogger(FrameProcessor):
             the LLM), "user" (TranscriptionFrame, place BEFORE the LLM), or "both".
     """
 
-    def __init__(self, capture: str = "both", **kwargs):
+    def __init__(self, capture: str = "both", on_user_final=None, **kwargs):
         super().__init__(**kwargs)
         self._capture = capture
         self._assistant_buf: list[str] = []
+        # Volitelný odposlech FINÁLNÍHO uživatelského přepisu. Používá ho
+        # `session_klient` („slyšeli jsme řeč" → posun okna ticha na plátně).
+        # Schválně tady: `TranscriptionFrame` je jediný bod v rouře, kde
+        # finální přepis prokazatelně existuje. Zůstává to instrumentace —
+        # callback nesmí rámec změnit ani zdržet (výjimky se polykají).
+        self._on_user_final = on_user_final
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -80,5 +86,10 @@ class TranscriptLogger(FrameProcessor):
                 text = (frame.text or "").strip()
                 if text:
                     logger.info(f"🗣️ user: {text}")
+                    if self._on_user_final is not None:
+                        try:
+                            self._on_user_final(text)
+                        except Exception as e:  # noqa: BLE001 - odposlech nesmí shodit rouru
+                            logger.warning(f"⚠️ odposlech finálního přepisu selhal: {e!r}")
 
         await self.push_frame(frame, direction)
