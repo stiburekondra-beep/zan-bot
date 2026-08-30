@@ -571,6 +571,23 @@ class Application:
         transcription_model = _resolve_choice(
             "TRANSCRIPTION_MODEL", "TRANSCRIPTION_MODEL_CUSTOM", "gpt-4o-transcribe"
         )
+        # Optional STT vocabulary ("prompt") to bias transcription toward known
+        # proper nouns (family names, room names, product names) — see karta
+        # -zana-05 / projects/baklazan/zan/zan-box/stt-slovnik/. File-based so
+        # it can be regenerated without touching this add-on's code or YAML.
+        # FAIL-SAFE: env unset, empty, or file missing/unreadable -> "" -> no
+        # prompt is sent -> transcription behaves exactly as before this patch.
+        stt_prompt_file = os.environ.get("STT_PROMPT_FILE", "").strip()
+        transcription_prompt = ""
+        if stt_prompt_file:
+            try:
+                with open(stt_prompt_file, "r", encoding="utf-8") as f:
+                    transcription_prompt = f.read().strip()
+            except OSError as e:
+                logger.warning(
+                    f"STT_PROMPT_FILE={stt_prompt_file} nastaveno, ale nejde přečíst ({e}) — pokračuju bez STT slovníku."
+                )
+                transcription_prompt = ""
 
         # Get instructions with default
         instructions = os.environ.get("INSTRUCTIONS", "You are the Home Assistant Voice Agent and can control the Smart Home.")
@@ -741,6 +758,7 @@ class Application:
         self.enable_disconnect_tool = enable_disconnect_tool
         self.transcription_language = transcription_language
         self.transcription_model = transcription_model
+        self.transcription_prompt = transcription_prompt
         if zan_bridge_enabled:
             # RYCHLÁ DRÁHA vs. DELEGACE (2026-08-22). Model má k dispozici jak
             # nativní HA nástroje (rychlá dráha), tak ask_zan (most na mozek).
@@ -976,6 +994,7 @@ class Application:
                 InputAudioTranscription(
                     model=self.transcription_model,
                     language=self.transcription_language,
+                    prompt=self.transcription_prompt or None,
                 )
                 if self.transcription_language
                 else None
