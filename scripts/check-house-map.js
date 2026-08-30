@@ -99,5 +99,29 @@ assert.strictEqual(res.map.adjacency.length, 2);
 assert.strictEqual(res.map.items[0].room_id, 'obyvak');
 assert.ok(res.map.rooms.find(r => r.area_id === 'loznice').notes.includes('Alternativní názvy'), 'seed must preserve existing room notes');
 
+// Scénář 64: dvě zákaznické oblasti se STEJNÝM názvem jako seed místnost →
+// remíza ≥ threshold nesmí skončit tichým arbitrárním pickem s ready_to_apply.
+const ambigSeed = { rooms: [{ id: 'bathroom', name: 'Koupelna' }] };
+const ambigCustomers = [
+  { area_id: 'koupelna_1', name: 'Koupelna' },
+  { area_id: 'koupelna_2', name: 'Koupelna' },
+];
+const ambigProposal = prepareHouseMapSeed(ambigSeed, ambigCustomers);
+assert.strictEqual(ambigProposal.rooms.length, 0, 'tie between identically named areas must not silently pick one');
+assert.strictEqual(ambigProposal.review.unresolved.length, 1, 'ambiguous seed room goes to unresolved');
+assert.ok(/ambiguous/.test(ambigProposal.review.unresolved[0].reason), 'unresolved reason flags ambiguity');
+assert.strictEqual(ambigProposal.review.unresolved[0].tied_candidates.length, 2, 'both tied candidates listed for human review');
+assert.strictEqual(ambigProposal.review.ready_to_apply, false, 'ambiguous tie blocks apply');
+
+// Diskriminace: jednoznačná shoda (jen jedna zákaznická místnost) se dál napasuje
+// normálně — fix nesmí zablokovat každý match, jen remízu.
+const clearProposal = prepareHouseMapSeed(
+  { rooms: [{ id: 'bathroom', name: 'Koupelna' }] },
+  [{ area_id: 'koupelna_1', name: 'Koupelna' }, { area_id: 'kuchyne', name: 'Kuchyně' }],
+);
+assert.strictEqual(clearProposal.rooms.length, 1, 'unique best match still resolves');
+assert.strictEqual(clearProposal.rooms[0].area_id, 'koupelna_1', 'clear winner mapped normally');
+assert.strictEqual(clearProposal.review.ready_to_apply, true, 'unambiguous single seed room is ready');
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('house map contract OK');
