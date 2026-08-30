@@ -22,7 +22,8 @@ from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TURN_LIVENESS
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
-from app.zan_bridge_tool import get_ask_zan_tool_definition, create_ask_zan_tool_handler
+from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
+from app.prubeh_server import spust_prubeh_server
 from app.voice_safety import is_sensitive_actuation
 from app.voice_fastlane import (
     CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
@@ -508,7 +509,12 @@ class Application:
         self.session_manager: Optional[SessionManager] = None
         self.current_task: Optional[PipelineTask] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
-        
+        # Most na Žánův mozek (drží frontu témat + dispečera řeči) a task
+        # endpointu /prubeh. Obojí vzniká až v initialize()/run(), ale
+        # cleanup() na ně sahá i po havárii při startu.
+        self.zan_bridge = None
+        self._prubeh_task = None
+
     async def initialize(self) -> None:
         """Initialize all components."""
         # Get configuration from environment
@@ -758,6 +764,9 @@ class Application:
                 "dashboardu, cokoli na víc než dvě věty přemýšlení, nebo když si "
                 "nejsi jistý. Když deleguješ, řekni krátce „jdu na to, dám vědět\" "
                 "a pak zavolej ask_zan přesně jednou s textem uživatele.\n"
+                "• PO DELEGACI: ask_zan se vrátí se stavem „delegated\" — to NENÍ "
+                "odpověď. Nic dalšího neříkej a nic si nedomýšlej. Odpověď ti "
+                "dorazí sama za chvíli jako systémová zpráva; teprve tu řekni.\n"
                 "• BEZPEČNOST: nevratné a rizikové akce NIKDY sám přes HA nástroje "
                 "— vždy přes ask_zan: zámky, alarm, brány a garážová vrata, "
                 "kotel/topný okruh, mazání, restart. Když by povel spadl sem, "
@@ -811,6 +820,22 @@ class Application:
             "zapnutá" if self.fastlane_enabled else "vypnutá",
             self.zan_event_url or "vypnuté",
         )
+
+        # MOST NA MOZEK — jedna instance na celý běh, ne jedna na spojení.
+        # Drží frontu témat a dispečera řeči (MLUVENI-ZANA-TECHNICKY.md §1);
+        # kdyby vznikal znovu s každou session, vznikly by paralelní fronty
+        # a „mluví právě jeden" by přestalo platit. Na novou realtime session
+        # se přepíná `pripoj()`.
+        self.zan_bridge = None
+        if zan_bridge_enabled:
+            self.zan_bridge = ZanBridge(
+                zan_voice_url, zan_voice_token, zan_voice_chat_id,
+                self.websocket_handler.broadcast_json,
+            )
+            self.zan_bridge.nastav_faze_getter(self.websocket_handler.aktualni_faze)
+            # STOP („zmlkni") musí umět vyprázdnit frontu — viz
+            # `websocket_handler._on_device_interrupt`.
+            self.websocket_handler.zan_bridge = self.zan_bridge
 
         # Initialize audio recording service (optional)
         self.audio_recording_service = AudioRecordingService(
@@ -1036,14 +1061,14 @@ class Application:
             self.openai_service.phrase_library = self.phrase_library
             self.openai_service.zan_event_url = self.zan_event_url
             self.openai_service.zan_event_token = self.zan_event_token
-            if self.zan_bridge_enabled:
-                self.openai_service.register_function(
-                    "ask_zan",
-                    create_ask_zan_tool_handler(
-                        self.zan_voice_url, self.zan_voice_token,
-                        self.zan_voice_chat_id, self.websocket_handler.broadcast_json,
-                    ),
+            if self.zan_bridge_enabled and self.zan_bridge is not None:
+                # Most přežívá spojení, mění se mu jen session pod rukama.
+                # `pripoj()` zároveň nastartuje dispečerskou smyčku a zahodí,
+                # co ve frontě zbylo po předchozím rozhovoru.
+                self.zan_bridge.pripoj(
+                    self.openai_service, self.websocket_handler.aktualni_faze
                 )
+                self.openai_service.register_function("ask_zan", self.zan_bridge.handler)
             logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
             
             # Register disconnect tool handler (only when the tool is exposed)
@@ -1078,7 +1103,16 @@ class Application:
     async def run(self) -> None:
         """Run the application."""
         await self.initialize()
-        
+
+        # Endpoint `/prubeh` — kudy mozek posílá průběžné nálezy do fronty
+        # témat (MLUVENI-ZANA-TECHNICKY.md §2). Fail-closed: bez tokenu se
+        # nespustí a jen se to zaloguje; hlas na něm nikdy nestojí.
+        if self.zan_bridge is not None:
+            try:
+                self._prubeh_task = await spust_prubeh_server(self.zan_bridge.prijmi_prubeh)
+            except Exception as e:
+                logger.warning(f"⚠️ /prubeh se nepodařilo nastartovat: {e!r}")
+
         # Create initial OpenAI service (will be replaced per connection)
         await self._ensure_openai_service()
         
@@ -1177,7 +1211,18 @@ class Application:
     async def cleanup(self) -> None:
         """Cleanup resources."""
         logger.info("Cleaning up application...")
-        
+
+        if self.zan_bridge is not None:
+            try:
+                self.zan_bridge.stop("vypínání mostu")
+                await self.zan_bridge.dispecer.zastav()
+            except Exception as e:
+                logger.warning(f"⚠️ Error stopping Žán bridge dispatcher: {e}")
+
+        prubeh_task = getattr(self, "_prubeh_task", None)
+        if prubeh_task is not None and not prubeh_task.done():
+            prubeh_task.cancel()
+
         if self.runner:
             try:
                 await self.runner.cancel()
