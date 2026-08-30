@@ -65,6 +65,7 @@ import asyncio
 import logging
 import os
 import time
+from typing import Optional
 
 from pipecat.frames.frames import (
     Frame,
@@ -161,6 +162,25 @@ class PhaseEmitter(FrameProcessor):
         # genuine new utterance — never cancel ITS response).
         self._on_dangling_stop = None
         self._on_real_speech = None
+
+    @property
+    def faze(self) -> Optional[str]:
+        """Poslední fáze, kterou zařízení opravdu dostalo (nebo None).
+
+        Read-only okénko pro dispečera řeči (`app/dispecer_reci.py`):
+        `replying` znamená „pusa mluví" a dokud trvá, nic se do session
+        nevstřikuje. Záměrně jen getter — rozhodovací logika fronty patří
+        do dispečera, ne sem (MLUVENI-ZANA-TECHNICKY.md §1: „nesmí být
+        rozprostřený po `zan_bridge_tool.py` a `phase_emitter.py`").
+
+        Pozor na výklad: je to poslední ODESLANÁ fáze, tedy stav, ne
+        událost na zařízení (poučení
+        `2026-08-26_faze-z-cizi-vrstvy-neni-udalost.md`). Pro „mluví
+        právě jeden" je to přesně to, co potřebujeme — `idle` se navíc
+        posílá až po debounce, takže mezery mezi větami jednoho souvětí
+        pořád platí jako `replying`.
+        """
+        return self._current
 
     def note_wake(self) -> None:
         """Device woke (or a follow-up window closed without speech). Until the

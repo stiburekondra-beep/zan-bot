@@ -397,7 +397,20 @@ class WebSocketHandler:
         # Connected device websockets, used to push va_client control/phase
         # messages as TEXT frames (the audio path uses the binary serializer).
         self._websockets: set = set()
-    
+        # PhaseEmitter posledně postavené pipeline. Dispečer řeči z něj čte
+        # fázi `replying` = „pusa mluví" (MLUVENI-ZANA-TECHNICKY.md §1).
+        self._phase_emitter = None
+        # Most na Žánův mozek. Nastavuje ho main.py; potřebujeme ho jen
+        # kvůli STOP — po „zmlkni" se musí vyprázdnit fronta témat, jinak
+        # promluví to, co do ní stihlo spadnout před stopkou.
+        self.zan_bridge = None
+
+    def aktualni_faze(self) -> Optional[str]:
+        """Poslední fáze poslaná zařízení (`replying` = pusa mluví), nebo None."""
+        emitter = self._phase_emitter
+        return emitter.faze if emitter is not None else None
+
+
     def create_transport(self) -> WebsocketServerTransport:
         """
         Create and initialize WebSocket transport.
@@ -484,6 +497,9 @@ class WebSocketHandler:
         # racing-`thinking` suppression); it is APPENDED near the end of the
         # pipeline below, before transport.output().
         phase_emitter = PhaseEmitter(send_phase=self.broadcast_phase)
+        # Zpřístupnit dispečerovi řeči (viz `aktualni_faze`). Pipeline se
+        # staví znovu při každém připojení, takže tohle je vždy ten živý.
+        self._phase_emitter = phase_emitter
 
         pipeline_components = [transport.input()]
 
@@ -643,6 +659,15 @@ class WebSocketHandler:
 
         async def _on_device_interrupt():
             _interrupt_kill_until["t"] = time.monotonic() + INTERRUPT_KILL_WINDOW_S
+            # „Zmlkni" / tlačítko: zrušit běžící dotazy na mozek A VYPRÁZDNIT
+            # FRONTU TÉMAT. Samotné zrušení dotazů nestačí — co už do fronty
+            # spadlo (dílčí nálezy, průběžné hlášky), by po stopce promluvilo.
+            bridge = self.zan_bridge
+            if bridge is not None:
+                try:
+                    bridge.stop("device interrupt (zmlkni)")
+                except Exception as e:  # brzda nesmí shodit stopku
+                    logger.warning(f"⚠️ STOP: vyprázdnění fronty témat selhalo ({e!r})")
             # Arm the next-response kill on EVERY stop (see the flag comment):
             # the 1.5 s time-window alone misses responses that land later —
             # OpenAI replying to the spoken "stop", or a slow tool's answer.
