@@ -263,6 +263,113 @@ def _ha_token() -> str:
     return os.environ.get("LONGLIVED_TOKEN") or os.environ.get("SUPERVISOR_TOKEN") or ""
 
 
+# ---------------------------------------------------------------------------
+# Oprava oblasti: model umí poslat anglický slug místo české oblasti
+# ---------------------------------------------------------------------------
+
+#: Anglický název oblasti → české slovo, pod kterým ji hledáme v HA.
+#:
+#: PROČ (31. 8. 2026, 10:17, Ondra: „vypnutí světel nešlo a nechce to udělat"):
+#:
+#:   🗣️ user: Vypni světla v obýváku.
+#:   Calling function [HassTurnOff:…] with arguments
+#:       {'area': 'living_room', 'domain': ['light']}
+#:   Final response: Error calling tool: <MatchFailedError …
+#:       no_match_reason=<MatchFailedReason.INVALID_AREA: 9>
+#:
+#: Model si „obývák" přeložil do angličtiny. V HA je oblast `obyvak` =
+#: „Obývák", žádný `living_room` neexistuje, takže povel spadl na neplatné
+#: oblasti — a navenek to vypadalo, že Žán „nechce" poslechnout.
+#:
+#: Přepisuje se JEN tehdy, když v domě opravdu existuje právě jeden
+#: odpovídající kandidát. Když je kandidátů víc (koupelna dolní/horní) nebo
+#: žádný, argument se nechá být — radši poctivé selhání než tipovat pokoj.
+_ANGLICKE_OBLASTI = {
+    "living_room": "obyvak", "livingroom": "obyvak", "living room": "obyvak",
+    "lounge": "obyvak",
+    "kitchen": "kuchyne",
+    "bedroom": "loznice",
+    "bathroom": "koupelna",
+    "hall": "chodba", "hallway": "chodba", "corridor": "chodba",
+    "attic": "puda",
+    "cellar": "sklep", "basement": "sklep",
+    "terrace": "terasa",
+    "yard": "dvur", "courtyard": "dvur",
+    "laundry": "pradelka",
+    "pantry": "spajzka",
+    "storage": "sklad", "storeroom": "sklad",
+    "toilet": "zachod", "wc": "zachod",
+    "utility_room": "technicka-mistnost",
+}
+
+#: Oblasti z HA se čtou jednou za tenhle čas (dům je nepřestavuje každou chvíli).
+_OBLASTI_TTL_S = 300.0
+_oblasti_cache: Dict[str, Any] = {"t": 0.0, "seznam": []}
+
+
+def fetch_areas() -> List[Tuple[str, str]]:
+    """Skutečné oblasti domu: [(id, název), …]. Cachované, chyba = prázdno."""
+    now = time.time()
+    if _oblasti_cache["seznam"] and now - _oblasti_cache["t"] < _OBLASTI_TTL_S:
+        return _oblasti_cache["seznam"]
+    sablona = "{% for a in areas() %}{{ a }}\t{{ area_name(a) }}\n{% endfor %}"
+    req = urllib.request.Request(
+        f"{HA_BASE}/template",
+        data=json.dumps({"template": sablona}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {_ha_token()}",
+                 "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            text = resp.read().decode("utf-8")
+    except Exception as e:
+        logger.warning("⚠️ oblasti z HA nejdou přečíst: %r", e)
+        return _oblasti_cache["seznam"]
+    seznam = []
+    for radek in text.splitlines():
+        if "\t" in radek:
+            ident, _, nazev = radek.partition("\t")
+            if ident.strip():
+                seznam.append((ident.strip(), nazev.strip()))
+    if seznam:
+        _oblasti_cache.update({"t": now, "seznam": seznam})
+    return seznam
+
+
+def oprav_area(hodnota: str) -> Optional[str]:
+    """Anglický/nepřesný název oblasti → skutečný název z HA, nebo None.
+
+    None = neměnit (buď to sedí, nebo nevíme — a tipovat pokoj se nesmí).
+    """
+    syrove = str(hodnota or "").strip()
+    if not syrove:
+        return None
+    oblasti = fetch_areas()
+    if not oblasti:
+        return None
+    hledane = _norm(syrove)
+    # Už to sedí na id nebo název? Pak nic neopravujeme.
+    for ident, nazev in oblasti:
+        if hledane in (_norm(ident), _norm(nazev)):
+            return None
+    klic = _ANGLICKE_OBLASTI.get(hledane) or _ANGLICKE_OBLASTI.get(
+        hledane.replace("_", " "))
+    if not klic:
+        return None
+    kandidati = [
+        (ident, nazev) for ident, nazev in oblasti
+        if _norm(ident) == klic or _norm(nazev) == klic
+        or _norm(ident).startswith(klic + "_") or _norm(nazev).startswith(klic + " ")
+    ]
+    if len(kandidati) != 1:
+        # Nula = takový pokoj v domě není. Víc = nevíme který (koupelna
+        # dolní/horní). Obojí = nechat spadnout poctivě, ne tipovat.
+        logger.info("ℹ️ oblast %r → %r: kandidátů %d, nechávám být",
+                    syrove, klic, len(kandidati))
+        return None
+    return kandidati[0][1]
+
+
 def fetch_states(domains: Tuple[str, ...]) -> Dict[str, Tuple[str, Any, str]]:
     """Stavy entit vybraných domén: entity_id → (state, attr_volume, friendly_name).
 

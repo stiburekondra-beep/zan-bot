@@ -47,6 +47,8 @@ from app.voice_fastlane import (
     classify as fastlane_classify,
     fetch_states,
     judge as fastlane_judge,
+    oprav_area,
+    _norm,
     room_variant,
     _post_event_blocking,
 )
@@ -95,6 +97,11 @@ FASTLANE_MUTE_S = 6.0
 #: dobou, za kterou člověk vysloví druhý, MYŠLENÝ povel.
 TOOL_DEDUP_S = 8.0
 
+#: Jak dlouho se drží NEÚSPĚŠNÝ výsledek. Jen tak dlouho, aby spolkl okamžité
+#: echo modelu (pozorováno 1,3-1,6 s) — ne aby zablokoval člověka, který povel
+#: zopakuje právě proto, že poprvé nezabral.
+DEDUP_MILOST_S = 2.5
+
 #: Nástroje, u kterých je OPAKOVÁNÍ ZÁMĚR, ne porucha — ty se nikdy
 #: nededuplikují:
 #:
@@ -132,6 +139,26 @@ TOOL_DEDUP_VYJIMKY = frozenset({
 RYCHLA_DRAHA_ZVUKY = frozenset({
     "zvuk_zapnuti", "zvuk_vypnuti", "vysledek_ok", "vysledek_fail",
 })
+
+#: Okno, ve kterém se PROTICHŮDNÉ povely na tentýž cíl berou jako porucha.
+#:
+#: PROČ (31. 8. 2026, 10:15, dvakrát po sobě): Gemini rozseká jednu Ondrovu
+#: promluvu na dva fragmenty, z nichž jeden je halucinace — do přepisu spadlo
+#: i wake word:
+#:
+#:   🗣️ user: rozsvítit světla v obývákuA já, ne?
+#:   🗣️ user: Vypni světlo v obýváku.
+#:   ... a o milisekundu později:
+#:   Calling function [HassTurnOn:fc_17354372043808562740]
+#:   Calling function [HassTurnOff:fc_17354372043808559819]
+#:
+#: Model tedy vystřelí ZAPNI i VYPNI naráz. Dedup je nechytí — jsou to různé
+#: nástroje s různými argumenty, takže do něj z definice nespadají. Výsledkem
+#: byly dva dvousekundové zvuky PŘES SEBE a světlo, které blikne.
+#:
+#: Nikdo nikdy nemyslí „zapni a vypni to samé". Je to vždycky porucha vstupu,
+#: takže druhý z protichůdné dvojice se NEPROVEDE a model se má doptat.
+PROTISMER_S = 2.0
 
 #: Průběhový záměr → zvuk, který ho zastoupí. Hlasitost a ztlumení tady
 #: schválně NEJSOU: „ztlum" není zapnutí ani vypnutí, tam mluví model.
@@ -193,7 +220,8 @@ class FastLaneMixin:
     def _dedup_uklid(self, ted: float) -> None:
         """Vyhodí, co je starší než okno — evidence nesmí růst donekonečna."""
         zaznamy = self._dedup_zaznamy()
-        for klic in [k for k, z in zaznamy.items() if ted - z["t"] > TOOL_DEDUP_S]:
+        for klic in [k for k, z in zaznamy.items()
+                     if ted - z["t"] > z.get("okno", TOOL_DEDUP_S)]:
             zaznamy.pop(klic, None)
 
     def register_function(self, function_name, handler, start_callback=None, *,
@@ -238,6 +266,22 @@ class FastLaneMixin:
                     return
             except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
                 logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
+
+            # OPRAVA OBLASTI (2026-08-31): model umí poslat `living_room`
+            # místo „Obývák" a HA to odmítne jako INVALID_AREA — navenek to
+            # vypadá, že Žán nechce poslechnout. Opraví se JEN když v domě
+            # existuje právě jeden odpovídající pokoj (viz `oprav_area`).
+            try:
+                _args = getattr(params, "arguments", None)
+                if isinstance(_args, dict) and _args.get("area"):
+                    _opravena = oprav_area(_args["area"])
+                    if _opravena:
+                        logger.warning(
+                            "🗺️ oblast %r neexistuje — opravuju na %r (%s)",
+                            _args["area"], _opravena, function_name)
+                        _args["area"] = _opravena
+            except Exception as e:  # pragma: no cover - oprava nesmí shodit tool
+                logger.warning("⚠️ oprava oblasti selhala, jedu dál: %r", e)
 
             # DEDUP STRÁŽ (2026-08-31): tentýž zásah do domu se do
             # `TOOL_DEDUP_S` neprovede podruhé. Model po výsledku nástroje
@@ -291,6 +335,9 @@ class FastLaneMixin:
                     "hotovo": asyncio.Event(),
                     "vysledek": None,
                     "properties": None,
+                    # Dokud běží, drží plné okno — souběžná duplicita se nesmí
+                    # provést. Po dokončení se okno podle výsledku upraví níž.
+                    "okno": TOOL_DEDUP_S,
                 }
                 zaznamy[dedup_klic] = zaznam
 
@@ -302,6 +349,16 @@ class FastLaneMixin:
                 async def zapamatuj_a_posli(result, *, properties=None):
                     zaznam["vysledek"] = result
                     zaznam["properties"] = properties
+                    # NEÚSPĚCH SE NECACHUJE NADLOUHO. Kdyby ano, člověk by
+                    # řekl povel znovu (protože nezabral) a stráž by mu vrátila
+                    # ten STARÝ neúspěch, aniž by to kdokoli zkusil — z pojistky
+                    # proti dvojímu provedení by byla pojistka proti opravě.
+                    # Plné okno drží jen OVĚŘENÝ ÚSPĚCH; po neúspěchu zůstává
+                    # jen krátká milost, která spolkne echo modelu (~1,4 s),
+                    # ale lidské zopakování povelu pustí dál.
+                    uspech = (isinstance(result, dict)
+                              and result.get("status") == "verified_success")
+                    zaznam["okno"] = TOOL_DEDUP_S if uspech else DEDUP_MILOST_S
                     zaznam["hotovo"].set()
                     return await puvodni_cb(result, properties=properties)
 
@@ -323,6 +380,34 @@ class FastLaneMixin:
             # hlídače i satelitu v domě a jeho mrtvá otočka by se neodblokovala.
             # `turn_liveness` na službu věší main.py při stavbě relace satelitu;
             # bez něj (starý/testovací kód) se spadne na modulový.
+            # PROTICHŮDNÉ POVELY V JEDNOM TAHU (viz `PROTISMER_S`): zapni
+            # i vypni totéž naráz nikdy není přání, vždycky porucha vstupu.
+            # Druhý z dvojice se NEPROVEDE a model se má doptat.
+            if plan is not None:
+                smer = ZVUK_MISTO_RECI.get(plan.progress)
+                if smer:
+                    cil = _norm(plan.target or plan.area or "?")
+                    ted2 = time.monotonic()
+                    protismery = getattr(self, "_protismer", None)
+                    if protismery is None:
+                        protismery = {}
+                        self._protismer = protismery
+                    posl = protismery.get(cil)
+                    if (posl and posl["smer"] != smer
+                            and ted2 - posl["t"] < PROTISMER_S):
+                        logger.warning(
+                            "🚫 protichůdný povel na %r: %s vs %s do %.1f s — "
+                            "NEPROVÁDÍM, model se má doptat",
+                            cil, posl["smer"], smer, ted2 - posl["t"])
+                        self.fastlane_unmute("protichůdné povely — model se ptá")
+                        await params.result_callback(
+                            "V jednom tahu dorazily protichůdné povely (zapnout "
+                            f"i vypnout {plan.target or plan.area or 'totéž'}). "
+                            "Neprovedl jsem ten druhý. Zeptej se uživatele "
+                            "jednou krátkou větou, co má platit.")
+                        return
+                    protismery[cil] = {"t": ted2, "smer": smer}
+
             liveness = getattr(self, "turn_liveness", None) or TURN_LIVENESS
             liveness.tool_started()
             try:
