@@ -41,12 +41,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 from google.genai.types import EndSensitivity
-from pipecat.frames.frames import LLMTextFrame, TTSAudioRawFrame, TTSTextFrame
+from pipecat.frames.frames import (
+    LLMTextFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSTextFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.utils.time import time_now_iso8601
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.google.gemini_live.llm import (
@@ -58,6 +65,7 @@ from pipecat.services.google.gemini_live.llm import (
 
 from app.fastlane_mixin import FastLaneMixin
 from app.pusa_fallback import fallback_path, write_fallback
+from app.sentence_accumulator import SentenceAccumulator
 from app.gemini_tools import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_VOICE,
@@ -104,6 +112,29 @@ _EXIT_CODE = 75
 #: Ubývá jen falešný poplach, kdy se počítadlo plazí nahoru přes minuty ticha.
 _IZOLOVANY_PAD_S = 60.0
 
+#: Po jak dlouhém tichu ve VSTUPNÍM přepisu se nedopsaná věta uzavře sama.
+#:
+#: PROČ TO TU JE (důkaz z živého logu 31. 8. 2026): pipecatí
+#: ``GeminiLiveLLMService._handle_msg_input_transcription`` sype došlé kousky
+#: do ``self._user_transcription_buffer`` a ``TranscriptionFrame`` pošle
+#: JEDINĚ, když v nárazníku najde tečku/otazník/vykřičník
+#: (``gemini_live/llm.py:1587-1612``). Nárazník se přitom nevyprazdňuje ani
+#: na konci tahu — jediné vynulování je na řádku 694 při navázání spojení.
+#: Na krabici to vyrobilo tohle: povely v 17:45:38 a dál zůstaly ležet
+#: nepřečtené, protože je Gemini přepsal bez tečky, a ven vypadly slepené
+#: až v 17:55:54 jako ``'světla v obývákutěchto hlavníchVypni televizi.'``
+#: — deset minut pozdě, s wake wordem uprostřed slova a s výsledkem
+#: ``vysledek_fail``. Očista ani reflex plátna do té doby NEDOSTALY NIC.
+#:
+#: S timerem se věta uzavře po tomhle tichu i bez interpunkce, takže reflex
+#: a očista jedou nad průběžnou větou, ne až nad slepencem celého tahu.
+#: Vypnout: ``ZAN_VETA_TICHO_MS=0``.
+_VETA_TICHO_MS_DEFAULT = 800
+
+#: Konec věty v SYROVÉM přepisu. Musí sedět na `sentence_accumulator.split_closed`,
+#: která dělí na tomtéž — jen nad normalizovaným textem.
+_KONEC_VETY = re.compile(r"[.!?]+")
+
 
 def _tvrdy_konec() -> None:
     """Doopravdy ukončí proces. ``sys.exit`` uvnitř tasku by zabil jen task."""
@@ -137,6 +168,24 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
         super().__init__(**kwargs)
         # Brzda terminálního pádu smí proběhnout jen jednou za život služby.
         self._pusa_brzda_spustena = False
+        # PRŮBĚŽNÉ VĚTY ZE VSTUPU (viz `_handle_msg_input_transcription` níž).
+        self._vety = SentenceAccumulator()
+        self._vety_segment = ""
+        self._vety_verze = 0
+        self._vety_timer: Optional[asyncio.Task] = None
+        try:
+            self._vety_ticho_s = max(
+                0.0,
+                int(os.environ.get("ZAN_VETA_TICHO_MS", "").strip()
+                    or _VETA_TICHO_MS_DEFAULT) / 1000.0,
+            )
+        except ValueError:
+            self._vety_ticho_s = _VETA_TICHO_MS_DEFAULT / 1000.0
+        logger.info(
+            "✂️ průběžné věty ze vstupu: %s",
+            ("dozávírám po %.0f ms ticha" % (self._vety_ticho_s * 1000))
+            if self._vety_ticho_s > 0 else "jen na interpunkci (ZAN_VETA_TICHO_MS=0)",
+        )
         if not drop_language_code:
             return
         model_name = str(getattr(self, "_model_name", "") or "")
@@ -150,6 +199,140 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
             self._settings["language"] = "cs-CZ"
             self._language_code = "cs-CZ"
             logger.info("🌐 Gemini: languageCode=cs-CZ (%s)", model_name)
+
+    # ------------------------------------------------------------------
+    # PRŮBĚŽNÉ VĚTY ZE VSTUPNÍHO PŘEPISU (zapojeno 31. 8. 2026)
+    # ------------------------------------------------------------------
+    #
+    # Dosud platilo: dokud člověk nedomluvil CELOU promluvu a Gemini ji
+    # neukončil tečkou, most z ní neviděl ANI PÍSMENO — a když tečka nikdy
+    # nepřišla, viselo to v nárazníku pipecatu do dalšího tahu (viz
+    # `_VETA_TICHO_MS_DEFAULT`). Reflex plátna i očista přepisu tak jely nad
+    # slepencem, ne nad povelem.
+    #
+    # Nově se každý došlý kousek přepisu pouští přes `SentenceAccumulator`
+    # (`app/sentence_accumulator.py`, napsaný a otestovaný 28. 8., do dneška
+    # ho ale nikdo nevolal) a KAŽDÁ UZAVŘENÁ VĚTA jde ven jako samostatný
+    # `TranscriptionFrame` HNED. Uzavřít větu umí dvě věci:
+    #   1. interpunkce v přepisu (`split_closed`),
+    #   2. ticho `ZAN_VETA_TICHO_MS` — pojistka pro povely bez tečky.
+    #
+    # OČISTA A ÚTRŽKOVÁ POJISTKA SE TÍM NEOBCHÁZEJÍ, PRÁVĚ NAOPAK. Posílá se
+    # tatáž třída rámce týmž směrem jako dřív, takže věta projde
+    # `transcript_logger` → `websocket_handler.na_prepis` → `prepis_ocista.ocisti()`
+    # se vším, co k tomu patří (wake word ven, útržek se dál nepouští,
+    # stopka řečí). Rozdíl je JEN v tom, kdy a jak velký kus tam doteče.
+    def _zavri_vety(self, text: str, *, final: bool) -> list:
+        """Přidá kousek přepisu a vrátí věty, které se tím uzavřely."""
+        self._vety_segment += text
+        if final and not self._vety_segment.strip():
+            return []
+        hotove, _, _ = self._vety.ingest(
+            self._vety_segment, self._vety_verze, final=final,
+        )
+        self._vety_verze += 1
+        # Neuzavřený zbytek si neseme dál — ale SYROVÝ, ne ten normalizovaný
+        # z akumulátoru. `normalize()` totiž ořezává okraje, takže by se
+        # z „Rozsviť " + „v obýváku." stalo „Rozsviťv obýváku." (chycen
+        # testem `test_veta_odejde_pred_koncem_promluvy`). Kde věta skončila,
+        # si najdeme v syrovém textu sami — je to tatáž hranice, na které
+        # dělí `split_closed`.
+        if final:
+            self._vety_segment = ""
+        else:
+            konec = None
+            for shoda in _KONEC_VETY.finditer(self._vety_segment):
+                konec = shoda.end()
+            if konec is not None:
+                self._vety_segment = self._vety_segment[konec:]
+        return hotove
+
+    async def _posli_vety(self, hotove: list, duvod: str, message: Any = None) -> None:
+        for veta in hotove:
+            logger.info("✂️ věta ze vstupu (%s): %r", duvod, veta.text)
+            await self.push_frame(
+                TranscriptionFrame(
+                    text=veta.text,
+                    user_id="",
+                    timestamp=time_now_iso8601(),
+                    result=message,
+                ),
+                FrameDirection.UPSTREAM,
+            )
+
+    def _zrus_timer_vety(self) -> None:
+        timer = self._vety_timer
+        self._vety_timer = None
+        if timer is not None and not timer.done():
+            timer.cancel()
+
+    def _naplanuj_dozavreni(self) -> None:
+        if self._vety_ticho_s <= 0:
+            return
+        self._zrus_timer_vety()
+        self._vety_timer = asyncio.create_task(self._dozavri_po_tichu())
+
+    async def _dozavri_po_tichu(self) -> None:
+        try:
+            await asyncio.sleep(self._vety_ticho_s)
+        except asyncio.CancelledError:
+            return
+        try:
+            await self._posli_vety(
+                self._zavri_vety("", final=True),
+                "ticho %.0f ms" % (self._vety_ticho_s * 1000),
+            )
+        except Exception as e:  # noqa: BLE001 — dozávření nesmí shodit pusu
+            logger.warning("⚠️ dozávření věty po tichu selhalo: %r", e)
+
+    async def _dozavri_vetu(self, duvod: str) -> None:
+        """Tvrdá hranice tahu: co zbylo, je věta, i kdyby chyběla tečka."""
+        self._zrus_timer_vety()
+        try:
+            await self._posli_vety(self._zavri_vety("", final=True), duvod)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("⚠️ dozávření věty (%s) selhalo: %r", duvod, e)
+
+    async def _handle_msg_input_transcription(self, message):  # type: ignore[override]
+        """Místo pipecatího nárazníku jede Žánův akumulátor vět.
+
+        Pipecatí verze se schválně NEVOLÁ: dělala by touž práci podruhé nad
+        vlastním nárazníkem a věta by se poslala dvakrát.
+        """
+        content = getattr(message, "server_content", None)
+        prepis = getattr(content, "input_transcription", None) if content else None
+        text = getattr(prepis, "text", None) if prepis else None
+        if not text:
+            return
+        try:
+            hotove = self._zavri_vety(text, final=False)
+        except Exception as e:  # noqa: BLE001 — na akumulátoru hlas nestojí
+            logger.warning("⚠️ akumulátor vět selhal, padám na pipecat: %r", e)
+            return await super()._handle_msg_input_transcription(message)
+        await self._posli_vety(hotove, "interpunkce", message)
+        self._naplanuj_dozavreni()
+
+    async def _handle_msg_model_turn(self, message):  # type: ignore[override]
+        # Model začal odpovídat = člověk domluvil. Co zbylo v nárazníku, je
+        # věta — jinak by se to slepilo s další promluvou.
+        if self._vety_segment.strip():
+            await self._dozavri_vetu("model začal odpovídat")
+        return await super()._handle_msg_model_turn(message)
+
+    async def _handle_msg_tool_call(self, message):  # type: ignore[override]
+        if self._vety_segment.strip():
+            await self._dozavri_vetu("model volá nástroj")
+        return await super()._handle_msg_tool_call(message)
+
+    async def _handle_msg_turn_complete(self, message):  # type: ignore[override]
+        if self._vety_segment.strip():
+            await self._dozavri_vetu("konec tahu")
+        self._zrus_timer_vety()
+        # Nový tah = nová paměť vyslovených vět (jinak by set rostl donekonečna
+        # a Žán by po hodině hovoru zahodil větu, kterou už jednou slyšel).
+        self._vety = SentenceAccumulator()
+        self._vety_verze = 0
+        return await super()._handle_msg_turn_complete(message)
 
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):  # type: ignore[override]
         """Když frázi řekla rychlá dráha, řeč modelu se do zařízení nepustí.
