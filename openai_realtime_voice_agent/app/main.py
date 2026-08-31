@@ -1067,6 +1067,11 @@ class Application:
             # služba se vytváří znovu při každém spojení, tak jí to předáme.
             service.fastlane_enabled = self.fastlane_enabled
             service.phrase_library = self.phrase_library
+            # JEDEN HLAS NA VÝMĚNU (Ondra, 31. 8. 2026: „pořád dva hlasy.
+            # Je to hnus."). Rychlá dráha proto NEMLUVÍ — pouští jen zvuky
+            # zapnutí/vypnutí a výsledkové tóny (`RYCHLA_DRAHA_ZVUKY`).
+            # Co je potřeba říct slovy, říká model. Knihovna se předává dál,
+            # protože ty zvuky a tóny jsou v ní.
             service.zan_event_url = self.zan_event_url
             service.zan_event_token = self.zan_event_token
             if self.zan_bridge_enabled and self.zan_bridge is not None:

@@ -262,7 +262,9 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
         #    funguje i s mrtvou session. Když fráze nahraná není, jen se to
         #    zaloguje — nic se nepředstírá.
         try:
-            await self.play_phrase("zaloha_pusa")
+            # force: tohle zaznít MUSÍ i s vypnutou knihovnou (nesoulad hlasů) —
+            # model už nemá čím promluvit, session je po smrti.
+            await self.play_phrase("zaloha_pusa", force=True)
         except Exception as e:
             logger.warning("⚠️ oznámení o přepnutí pusy se nepovedlo: %r", e)
         try:

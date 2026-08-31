@@ -119,6 +119,32 @@ TOOL_DEDUP_VYJIMKY = frozenset({
 })
 
 
+#: Co SMÍ rychlá dráha pustit z knihovny. Nic jiného — žádná přednahraná
+#: řeč (viz `play_phrase`). Jsou to čtyři bezhlasé signály:
+#:
+#: * ``zvuk_zapnuti`` / ``zvuk_vypnuti`` — ~2 s, stoupavý „něco se zapíná"
+#:   a klesavý „něco se vypíná" (Ondra 31. 8.: „na spouštění věcí tam dáme
+#:   zvuk (nějaký uplifting 2s jak se něco zapíná) a vypínání zase jak se
+#:   něco vypíná 2s"),
+#: * ``vysledek_ok`` / ``vysledek_fail`` — krátké tóny po ověření stavu.
+#:
+#: Akce sama je potvrzení; slova k ní netřeba. Řeč zůstává modelu.
+RYCHLA_DRAHA_ZVUKY = frozenset({
+    "zvuk_zapnuti", "zvuk_vypnuti", "vysledek_ok", "vysledek_fail",
+})
+
+#: Průběhový záměr → zvuk, který ho zastoupí. Hlasitost a ztlumení tady
+#: schválně NEJSOU: „ztlum" není zapnutí ani vypnutí, tam mluví model.
+ZVUK_MISTO_RECI = {
+    "rozsvecuju": "zvuk_zapnuti",
+    "zapinam": "zvuk_zapnuti",
+    "poustim_hudbu": "zvuk_zapnuti",
+    "zhasinam": "zvuk_vypnuti",
+    "vypinam": "zvuk_vypnuti",
+    "zastavuju_hudbu": "zvuk_vypnuti",
+}
+
+
 def _dedup_klic(function_name: str, arguments) -> str:
     """Otisk volání: jméno nástroje + argumenty nezávisle na pořadí klíčů."""
     try:
@@ -320,8 +346,12 @@ class FastLaneMixin:
     # Rychlá dráha: přednahraná pusa místo modelu
     # -----------------------------------------------------------------------
 
-    async def play_phrase(self, zamer: str) -> bool:
+    async def play_phrase(self, zamer: str, *, force: bool = False) -> bool:
         """Pustí přednahranou frázi/tón rovnou do pipeline — bez modelu.
+
+        ``force=True`` obejde vypnutou knihovnu (``fastlane_phrases_enabled``).
+        Používá to JEDINÁ věc: oznámení o pádu pusy v ``gemini_safety`` — to
+        musí zaznít i tehdy, když model mluvit nemůže, protože je po session.
 
         Audio jde jako `TTSAudioRawFrame` po 20 ms kusech, tedy přesně tak,
         jak do pipeline padá řeč z modelu. Pro zařízení je to k nerozeznání
@@ -331,6 +361,16 @@ class FastLaneMixin:
         zároveň výstupní rychlost OBOU pus (OpenAI Realtime i Gemini Live
         vrací 24 kHz PCM), takže mixin nemusí nic převzorkovávat.
         """
+        # JEN ZVUKY, ŽÁDNÁ PŘEDNAHRANÁ ŘEČ (Ondra, 31. 8. 2026). Knihovna je
+        # namluvená jedním hlasem (`ash`), ale pusa mluví jiným — v jedné
+        # výměně pak promluvili dva různí lidé: „pořád dva hlasy. Je to hnus."
+        # Rozhodnutí: „nic negeneruj, říkal jsem že bude nějaký zvuk."
+        # Rychlá dráha proto smí pustit POUZE bezhlasé signály
+        # (`RYCHLA_DRAHA_ZVUKY`); mluvená fráze se nepřehraje nikdy. Když je
+        # opravdu potřeba něco ŘÍCT, řekne to model — jedním hlasem.
+        if not force and zamer not in RYCHLA_DRAHA_ZVUKY:
+            logger.debug("🔇 rychlá dráha nemluví — %r nechávám modelu", zamer)
+            return False
         lib = getattr(self, "phrase_library", None)
         if lib is None:
             return False
@@ -425,7 +465,9 @@ class FastLaneMixin:
         # na druhé — uživatel má slyšet „Rozsvěcuju." v tomtéž okamžiku, kdy
         # povel odchází do Home Assistanta.
         params.result_callback = capture
-        zamer = room_variant(lib, plan) if lib else plan.progress
+        # Zapnutí/vypnutí ohlásí ZVUK, ne věta — a je jedno, které místnosti
+        # se to týká, takže se per-místnostní varianty vůbec neřeší.
+        zamer = ZVUK_MISTO_RECI.get(plan.progress) or plan.progress
         started = time.time()
         speak_task = asyncio.create_task(self.play_phrase(zamer))
         action_task = asyncio.create_task(handler(params))
@@ -461,48 +503,28 @@ class FastLaneMixin:
 
         self._mirror_to_zan(plan, function_name, args, verdict)
 
-        # Knihovna nemá čím mluvit → ať mluví model, ale jen ověřenou pravdu.
-        if not spoke:
-            params.result_callback = real_cb
-            await real_cb(self._verdict_text(verdict, plan, captured))
-            return
-
-        if verdict == "ok":
-            await self.play_phrase("vysledek_ok")   # krátký tón „tadá"
+        # ÚSPĚCH = ZVUK A TÓN, ŽÁDNÁ SLOVA (Ondra, 31. 8.): „akce sama je
+        # potvrzení". Zvuk zapnutí/vypnutí už zazněl, teď jen tón — a model
+        # k tomu mlčí.
+        if verdict == "ok" and spoke:
+            await self.play_phrase("vysledek_ok")
             await real_cb(
-                {"status": "verified_success", "spoken_locally": "tón + průběhová fráze"},
+                {"status": "verified_success",
+                 "spoken_locally": "zvuk zapnutí/vypnutí + tón úspěchu"},
                 properties=FunctionCallResultProperties(run_llm=False),
             )
             return
 
-        if verdict == "unconfirmed":
-            # Poctivě: povel odešel, ale nemáme důkaz. Nikdy ne tón úspěchu.
-            await self.play_phrase("nepotvrdilo_stav")
-            await real_cb(
-                {"status": "unconfirmed", "spoken_locally": "povel odešel, stav nepotvrzen"},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            return
-
-        if verdict == "ha_down":
-            await self.play_phrase("ha_neodpovida")
-            await real_cb(
-                {"status": "ha_unreachable", "spoken_locally": "Home Assistant neodpovídá"},
-                properties=FunctionCallResultProperties(run_llm=False),
-            )
-            return
-
-        # Selhalo i podruhé → poctivá věta + diagnostiku převezme Žán-Code.
-        # Tady model mluvit MUSÍ (má zavolat ask_zan), takže umlčení zrušíme.
-        await self.play_phrase("nepovedlo_se")
-        self.fastlane_unmute("selhání — model má převzít a zavolat ask_zan")
-        cil = plan.target or plan.area or "to"
-        await real_cb(
-            "Akce se nepovedla ani na druhý pokus a ověřený stav to potvrzuje. "
-            f"Uživatel UŽ SLYŠEL „Nepovedlo se mi to, zjišťuju proč.\" — nic o "
-            "výsledku už neopakuj a hlavně netvrď, že se to povedlo. Rovnou "
-            f"zavolej ask_zan s textem „proč nejde {cil}\" a nech Žán-Code najít příčinu."
-        )
+        # COKOLI JINÉHO NEŽ ÚSPĚCH SE MUSÍ ŘÍCT — a říká to MODEL, jedním
+        # hlasem. Rychlá dráha na to nemá (a nesmí mít) přednahranou větu;
+        # dřív ji měla a právě tím vznikal druhý hlas ve výměně.
+        # `vysledek_fail` je bezhlasý tón, ať je hned slyšet, že něco není
+        # v pořádku, ještě než model začne mluvit.
+        if verdict != "ok":
+            await self.play_phrase("vysledek_fail")
+        self.fastlane_unmute("neúspěch nebo bez zvuku — pravdu musí říct model")
+        params.result_callback = real_cb
+        await real_cb(self._verdict_text(verdict, plan, captured))
 
     @staticmethod
     def _verdict_text(verdict: str, plan, captured) -> str:
