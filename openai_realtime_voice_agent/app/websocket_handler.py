@@ -765,8 +765,31 @@ class WebSocketHandler:
         # ticha session). POZOR: `TranscriptionFrame` vzniká jen když je
         # zapnutá vstupní transkripce (TRANSCRIPTION_LANGUAGE) — bez ní se
         # `heard` neposílá a session dojede na svůj timeout ticha.
+        # Dva dráty na jednom finálním přepisu:
+        #   1. `heard()`  — posune okno ticha session (jako dosud),
+        #   2. `reflex()` — podá text plátnu k posouzení, jestli to není
+        #      SCÉNICKÝ POVEL („ukaž vesmír rodiny", „domů", „posuň níž").
+        #
+        # Bod 2 je oprava z 30. 8. 2026. Do teď reflexní dráha z HLASU
+        # NEBYLA ZAPOJENÁ VŮBEC — `/api/reflex` uměl jen plátno sám pro
+        # sebe, takže každý obrazový povel musel projít Realtime modelem
+        # a přišel se sekundovým zpožděním. Ondra: „ne nejsou to reflexy
+        # a nezabiraji hned."
+        #
+        # Reflex se posílá SOUBĚŽNĚ, ne místo modelu: nesedne-li, plátno
+        # vrátí `no_reflex` a nestane se nic. Model dostane povel tak jako
+        # tak — obraz se jen přepne dřív, než domluví.
         session_klient = self.session_klient
-        na_prepis = (lambda _text: session_klient.heard()) if session_klient is not None else None
+
+        def na_prepis(text):
+            session_klient.heard()
+            try:
+                session_klient.reflex(text)
+            except Exception:  # noqa: BLE001 — hlas na reflexu nikdy nestojí
+                logger.debug("reflex se nepodařilo odeslat", exc_info=True)
+
+        if session_klient is None:
+            na_prepis = None
         if context_aggregator:
             pipeline_components.extend([
                 context_aggregator.user(),

@@ -16,6 +16,9 @@ Tři dráty, každý zvlášť:
    nevyrábí ani neruší, jen zrcadlí, co zařízení řeklo.
 3. **gate** — každých ``PLATNO_POLL_S`` (30 s) se čte ``listening``. Když je
    ``false``, most nepouští mikrofonní audio dál do pusy.
+4. **reflex** — při každém FINÁLNÍM přepisu jde text i na ``/api/reflex``
+   (viz ``CESTA_REFLEX`` níž). Scénický povel se tak odbaví hned, ne až
+   po kole přes Realtime model.
 
 FAIL-SAFE (a proto ``_posloucha`` startuje na ``True``): **dům nesmí
 ohluchnout kvůli UI.** Když plátno neběží, odpoví chybou nebo pošle
@@ -53,6 +56,17 @@ VYCHOZI_URL = "http://127.0.0.1:4600"
 VYCHOZI_POLL_S = 30.0
 VYCHOZI_WAKE_GRACE_S = 30.0
 CESTA = "/api/session"
+# REFLEXY (30. 8. 2026): druhá cesta na tomtéž plátně. Scénické povely
+# („ukaž vesmír rodiny", „domů", „posuň níž") nemají co dělat u modelu —
+# jsou to čistě lokální, vratné změny obrazu bez vnějšího účinku. Když
+# se pošlou sem HNED po finálním přepisu, obraz se přepne za desítky
+# milisekund; přes Realtime model to trvá sekundy a Ondra to popsal
+# přesně takhle: „ne nejsou to reflexy a nezabiraji hned".
+#
+# Klasifikaci NEDĚLÁME tady — je jediná, v `platno/reflexes.js`. Most jen
+# podá přepis a plátno řekne, jestli to reflex byl (`accepted`). Tím se
+# seznam frází udržuje na JEDNOM místě, ne ve dvou, které se rozejdou.
+CESTA_REFLEX = "/api/reflex"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -107,6 +121,11 @@ class SessionKlient:
     ) -> None:
         base = (url if url is not None else os.environ.get("PLATNO_URL", "")).strip()
         self.url = (base or VYCHOZI_URL).rstrip("/") + CESTA
+        self.url_reflex = (base or VYCHOZI_URL).rstrip("/") + CESTA_REFLEX
+        # Plátno odmítá přehrát starší přepis téže interakce
+        # (`transcript_version <= seen` → `stale`). Most má jeden hlas, tak
+        # stačí monotónní čítač — každý finální přepis je nová interakce.
+        self._reflex_n = 0
         self.token = (token if token is not None else os.environ.get("PLATNO_TOKEN", "")).strip()
         self.poll_s = poll_s if poll_s is not None else _env_float("PLATNO_POLL_S", VYCHOZI_POLL_S)
         self.gate = gate if gate is not None else _env_bool("PLATNO_SESSION_GATE", False)
@@ -171,28 +190,80 @@ class SessionKlient:
         """Satelit ohlásil (od)mutování mikrofonu. Fire-and-forget."""
         self._posli({"action": "mute", "muted": bool(muted), "reason": reason})
 
-    def _posli(self, payload: dict) -> None:
+    def reflex(self, transcript: str) -> None:
+        """Finální přepis → plátnu na posouzení, jestli je to scénický reflex.
+
+        Fire-and-forget, stejně jako `heard()`. Hlas na tom NESMÍ stát:
+        když plátno neběží nebo reflex nesedne, nestane se nic a povel
+        normálně dojede k modelu — což je přesně dnešní chování. Jediné,
+        co se přidává, je RYCHLÁ ZKRATKA pro čistě obrazové povely.
+        """
+        text = str(transcript or "").strip()
+        if not text:
+            return
+        self._reflex_n += 1
+        self._posli(
+            {
+                "transcript": text,
+                # Jedna interakce = jeden finální přepis. Plátno si podle
+                # dvojice (id, verze) hlídá, že nepřehraje starší přepis.
+                "interaction_id": "most-%d-%d" % (int(time.time()), self._reflex_n),
+                "transcript_version": 1,
+            },
+            url=self.url_reflex,
+        )
+
+    def _posli(self, payload: dict, url: Optional[str] = None) -> None:
+        cil = url or self.url
         try:
             smycka = asyncio.get_running_loop()
         except RuntimeError:
             smycka = None
         if smycka is not None:
-            smycka.create_task(self._posli_async(payload))
+            smycka.create_task(self._posli_async(payload, cil))
             return
         # Mimo event loop (test, sync callback) — vlastní vlákno, ať to
         # nikoho nezdrží.
-        threading.Thread(target=self._posli_blokujici, args=(payload,), daemon=True).start()
+        threading.Thread(target=self._posli_blokujici, args=(payload, cil), daemon=True).start()
 
-    async def _posli_async(self, payload: dict) -> None:
-        await asyncio.to_thread(self._posli_blokujici, payload)
+    async def _posli_async(self, payload: dict, url: Optional[str] = None) -> None:
+        await asyncio.to_thread(self._posli_blokujici, payload, url)
 
-    def _posli_blokujici(self, payload: dict) -> None:
+    def _posli_blokujici(self, payload: dict, url: Optional[str] = None) -> None:
+        cil = url or self.url
+        if cil == self.url_reflex:
+            return self._reflex_blokujici(payload)
         try:
             odpoved = self._http(self.url, self.token, payload, self.timeout_s)
         except Exception as exc:  # noqa: BLE001 — hlas na plátně nestojí
             self._nedostupne(exc, payload.get("action"))
             return
         self._dostupne = True
+        session = odpoved.get("session")
+        if isinstance(session, dict):
+            self._prevezmi(session)
+
+    def _reflex_blokujici(self, payload: dict) -> None:
+        """POST /api/reflex — a do logu jen to, co reflex OPRAVDU udělal."""
+        try:
+            odpoved = self._http(self.url_reflex, self.token, payload, self.timeout_s)
+        except Exception as exc:  # noqa: BLE001 — hlas na reflexu nestojí
+            self._nedostupne(exc, "reflex")
+            return
+        self._dostupne = True
+        if odpoved.get("accepted") is True:
+            zamer = (odpoved.get("reflex") or {}).get("intent")
+            logger.info(
+                "⚡ reflex '%s' → %s (revize %s)",
+                str(payload.get("transcript", ""))[:60], zamer, odpoved.get("revision"),
+            )
+        else:
+            # `no_reflex` je NORMÁLNÍ a nejčastější stav — běžná věta pro
+            # model není reflex. Na debug, ať to nezavalí info log.
+            logger.debug(
+                "reflex nesedl ('%s'): %s",
+                str(payload.get("transcript", ""))[:60], odpoved.get("reason"),
+            )
         session = odpoved.get("session")
         if isinstance(session, dict):
             self._prevezmi(session)
