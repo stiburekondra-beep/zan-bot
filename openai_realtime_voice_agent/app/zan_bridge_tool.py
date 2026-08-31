@@ -116,14 +116,17 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def get_ask_zan_tool_definition() -> Dict[str, Any]:
     return {
-        "type": "function", "name": "ask_zan",
+        "type": "function", "name": "zeptej_se_mozku",
+        # Popis je česky (model je promptovaný česky) a SCHVÁLNĚ neříká,
+        # jak vypadá výsledek — Pipecat na tomhle pohořel (PR #5278): když
+        # model zná tvar dat, zavolá nástroj podruhé a data si vymyslí.
         "description": (
-            "Send the exact request to Žán, the only brain with memory, permissions "
-            "and Home Assistant tools. Returns IMMEDIATELY with status 'delegated' — "
-            "that is NOT the answer. The answer arrives later on its own as a system "
-            "message; do not invent one meanwhile. Call exactly once for every turn."
+            "Předej dotaz Žánovu mozku. Mozek jediný má paměť, oprávnění "
+            "a nástroje domu. Vrátí se OKAMŽITĚ — to není odpověď a odpověď "
+            "od tebe se pak nečeká: mozek promluví sám. Zavolej ho jednou "
+            "za promluvu a pak mlč."
         ),
-        "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "Exact user utterance."}}, "required": ["text"]},
+        "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "Přesně to, co člověk řekl."}}, "required": ["text"]},
     }
 
 
@@ -220,14 +223,37 @@ def session_alive(service: Any) -> bool:
     """Je realtime session pořád živá? (Ne „byla, když jsme začínali.")
 
     Poučení `2026-08-23_health-na-portu-neni-funkcni-sluzba.md`: ptát se na
-    STAV spojení, ne čekat na událost. pipecat drží websocket v
-    `_websocket` a při odpojování zvedá `_disconnecting`.
+    STAV spojení, ne čekat na událost.
+
+    KAŽDÁ PUSA TO DRŽÍ JINDE (nalezeno 31. 8. 2026 živým testem):
+
+    * OpenAI Realtime (`OpenAIRealtimeLLMService`) — `self._websocket`,
+    * Gemini Live (`GeminiLiveLLMService`) — `self._session`; `_websocket`
+      na ní NEEXISTUJE.
+
+    Do dneška se ptalo jen na `_websocket`, takže u Gemini pusy vracela
+    tahle funkce VŽDY False. Následek nebyl vidět jako chyba, ale jako
+    povaha: `ask_zan` spadl do nouzového blokujícího režimu, odpověď mozku
+    se vrátila jako VÝSLEDEK NÁSTROJE a model ji převyprávěl vlastními
+    slovy — přesně to, co Ondra popisoval jako „mluví blbosti". Zároveň
+    tím byl mrtvý celý dispečer (fronta, TTL, priority) i doslovná řeč.
+
+    Doloženo v logu 15:20:27: `⚠️ ask_zan: není živá realtime session →
+    blokující režim`, ačkoli tatáž relace o vteřinu dřív v pořádku
+    přijala povel a zavolala nástroj.
+
+    Poučení `2026-08-23_pojistka-se-pri-pivotu-nepresouva-sama.md`: brzdy
+    a mechaniky jsou vlastností KONKRÉTNÍ CESTY kódu; při přesunu na
+    druhého poskytovatele se nepřestěhují samy a chybějící mechanika se
+    navenek tváří jako vlastnost modelu.
     """
     if service is None:
         return False
     if getattr(service, "_disconnecting", False):
         return False
-    return getattr(service, "_websocket", None) is not None
+    if getattr(service, "_websocket", None) is not None:
+        return True
+    return getattr(service, "_session", None) is not None
 
 
 def mluvi_prave(service: Any) -> bool:
@@ -243,6 +269,35 @@ def mluvi_prave(service: Any) -> bool:
     return getattr(service, "_current_assistant_response", None) is not None
 
 
+async def _inject_gemini(service: Any, text: str, run_llm: bool) -> bool:
+    """Vstříknutí do Gemini Live session.
+
+    Gemini nemá `conversation.item.create` ani `response.create` — má
+    `send_client_content(turns=…, turn_complete=…)`. A `turn_complete`
+    dělá přesně to, co potřebujeme rozlišit:
+
+    * `False` — text jen PŘIBUDE do kontextu a model nezačne mluvit.
+      Tudy jde záznam „tohle už zaznělo Žánovým hlasem" po doslovné řeči.
+    * `True` — model na text odpoví (záložní cesta, když mluvčí selže).
+
+    Role je `user`: Live API v `send_client_content` bere `user` a `model`,
+    systémová role tu neexistuje (ta se posílá jen jako
+    `system_instruction` při navazování spojení).
+    """
+    session = getattr(service, "_session", None)
+    if session is None:
+        return False
+    try:
+        await session.send_client_content(
+            turns=[{"role": "user", "parts": [{"text": text}]}],
+            turn_complete=bool(run_llm),
+        )
+    except Exception as exc:  # pragma: no cover - vstříknutí nesmí shodit most
+        logger.warning("⚠️ vstříknutí do Gemini session selhalo: %r", exc)
+        return False
+    return True
+
+
 async def inject_into_session(service: Any, text: str, *, run_llm: bool = True) -> bool:
     """Vloží zprávu do BĚŽÍCÍ session a (volitelně) nechá model odpovědět.
 
@@ -251,6 +306,10 @@ async def inject_into_session(service: Any, text: str, *, run_llm: bool = True) 
     """
     if not session_alive(service):
         return False
+    # Gemini pusa: jiné API, jiná cesta (viz `_inject_gemini`). Pozná se
+    # podle toho, že nemá websocket OpenAI Realtime klienta.
+    if getattr(service, "_websocket", None) is None:
+        return await _inject_gemini(service, text, run_llm)
     item = rt_events.ConversationItem(
         type="message",
         role="system",
@@ -283,10 +342,24 @@ async def inject_into_session(service: Any, text: str, *, run_llm: bool = True) 
 
 # Co uvidí model jako výsledek nástroje. Musí být neprůstřelně jasné, že
 # tohle NENÍ odpověď — jinak si lite model odpověď domyslí.
+# Co uvidí model jako výsledek nástroje.
+#
+# TVAR JE ZKOPÍROVANÝ Z PIPECAT 1.8.0 (`async_tool_messages.py`, viz research
+# `2026-08-31_realtime-hlas-jak-to-dela-svet.md` §3.1) — jsme na 0.0.97, ale
+# wording je jen text a funguje i bez upgradu. Dvě pravidla z jejich chyb
+# (PR #5278): (a) NIKDY nepopisovat tvar dat, které přijdou — model se je
+# pak snaží reprodukovat a zavolá nástroj podruhé s vymyšleným výsledkem;
+# (b) říct výslovně „nevolej znovu".
+#
+# A jedna věc navíc, která platí až po 31. 8. 2026: odpověď mozku uživateli
+# NEŘEKNE MODEL. Řekne ji Žánův vlastní hlas (mluvčí) a modelu přijde jen
+# záznam, co zaznělo. Proto tu nesmí zůstat „teprve tu řekneš uživateli" —
+# to by byl slib, na který model nemá dosah (poučení
+# `2026-08-25_slib-v-ustave-bez-dosahu.md`), a čekal by na svou repliku.
 ACK_NOTE = (
-    "Dotaz jsem předal Žán-Code. Tohle NENÍ odpověď — odpověď dorazí sama "
-    "za chvíli jako systémová zpráva a teprve tu řekneš uživateli. Do té "
-    "doby za mozek neodpovídej a nic si nevymýšlej."
+    "Úloha běží. Tohle NENÍ odpověď a odpověď od tebe se nečeká. "
+    "Nevolej nástroj znovu a nic si nedomýšlej. Až bude hotovo, řekne to "
+    "Žán sám; ty mlč a čekej na další promluvu člověka."
 )
 
 # LIDSKÉ HLÁŠKY PŘI ČEKÁNÍ (Ondra, 25. 8.: „ať to zní lidsky, ne robot").
@@ -302,6 +375,19 @@ ACK_NOTE = (
 #
 # ŽÁDNÉ ČÍSLICE (poučení 2026-08-05_ceske-tts-necist-cislice) — uplynulý
 # čas jde do logu, ne do řeči.
+#
+# 31. 8. 2026 SE PŘESTALY ŘÍKAT NAHLAS (Ondra: „casto mluvi blbosti
+# a opakuje fraze"; zadání: „žádné ‚moment, musím přemýšlet\u2018").
+#
+# Proč ticho a ne jiná věta: Home Assistant řeší čekání na Voice PE
+# VÝHRADNĚ vizuálně — pulzující LED „Thinking", žádný hlasový filler
+# (research §1, HA Assist pipeline). Tenhle most drží thinking fázi po
+# celou dobu běhu nástroje (`TURN_LIVENESS.tool_started()`), takže na
+# satelitu svítí prstenec a uživatel VIDÍ, že se pracuje. Přidávat k tomu
+# každých pětadvacet sekund větu je hluk, ne informace.
+#
+# Zůstávají jako LOG (a jako záloha, kdyby se `ZAN_ASK_PROGRESS_MAX`
+# vědomě zapnul na zařízení bez indikace stavu).
 PROGRESS_HINTS = (
     "Ještě na tom dělám, vydrž.",
     "Pořád nad tím přemýšlím.",
@@ -329,7 +415,8 @@ class ZanBridge:
         self.async_enabled = _env_bool("ZAN_ASK_ASYNC", True)
         self.progress_after = _env_float("ZAN_ASK_PROGRESS_AFTER", 25.0)
         self.progress_every = _env_float("ZAN_ASK_PROGRESS_EVERY", 45.0)
-        self.progress_max = _env_int("ZAN_ASK_PROGRESS_MAX", 3)
+        # 0 = nemluvit při čekání vůbec (viz PROGRESS_HINTS). Ticho + LED.
+        self.progress_max = _env_int("ZAN_ASK_PROGRESS_MAX", 0)
         self.max_pending = max(1, _env_int("ZAN_ASK_MAX_PENDING", 3))
         self.keep_thinking = _env_bool("ZAN_ASK_KEEP_THINKING", True)
         self._pending: Dict[int, asyncio.Task] = {}
@@ -347,6 +434,7 @@ class ZanBridge:
             session_ziva=lambda: session_alive(self._service),
             tik_s=_env_float("ZAN_DISPECER_TIK", 0.2),
             rozbeh_s=_env_float("ZAN_DISPECER_ROZBEH", 2.0),
+            rekni_doslova=self._rekni_doslova,
         )
         logger.info(
             "🧠 ask_zan most: async=%s timeout=%.0fs progress=%.0f/%.0fs×%d "
@@ -423,6 +511,18 @@ class ZanBridge:
     async def _vyslov(self, text: str, run_llm: bool = True) -> bool:
         """Jediná cesta z fronty do session. Volá to jenom dispečer."""
         return await inject_into_session(self._service, text, run_llm=run_llm)
+
+    async def _rekni_doslova(self, text: str) -> bool:
+        """Vyslovit text mozku PŘESNĚ (mluvčí Piper). Volá to jenom dispečer.
+
+        Vrací False, když pusa mixin nemá (starší služba) nebo mluvčí
+        selhal — dispečer pak spadne na starou cestu přes model.
+        """
+        service = self._service
+        rekni = getattr(service, "rekni_doslova", None)
+        if rekni is None:
+            return False
+        return bool(await rekni(text))
 
     # -- veřejné API ------------------------------------------------------
 
@@ -569,7 +669,7 @@ class ZanBridge:
             result = await asyncio.to_thread(_post_json, self.url, self.token, payload, self.timeout)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             logger.error("Žán bridge failed: %r", exc)
-            await params.result_callback("Teď se nedostanu ke svému mozku. Zkus to prosím znovu.")
+            await params.result_callback("Tohle mi teď nejde zjistit. Zkus to prosím znovu.")
             return
         reply = str(result.get("reply", "")).strip() or "Hotovo."
         if result.get("local_confirmation") == "success":
@@ -603,7 +703,11 @@ class ZanBridge:
                 progress.cancel()
                 logger.error("❌ ask_zan #%d: most na mozek selhal: %r", ask_id, exc)
                 self.dispecer.pridej_odpoved(
-                    "Teď se nedostanu ke svému mozku, zkus to prosím za chvilku znovu.",
+                    # BEZ ŽARGONU: „mozek" je slovo z naší architektury, ne
+                    # z domácnosti — osobnost pusy ho má zakázané, a od
+                    # 31. 8. tuhle větu vyslovuje Žán DOSLOVA, takže by ji
+                    # prozradil nahlas. Konkrétně, bez omluvy, s cestou ven.
+                    "Tohle mi teď nejde zjistit, zkus to prosím za chvilku znovu.",
                     interaction_id, druh="chyba",
                 )
                 return
@@ -622,22 +726,37 @@ class ZanBridge:
             )
 
     async def _consume(self, ask_id: int, interaction_id: str, text: str) -> int:
-        """Čte odpovědi mozku a zařazuje je do fronty jednu po druhé.
+        """Čte odpovědi mozku a zařazuje je do fronty HNED, jak přijdou.
 
-        Poslední se označí jako finální (`odpoved` — pusa smí uzavřít),
-        předchozí jako dílčí nález (`nalez` — ještě něco přijde).
+        PROČ SE TO 31. 8. 2026 ZMĚNILO. Původní kód držel každou položku
+        v ruce, dokud nedorazila NÁSLEDUJÍCÍ — jen aby té poslední mohl
+        dát druh `odpoved` místo `nalez`. U jednovětné odpovědi (což je
+        většina) to znamenalo čekat na UZAVŘENÍ streamu, tedy zahodit
+        celý smysl streamování: první věta se dala vyslovit hned, ale
+        čekalo se.
+
+        Ta cena byla placená za ROZDÍL VE FORMULACI — `nalez` říkal
+        modelu „hovor neuzavírej", `odpoved` „uzavři". Jenže odpověď
+        mozku od dneška vyslovuje mluvčí DOSLOVA, takže druh už na text
+        nemá vliv; platí jen za tou hranicí, kde se padá zpátky na model.
+        Latence je důležitější než odstín zálohy.
+
+        (Research 2026-08-31 §3.5: streaming vět je největší jednotlivá
+        latency páka vůbec — HA Voice měřil >5 s → ~0,5 s.)
         """
         zarazeno = 0
-        previous: Optional[Tuple[str, bool]] = None
+        posledni: Optional[Tuple[str, bool]] = None
         async for payload in self._stream(text):
             for item in self._items(payload):
-                if previous is not None:
-                    zarazeno += 1
-                    await self._zarad(ask_id, interaction_id, previous, final=False)
-                previous = item
-        if previous is not None:
-            zarazeno += 1
-            await self._zarad(ask_id, interaction_id, previous, final=True)
+                zarazeno += 1
+                if zarazeno == 1:
+                    logger.info("⚡ ask_zan #%d: první věta mozku jde do řeči hned", ask_id)
+                await self._zarad(ask_id, interaction_id, item, final=False)
+                posledni = item
+        if posledni is not None and zarazeno:
+            # Stream skončil. Nic se už nevysloví (to je hotové), jen se
+            # modelu potvrdí, že téma je uzavřené — jinak by čekal dál.
+            logger.info("🏁 ask_zan #%d: mozek dořekl (%d vět)", ask_id, zarazeno)
         return zarazeno
 
     def _items(self, payload: dict) -> List[Tuple[str, bool]]:

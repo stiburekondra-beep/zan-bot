@@ -23,7 +23,7 @@ from app.gemini_tools import (  # noqa: E402
 # Přesně ten tvar, jak ho most skládá v main.py (ask_zan + jeden MCP nástroj).
 ASK_ZAN = {
     "type": "function",
-    "name": "ask_zan",
+    "name": "zeptej_se_mozku",
     "description": "Send the exact request to Žán.",
     "parameters": {
         "type": "object",
@@ -53,7 +53,7 @@ def test_prevod_zachova_jmeno_popis_i_schema():
     declarations = to_gemini_function_declarations([ASK_ZAN])
     assert len(declarations) == 1
     decl = declarations[0]
-    assert decl["name"] == "ask_zan"
+    assert decl["name"] == "zeptej_se_mozku"
     assert decl["description"] == "Send the exact request to Žán."
     # Malá písmena (object/string) — shodně s pipecatím GeminiLLMAdapter;
     # sonda 30. 8. 2026 potvrdila, že server přijme velká i malá.
@@ -95,7 +95,7 @@ def test_duplicity_a_nesmysly_se_zahodi():
         {"type": "web_search_preview"},                 # vestavěný nástroj
         "tohle není slovník",
     ])
-    assert [d["name"] for d in declarations] == ["ask_zan"]
+    assert [d["name"] for d in declarations] == ["zeptej_se_mozku"]
 
 
 def test_prijme_i_chat_completions_tvar():

@@ -181,7 +181,7 @@ UTRZEK_VYJIMKY = frozenset({
     "GetDateTime",
     "todo_get_items",
     "web_search",
-    "ask_zan",
+    "zeptej_se_mozku",
     "disconnect",
 })
 
@@ -587,6 +587,76 @@ class FastLaneMixin:
             return False
         finally:
             self._fastlane_playing = False
+
+    # -----------------------------------------------------------------------
+    # DOSLOVNÁ ŘEČ MOZKU (31. 8. 2026) — „mluví mozek, pusa je tlumočník"
+    # -----------------------------------------------------------------------
+
+    async def rekni_doslova(self, text: str) -> bool:
+        """Vysloví text PŘESNĚ tak, jak přišel od mozku. Bez modelu.
+
+        Tohle je jediný rozdíl mezi „Žán tlumočí" a „Žán si vymýšlí".
+        Dosavadní cesta (vlož text do Live session + `response.create`)
+        dává text jazykovému modelu jako PODNĚT, ne jako věty k vyslovení —
+        a lite model ho přebásní. Živě z `hovory/2026-08-31.jsonl` 08:18:
+        na „Ukaž mi mozek." pusa odpověděla o poště a kalendáři.
+
+        Tady text do modelu nejde vůbec: `app/mluvci_piper.py` z něj udělá
+        PCM a to se do pipeline vloží stejnými rámci jako přednahraná fráze
+        (`play_phrase`). Pro zařízení je to k nerozeznání od řeči pusy.
+        Doslovnost je vlastností KONSTRUKCE, ne slibu v promptu.
+
+        Vrací False, když se to nepovedlo — volající pak smí sáhnout po
+        záložní cestě (vstříknout do session a nechat mluvit pusu), aby
+        Žán radši mluvil nepřesně než vůbec.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return False
+        try:
+            from app import mluvci_piper
+        except Exception as e:  # pragma: no cover - chybějící modul nesmí umlčet Žána
+            logger.warning("⚠️ mluvčí není k dispozici (%r) — nechám mluvit pusu", e)
+            return False
+
+        zacatek = time.monotonic()
+        try:
+            pcm = await asyncio.to_thread(mluvci_piper.synth, text)
+        except Exception as e:  # pragma: no cover
+            logger.warning("⚠️ mluvčí selhal (%r) — nechám mluvit pusu", e)
+            return False
+        if not pcm:
+            return False
+
+        # Vlastní hlas nesmí spadnout do filtru, který zahazuje řeč modelu
+        # během umlčení rychlou dráhou (`fastlane_muted`).
+        self._fastlane_playing = True
+        try:
+            await self.push_frame(TTSStartedFrame())
+            for i in range(0, len(pcm), FASTLANE_CHUNK_BYTES):
+                await self.push_frame(
+                    TTSAudioRawFrame(
+                        audio=pcm[i:i + FASTLANE_CHUNK_BYTES],
+                        sample_rate=FASTLANE_SAMPLE_RATE,
+                        num_channels=1,
+                    )
+                )
+            await self.push_frame(TTSStoppedFrame())
+        except Exception as e:  # pragma: no cover - přehrání nesmí shodit most
+            logger.warning("⚠️ přehrání řeči mozku selhalo: %r", e)
+            return False
+        finally:
+            self._fastlane_playing = False
+
+        # DŮKAZ NA SPRÁVNÉ VRSTVĚ (poučení 2026-08-24): logujeme text, který
+        # SKUTEČNĚ šel do syntézy, ne text, který jsme měli v úmyslu říct.
+        # Tenhle řádek je proto párový k „🧠 mozek řekl" a dá se porovnat
+        # znak po znaku.
+        logger.info(
+            "🗣️ VYSLOVENO DOSLOVA (%d B, %.2f s od přijetí): %s",
+            len(pcm), time.monotonic() - zacatek, text,
+        )
+        return True
 
     async def _verify_after_action(self, pre, plan) -> str:
         """Přečte stav PO akci a vrátí verdikt: ok / fail / unconfirmed / ha_down.

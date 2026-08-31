@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 # HA MCP read-only tool — never gated (reading a lock/boiler state is harmless).
 SAFE_READ_TOOLS = frozenset({"GetLiveContext"})
 # Our own bridge/util tools carry free user text in their args; never gate them.
-NEVER_GATE_TOOLS = frozenset({"ask_zan", "web_search", "disconnect_client"})
+NEVER_GATE_TOOLS = frozenset({"zeptej_se_mozku", "web_search", "disconnect_client"})
 # Normalized (lowercase, diacritics-stripped) keywords marking a risky target.
 _SENSITIVE_KEYWORDS = (
     "kotel", "kotl", "boiler",      # topný okruh / kotel

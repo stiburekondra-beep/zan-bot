@@ -39,6 +39,7 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     LLMTextFrame,
     LLMFullResponseEndFrame,
+    TTSStoppedFrame,
     TranscriptionFrame,
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -75,7 +76,14 @@ class TranscriptLogger(FrameProcessor):
             if isinstance(frame, (TTSTextFrame, LLMTextFrame)):
                 if frame.text:
                     self._assistant_buf.append(frame.text)
-            elif isinstance(frame, LLMFullResponseEndFrame):
+            # GEMINI PUSA (doplněno 31. 8. 2026): její cesta `LLMFullResponseEndFrame`
+            # dolů nepouští, takže se text, který model VYSLOVIL, nikdy nezapsal —
+            # tři a půl tisíce řádků logu a ani jedno „🤖 assistant:". Přitom je to
+            # jediné okno do toho, jestli si pusa vymýšlí. `TTSStoppedFrame` uzavírá
+            # promluvu u OBOU pus, takže se bere jako druhá závorka.
+            # (Vlastní doslovná řeč Žána sem nespadne — ta žádné TTSTextFrame
+            # negeneruje, takže je nárazník prázdný a nic se nezaloguje.)
+            elif isinstance(frame, (LLMFullResponseEndFrame, TTSStoppedFrame)):
                 text = "".join(self._assistant_buf).strip()
                 self._assistant_buf = []
                 if text:

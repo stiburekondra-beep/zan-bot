@@ -76,6 +76,20 @@ ROZBEH_S = 2.0
 # ŽÁDNÉ ČÍSLICE v ničem, co model vysloví (poučení
 # `2026-08-05_ceske-tts-necist-cislice.md`) — pořadová čísla, uplynulý čas
 # a délky patří do logu, ne do řeči.
+#: DRUHY, které se vyslovují DOSLOVA vlastním hlasem (`rekni_doslova`).
+#:
+#: PROČ (Ondra, 31. 8. 2026): „casto mluvi blbosti a opakuje fraze."
+#: Text mozku poslaný do Live session je pro model PODNĚT, ne scénář —
+#: přebásní ho, zkrátí, nebo si domyslí něco jiného. Cokoli, co je
+#: OBSAHEM (odpověď, dílčí nález, oprava, konkrétní selhání), proto
+#: vyslovuje mluvčí (Piper) znak po znaku a model to jen dostane do
+#: kontextu, aby věděl, co zaznělo.
+#:
+#: `potvrzeni` tu není schválně — to už zaznělo z knihovny frází.
+#: `prubeh` a `smalltalk` tu nejsou proto, že po přestavbě do fronty
+#: vůbec nepadají (zamlouvání nahradil zvuk, viz `zan_bridge_tool`).
+DOSLOVNE_DRUHY = frozenset({"odpoved", "nalez", "oprava", "chyba"})
+
 HLAVICKY = {
     "odpoved": (
         "ŽÁN-CODE ODPOVĚDĚL na dotaz, který jsi mu předal. Řekni to uživateli "
@@ -124,6 +138,23 @@ def obal(tema: Tema) -> str:
     return f"{hlavicka}:\n„{tema.obsah}\""
 
 
+def kontext_po_doslovne(tema: Tema) -> str:
+    """Co se pusa dozví o větě, kterou VYSLOVIL mluvčí, ne ona.
+
+    Model musí vědět, co v místnosti zaznělo (jinak by na doplňující
+    otázku odpovídal do prázdna), ale nesmí to zopakovat. Tvar je
+    schválně holé konstatování minulého děje bez jediné instrukce
+    „řekni" — poučení `2026-08-23_dva-zdroje-reci-a-protichudne-instrukce`:
+    dvě protichůdná pravidla v jednom promptu dělají dvojhlas.
+    """
+    return (
+        "TOHLE UŽ UŽIVATEL SLYŠEL — právě to nahlas zaznělo Žánovým hlasem "
+        "z odpovědi mozku. Neopakuj to, nekomentuj to, jen si to pamatuj "
+        "pro další otázky:\n"
+        "„%s\u201c" % tema.obsah
+    )
+
+
 class DispecerReci:
     """Dispečerská smyčka nad `FrontaTemat`.
 
@@ -144,9 +175,16 @@ class DispecerReci:
         tik_s: float = TIK_S,
         rozbeh_s: float = ROZBEH_S,
         fronta: Optional[FrontaTemat] = None,
+        rekni_doslova: Optional[Callable[[str], Awaitable[bool]]] = None,
     ) -> None:
         self.fronta = fronta if fronta is not None else FrontaTemat()
         self._vyslov = vyslov
+        # Mluvčí mozku. Když chybí nebo selže, spadne se na starou cestu
+        # (vstříknout do session a nechat mluvit pusu) — radši nepřesně
+        # než němý dům. Každý takový pád se loguje, ať to nezůstane tiché.
+        self._rekni_doslova = rekni_doslova
+        self.vysloveno_doslova = 0
+        self.doslova_selhalo = 0
         self._pusa_mluvi = pusa_mluvi
         self._session_ziva = session_ziva if session_ziva is not None else (lambda: True)
         self.tik_s = max(0.02, float(tik_s))
@@ -293,13 +331,39 @@ class DispecerReci:
         if tema is None:
             return None
 
-        text = obal(tema)
-        try:
-            odeslano = await self._vyslov(text, tema.run_llm)
-        except Exception as exc:  # pragma: no cover - dispečer nesmí umřít
-            logger.error("❌ dispečer: vyslovení selhalo (%r) — položka zahozena: %.120s",
-                         exc, tema.obsah)
-            return None
+        # --- 4a. DOSLOVNÁ CESTA: mluví mozek, pusa je jen reproduktor ---
+        odeslano = False
+        doslova = False
+        if tema.druh in DOSLOVNE_DRUHY and self._rekni_doslova is not None:
+            try:
+                odeslano = await self._rekni_doslova(tema.obsah)
+            except Exception as exc:  # pragma: no cover - mluvčí nesmí umřít
+                logger.error("❌ dispečer: mluvčí spadl (%r)", exc)
+                odeslano = False
+            if odeslano:
+                doslova = True
+                self.vysloveno_doslova += 1
+                # Pusa se musí dozvědět, co zaznělo — ale bez řeči.
+                try:
+                    await self._vyslov(kontext_po_doslovne(tema), False)
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("⚠️ dispečer: kontext po doslovné řeči neprošel (%r)", exc)
+            else:
+                self.doslova_selhalo += 1
+                logger.warning(
+                    "⚠️ dispečer: mluvčí nevyslovil (%s) — padám na pusu, "
+                    "text se může změnit: %.120s", tema.druh, tema.obsah,
+                )
+
+        # --- 4b. ZÁLOŽNÍ CESTA: nechat to říct pusu (může přebásnit) ---
+        if not odeslano:
+            text = obal(tema)
+            try:
+                odeslano = await self._vyslov(text, tema.run_llm)
+            except Exception as exc:  # pragma: no cover - dispečer nesmí umřít
+                logger.error("❌ dispečer: vyslovení selhalo (%r) — položka zahozena: %.120s",
+                             exc, tema.obsah)
+                return None
 
         if not odeslano:
             logger.info("🗑️ dispečer: %s zahozeno — nebylo kam vstříknout: %.120s",
@@ -307,10 +371,13 @@ class DispecerReci:
             return None
 
         self.vysloveno += 1
-        if tema.run_llm and self.rozbeh_s > 0:
+        # Rozběh platí pro OBĚ cesty: i doslovná řeč chvíli hraje z reproduktoru
+        # a druhá položka by ji překřičela.
+        if (doslova or tema.run_llm) and self.rozbeh_s > 0:
             self._rozbeh_do = nyni + self.rozbeh_s
-        logger.info("💉 dispečer: vysloveno (druh=%s priorita=%d): %.120s",
-                    tema.druh, tema.priorita, tema.obsah)
+        logger.info("💉 dispečer: vysloveno (druh=%s priorita=%d cesta=%s): %.120s",
+                    tema.druh, tema.priorita,
+                    "doslova" if doslova else "pusa", tema.obsah)
         return tema
 
     async def _bezet(self) -> None:
