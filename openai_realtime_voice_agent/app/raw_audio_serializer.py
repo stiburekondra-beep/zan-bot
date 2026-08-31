@@ -2,10 +2,20 @@
 import json
 import logging
 import os
+import time
 from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, Frame
 from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
 
 logger = logging.getLogger(__name__)
+
+# NABEH TICHA. Satelit (HA Voice PE) rozjizdi vystupni stream az s prvnim
+# bajtem, takze prvni ~300 ms kazde nove promluvy spolkne. Ondra 31. 8. 2026
+# v labu slysel misto 'Podivam se na to' jen '...am se na to'. Plati to pro
+# vsechny tri zdroje zvuku (pusa Gemini, mluvci Piper, prednahrane fraze),
+# proto se ticho pridava tady, v jedinem hrdle vystupniho zvuku.
+NABEH_TICHA_MS = float(os.environ.get('ZAN_NABEH_TICHA_MS', '280'))
+# Mezera, po ktere se dalsi ramec povazuje za ZACATEK nove promluvy.
+NABEH_PAUZA_S = float(os.environ.get('ZAN_NABEH_PAUZA_S', '0.6'))
 
 
 class RawAudioSerializer(FrameSerializer):
@@ -25,6 +35,8 @@ class RawAudioSerializer(FrameSerializer):
         if input_sample_rate is None:
             input_sample_rate = int(os.environ.get("DEVICE_INPUT_SAMPLE_RATE", "16000"))
         self._input_sample_rate = input_sample_rate
+        # Kdy naposledy odesel vystupni zvuk do zarizeni (nabeh ticha).
+        self._posledni_vystup = 0.0
         # Async callback invoked when the device sends {"type":"interrupt"} (the
         # "stop" wake word). Set by WebSocketHandler.build_pipeline once it has
         # the OpenAI service. We deliberately do NOT emit a pipecat
@@ -206,6 +218,13 @@ class RawAudioSerializer(FrameSerializer):
         """
         if isinstance(frame, OutputAudioRawFrame):
             audio_bytes = frame.audio
+            nyni = time.monotonic()
+            if NABEH_TICHA_MS > 0 and (nyni - self._posledni_vystup) > NABEH_PAUZA_S:
+                rate = int(getattr(frame, 'sample_rate', 0) or 24000)
+                vzorku = int(rate * NABEH_TICHA_MS / 1000.0)
+                audio_bytes = bytes(2 * vzorku) + audio_bytes
+                logger.info('nabeh: pred zacatek promluvy jde %.0f ms ticha (%d Hz)', NABEH_TICHA_MS, rate)
+            self._posledni_vystup = nyni
             logger.debug(f"📤 Serializing OutputAudioRawFrame: {len(audio_bytes)} bytes")
             return audio_bytes
         # For other frame types, return empty bytes (not serialized)

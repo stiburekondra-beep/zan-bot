@@ -165,8 +165,11 @@ class FrontaTemat:
         if not self._polozky:
             return False
         nyni = time.monotonic() if nyni is None else nyni
-        if self._posledni_vydani is None:
-            # Nikdy nic nevydáno — měřítkem je vznik nejstarší položky.
-            nejstarsi = min(t.vzniklo for t in self._polozky)
-            return (nyni - nejstarsi) > WATCHDOG_S
-        return (nyni - self._posledni_vydani) > WATCHDOG_S
+        # Měřítkem je VŽdy stáří nejdéle čekající položky, NIKDY čas od
+        # posledního vydání. `_posledni_vydani` se totiž nenuluje, když
+        # fronta doběhne do prázdna — a ticho mezi dvěma otázkami (běžně
+        # minuty) se pak počítalo jako „zaseknuté hrdlo“. Důsledek
+        # (31. 8. 2026, log zan-realtime 16:33–16:46): každá odpověď mozku
+        # se zahodila do dvou set milisekund po zařazení a Žán nedřekl nic.
+        nejstarsi = min(t.vzniklo for t in self._polozky)
+        return (nyni - nejstarsi) > WATCHDOG_S
