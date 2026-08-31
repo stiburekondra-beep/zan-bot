@@ -45,7 +45,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from google.genai.types import EndSensitivity
+from google.genai.types import Blob, EndSensitivity
 from pipecat.frames.frames import (
     LLMTextFrame,
     TranscriptionFrame,
@@ -57,6 +57,7 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.google.gemini_live.llm import (
+    ContextWindowCompressionParams,
     GeminiLiveLLMService,
     GeminiModalities,
     GeminiVADParams,
@@ -131,6 +132,38 @@ _IZOLOVANY_PAD_S = 60.0
 #: Vypnout: ``ZAN_VETA_TICHO_MS=0``.
 _VETA_TICHO_MS_DEFAULT = 800
 
+#: KEEPALIVE: po kolika sekundách BEZ JEDINÉHO KOUSKU ZVUKU pošleme Geminimu
+#: dávku digitálního ticha, aby session nespadla na nečinnost.
+#:
+#: PROČ TO TU JE (změřeno 31. 8. 2026 sondou proti holému ``google-genai``,
+#: tentýž klíč a model jako most): Gemini Live zavře session, do které klient
+#: ~150 s nic nepošle, kódem ``1008 The operation was aborted.`` Sonda, která
+#: ticho posílala průběžně, žila 400,1 s bez jediného pádu; sonda, která
+#: neposlala NIC, umřela v t=150,3 s přesně tou hláškou, kterou máme v logu.
+#: Náš satelit (HA Voice PE) mikrofon mezi tahy brání ("mic-streaming gate"),
+#: takže most mezi promluvami Geminimu neposílá NIC — ten limit si tedy
+#: vyrábíme sami, není to strop Googlu na délku session.
+#:
+#: DRUHÝ, HORŠÍ NÁSLEDEK: Google posílá ``sessionResumptionUpdate`` JEN jako
+#: reakci na vstup od klienta. Táž dvojice sond: 433 handlů za 400 s když
+#: ticho teklo, NULA za 127 s když neteklo nic. Bez handle se pipecat po pádu
+#: připojí s ``handle=None`` → NOVÁ session → celý dosavadní rozhovor je pryč.
+#: Keepalive tedy nedrží jen spojení, ale i paměť rozhovoru.
+_KEEPALIVE_PERIOD_S = float(os.environ.get("ZAN_GEMINI_KEEPALIVE_S", "").strip() or 20.0)
+
+#: Jak dlouhá dávka ticha se posílá. Účtuje se jako zvuk (25 tok/s), takže
+#: 100 ms jednou za 20 s = 0,125 tok/s — v šumu.
+_KEEPALIVE_BURST_MS = int(os.environ.get("ZAN_GEMINI_KEEPALIVE_MS", "").strip() or 100)
+
+#: Vzorkovací frekvence keepalive ticha, dokud neznáme tu skutečnou z mikrofonu.
+_KEEPALIVE_RATE_DEFAULT = 16000
+
+#: TVRDÁ PODLAHA: i kdyby všechny měkké podmínky říkaly „teď ne" (Žán mluví,
+#: vstup je pozastavený), po tolika sekundách bez JEDINÉHO bajtu odeslaného
+#: Googlu se ticho pošle stejně. Brzda musí být fail-closed: měřená hranice
+#: pádu je ~150 s, tohle je s rezervou pod ní.
+_KEEPALIVE_STROP_S = float(os.environ.get("ZAN_GEMINI_KEEPALIVE_STROP_S", "").strip() or 100.0)
+
 #: Konec věty v SYROVÉM přepisu. Musí sedět na `sentence_accumulator.split_closed`,
 #: která dělí na tomtéž — jen nad normalizovaným textem.
 _KONEC_VETY = re.compile(r"[.!?]+")
@@ -168,6 +201,11 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
         super().__init__(**kwargs)
         # Brzda terminálního pádu smí proběhnout jen jednou za život služby.
         self._pusa_brzda_spustena = False
+        # KEEPALIVE TICHA (viz `_KEEPALIVE_PERIOD_S`).
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._keepalive_rate = _KEEPALIVE_RATE_DEFAULT
+        self._keepalive_posledni_vstup = time.monotonic()
+        self._keepalive_odeslano = 0
         # PRŮBĚŽNÉ VĚTY ZE VSTUPU (viz `_handle_msg_input_transcription` níž).
         self._vety = SentenceAccumulator()
         self._vety_segment = ""
@@ -370,6 +408,97 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
         except Exception as e:  # pragma: no cover - filtr nesmí shodit pipeline
             logger.warning("⚠️ fast-lane filtr (gemini) selhal, propouštím: %r", e)
         return await super().push_frame(frame, direction)
+
+    # ------------------------------------------------------------------
+    # KEEPALIVE TICHA — ať session nespadne na nečinnost (viz konstanty výš)
+    # ------------------------------------------------------------------
+    async def _send_user_audio(self, frame):  # type: ignore[override]
+        """Orazítkuje ODESLANÝ zvuk a zapamatuje si jeho frekvenci.
+
+        POZOR NA ROZDÍL (chyba z první verze, 31. 8. 18:49): rámec, který sem
+        DOJDE, ještě není rámec, který Google DOSTANE — pipecat ho v
+        ``_send_user_audio`` zahodí, když je ``_audio_input_paused``. Razítko
+        na příchod tedy keepalivu lhalo: tvářilo se, že vstup teče, i když
+        Googlu neodešlo nic, a keepalive pak nikdy nevystřelil. Razítkujeme
+        proto jen tehdy, když rámec pipecatími guardy opravdu prošel.
+        """
+        rate = getattr(frame, "sample_rate", None)
+        if rate:
+            self._keepalive_rate = rate
+        odeslano = not (
+            getattr(self, "_audio_input_paused", False)
+            or self._disconnecting
+            or not self._session
+        )
+        await super()._send_user_audio(frame)
+        if odeslano:
+            self._keepalive_posledni_vstup = time.monotonic()
+
+    async def _handle_session_ready(self, session):  # type: ignore[override]
+        """Po každém (i obnoveném) spojení nastartuje keepalive."""
+        await super()._handle_session_ready(session)
+        self._keepalive_posledni_vstup = time.monotonic()
+        if self._keepalive_task is None and _KEEPALIVE_PERIOD_S > 0:
+            self._keepalive_task = self.create_task(self._keepalive_smycka())
+            logger.info(
+                "\U0001f493 keepalive gemini: %d ms ticha po %.0f s bez vstupu",
+                _KEEPALIVE_BURST_MS, _KEEPALIVE_PERIOD_S,
+            )
+
+    async def _zastav_keepalive(self) -> None:
+        if self._keepalive_task is not None:
+            task, self._keepalive_task = self._keepalive_task, None
+            try:
+                await self.cancel_task(task, timeout=1.0)
+            except Exception as e:  # pragma: no cover - úklid nesmí spadnout
+                logger.debug("keepalive se nepodařilo zrušit: %r", e)
+
+    async def _disconnect(self):  # type: ignore[override]
+        await self._zastav_keepalive()
+        await super()._disconnect()
+
+    async def _keepalive_smycka(self) -> None:
+        """Když dlouho nic neteče, pošli Geminimu dávku digitálního ticha.
+
+        Posílá se JEN při skutečné nečinnosti — ne když mluví člověk (to teče
+        mikrofon a razítko se obnovuje v ``_send_user_audio``) a ne když mluví
+        Žán (``_bot_is_responding``), aby si most nepřerušil vlastní odpověď.
+        """
+        rate = self._keepalive_rate
+        ticho = b"\x00" * (rate * 2 * _KEEPALIVE_BURST_MS // 1000)
+        while True:
+            await asyncio.sleep(1.0)
+            if not self._session or self._disconnecting:
+                continue
+            od_vstupu = time.monotonic() - self._keepalive_posledni_vstup
+            # Tvrdá podlaha přebíjí měkké podmínky — viz `_KEEPALIVE_STROP_S`.
+            nouze = od_vstupu >= _KEEPALIVE_STROP_S
+            if not nouze:
+                if getattr(self, "_audio_input_paused", False):
+                    continue
+                if getattr(self, "_bot_is_responding", False):
+                    continue
+                if od_vstupu < _KEEPALIVE_PERIOD_S:
+                    continue
+            if self._keepalive_rate != rate:
+                rate = self._keepalive_rate
+                ticho = b"\x00" * (rate * 2 * _KEEPALIVE_BURST_MS // 1000)
+            try:
+                await self._session.send_realtime_input(
+                    audio=Blob(data=ticho, mime_type="audio/pcm;rate=%d" % rate)
+                )
+            except Exception as e:
+                logger.debug("keepalive neprošel (spojení se právě mění?): %r", e)
+                continue
+            self._keepalive_posledni_vstup = time.monotonic()
+            self._keepalive_odeslano += 1
+            if self._keepalive_odeslano in (1, 10) or self._keepalive_odeslano % 30 == 0:
+                logger.info(
+                    "\U0001f493 keepalive gemini: %d. dávka ticha "
+                    "(%d ms @ %d Hz, %.0f s bez vstupu%s)",
+                    self._keepalive_odeslano, _KEEPALIVE_BURST_MS, rate,
+                    od_vstupu, ", TVRDÁ PODLAHA" if nouze else "",
+                )
 
     async def _handle_connection_error(self, error: Exception) -> bool:  # type: ignore[override]
         """Terminální pád gemini pusy nesmí skončit smyčkou ``ErrorFrame``.
@@ -585,6 +714,14 @@ def build_gemini_service(*,
         vad=build_gemini_vad_params(
             vad_eagerness, vad_silence_duration_ms, vad_prefix_padding_ms
         ),
+        # KONTEXTOVÉ OKNO SE MUSÍ SAMO OŘEZÁVAT, jinak session skončí, až se
+        # naplní. Google to říká natvrdo: „Without compression, audio-only
+        # sessions are limited to 15 minutes ... you can use context window
+        # compression to extend sessions to an unlimited amount of time."
+        # (ai.google.dev/gemini-api/docs/live-session). Bez tohohle by
+        # keepalive výš problém jen odsunul z 2,5 minuty na čtvrt hodiny.
+        # `trigger_tokens=None` = výchozích 80 % okna (128k → ~102k).
+        context_window_compression=ContextWindowCompressionParams(enabled=True),
     )
     if max_output_tokens:
         params.max_tokens = max_output_tokens
