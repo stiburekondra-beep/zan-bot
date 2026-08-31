@@ -77,91 +77,6 @@ from app.gemini_tools import (
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# ZASAH DO CIZI KNIHOVNY (pipecat-ai 0.0.97) -- cs-CZ na vstupni prepis.
-# =============================================================================
-#
-# `pipecat.services.google.gemini_live.llm.GeminiLiveLLMService._connect()`
-# posila Google Live API napevno:
-#
-#     input_audio_transcription=AudioTranscriptionConfig(),   # PRAZDNE
-#     output_audio_transcription=AudioTranscriptionConfig(),
-#
-# -- zadny kwarg service/InputParams tohle neovlivni (overeno na zivem
-# procesu 31. 8. 2026: `inspect.getsourcelines` na `_connect` a signatura
-# `GeminiLiveLLMService.__init__`/`InputParams`). Vystup uz jazyk dostava
-# jinudy (SpeechConfig.language_code, viz `_language_code` nize v tomhle
-# souboru); vstup jede na autodetekci, i kdyz v dome vime, ze se mluvi
-# cesky. Domacnost o tomhle stavela karta -21 (baklazan-hq/firma/ukoly).
-#
-# `AudioTranscriptionConfig` i `LiveConnectConfig` pipecat importuje JMENEM
-# (`from google.genai.types import ...`) primo do sveho modulu -- Python je
-# tedy za behu vyhledava v modulovem jmennem prostoru `pipecat...gemini_live.
-# llm`, ne v nasem. Nahrazujeme tam `LiveConnectConfig` tenkym wrapperem: kdyz
-# dostane PRAZDNY `input_audio_transcription` (zadne `language_codes`), dosadi
-# `language_codes=["cs-CZ"]`. `output_audio_transcription` se NEDOTYKA --
-# ukol 2 chtel vyslovene jen vstup.
-try:
-    import pipecat.services.google.gemini_live.llm as _gemini_llm_modul
-    from google.genai.types import (
-        AudioTranscriptionConfig as _GenAiAudioTranscriptionConfig,
-        LiveConnectConfig as _GenAiLiveConnectConfig,
-    )
-except Exception as _e:  # pragma: no cover - gemini vetev se nenatahne vubec
-    logger.error("⚠️ cs-CZ patch vstupniho prepisu: pipecat/google.genai se "
-                 "nepodarilo importovat, patch se NEPROVEDL: %r", _e)
-    _gemini_llm_modul = None
-
-
-def _cscz_live_connect_config(*args, **kwargs):
-    """Nahrazuje `LiveConnectConfig` uvnitr pipecat modulu -- viz banner výš."""
-    iat = kwargs.get("input_audio_transcription")
-    if (
-        isinstance(iat, _GenAiAudioTranscriptionConfig)
-        and not getattr(iat, "language_codes", None)
-    ):
-        kwargs["input_audio_transcription"] = _GenAiAudioTranscriptionConfig(
-            language_codes=["cs-CZ"]
-        )
-    return _GenAiLiveConnectConfig(*args, **kwargs)
-
-
-def _over_patch_input_transcription() -> None:
-    """Sebekontrola: patch se OPRAVDU pouzije, jinak se to nema tise ztratit.
-
-    Voláno z `build_gemini_service()` (jednou na start sluzby), ne pri
-    importu modulu -- ať se log neopakuje pri kazdem `_connect`/reconnectu.
-    """
-    if _gemini_llm_modul is None:
-        return
-    if getattr(_gemini_llm_modul, "LiveConnectConfig", None) is not _cscz_live_connect_config:
-        logger.error(
-            "⚠️ cs-CZ patch vstupniho prepisu SE NEPROVEDL — "
-            "pipecat.services.google.gemini_live.llm.LiveConnectConfig neni "
-            "nas wrapper (pipecat asi zmenil import). Vstupni prepis jede na "
-            "autodetekci jazyka, ne na cs-CZ."
-        )
-        return
-    # Funkcni test na skutecnem typu z knihovny, ne jen na identite objektu --
-    zkouska = _cscz_live_connect_config(
-        input_audio_transcription=_GenAiAudioTranscriptionConfig(),
-        output_audio_transcription=_GenAiAudioTranscriptionConfig(),
-    )
-    vstup_ok = list(getattr(zkouska.input_audio_transcription, "language_codes", None) or []) == ["cs-CZ"]
-    vystup_nedotceno = not getattr(zkouska.output_audio_transcription, "language_codes", None)
-    if vstup_ok and vystup_nedotceno:
-        logger.info("🇨🇿 cs-CZ patch vstupniho prepisu: aktivni (output_audio_transcription nedotceny)")
-    else:
-        logger.error(
-            "⚠️ cs-CZ patch vstupniho prepisu: funkcni sebekontrola SELHALA "
-            "(vstup_ok=%s vystup_nedotceno=%s) — nevěř mu.", vstup_ok, vystup_nedotceno,
-        )
-
-
-if _gemini_llm_modul is not None:
-    _gemini_llm_modul.LiveConnectConfig = _cscz_live_connect_config
-# =============================================================================
-
 #: Podřetězce ve jméně modelu, které signalizují „``languageCode`` odmítá".
 #: Sonda 30. 8. 2026: ``gemini-2.5-flash-native-audio-preview…`` vrátí na
 #: ``cs-CZ`` chybu 1007 „Unsupported language code"; ``gemini-3.1-flash-
@@ -793,7 +708,6 @@ def build_gemini_service(*,
     samo od sebe promluví. Na OpenAI straně se týž problém řeší předsazením
     prázdného kontextu v ``main.run()``; tady stačí tenhle přepínač.
     """
-    _over_patch_input_transcription()
     tools = build_gemini_tools_schema(openai_tools)
     params = InputParams(
         modalities=GeminiModalities.AUDIO,
