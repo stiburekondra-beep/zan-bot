@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from google.genai.types import EndSensitivity
@@ -81,6 +82,27 @@ _EXIT_DELAY_S = 2.0
 #: Návratový kód "dočasné selhání" (EX_TEMPFAIL) — v ``docker inspect`` je pak
 #: vidět, že most odešel vlastní brzdou, ne že ho někdo zabil.
 _EXIT_CODE = 75
+
+#: Odstup, od kterého je pád POVAŽOVÁN ZA IZOLOVANÝ, ne za pokračování
+#: sesypání.
+#:
+#: PROČ (incident 31. 8. 2026, 09:37): Ondra si vyžádal gemini pusu do LABu a
+#: brzda mu ji za osm minut sebrala, aniž by se cokoli sesypalo. Dostal tři
+#: OJEDINĚLÉ ``1008`` — 09:32:30, 09:35:03, 09:37:36 — každý se sám vrátil do
+#: 0,4 s. Počítadlo ``_consecutive_failures`` je ale v pipecatu vynulované
+#: jedině v ``_check_and_reset_failure_counter()``, a to se volá
+#: (``gemini_live/llm.py:1194``) **uvnitř přijímací smyčky na každou došlou
+#: zprávu**. Když se satelitem nikdo nemluví, žádná zpráva nechodí a stabilní
+#: spojení se nezapočítá — takže „consecutive" ve skutečnosti znamená
+#: „kumulativní za libovolně dlouhou dobu ticha". Tři nezávislé výpadky za pět
+#: minut nečinnosti pak vypadají stejně jako sesypání.
+#:
+#: Brzda přitom vznikla na NĚCO JINÉHO: na 30. 8., kdy se pipecat zacyklil ve
+#: spamu ``ErrorFrame`` (zdroj popisuje flood ~15/s) a most oněměl. Tam jdou
+#: pády po sobě v řádu milisekund až sekund, tedy hluboko pod touhle hranicí —
+#: pro ten případ zůstává brzda beze změny a vystřelí pořád na třetím pádu.
+#: Ubývá jen falešný poplach, kdy se počítadlo plazí nahoru přes minuty ticha.
+_IZOLOVANY_PAD_S = 60.0
 
 
 def _tvrdy_konec() -> None:
@@ -192,6 +214,24 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
         provozu je řádově složitější než restart a most tu nemá co držet —
         session je stejně po smrti. Jednoduchost je tady ta bezpečnější volba.
         """
+        # IZOLOVANÝ PÁD NENÍ SESYPÁNÍ (viz `_IZOLOVANY_PAD_S`). Když od
+        # minulého pádu uběhla víc než minuta, počítadlo se vynuluje HNED
+        # TEĎ — pipecat by to sám udělal jen tehdy, kdyby zrovna chodily
+        # zprávy, takže při tichu v pokoji se plazí nahoru donekonečna.
+        # Musí to být PŘED `super()`, protože ten počítadlo zvedá a nad
+        # `MAX_CONSECUTIVE_FAILURES` rovnou vrací False.
+        ted = time.monotonic()
+        predchozi = getattr(self, "_posledni_pad_t", None)
+        if predchozi is not None and (ted - predchozi) > _IZOLOVANY_PAD_S:
+            logger.info(
+                "🔁 Gemini: od minulého pádu uběhlo %.0f s (> %.0f s) — beru to "
+                "jako ojedinělý výpadek, ne sesypání; počítadlo z %s zpět na 0.",
+                ted - predchozi, _IZOLOVANY_PAD_S,
+                getattr(self, "_consecutive_failures", "?"),
+            )
+            self._consecutive_failures = 0
+        self._posledni_pad_t = ted
+
         should_reconnect = await super()._handle_connection_error(error)
         if should_reconnect:
             return True
