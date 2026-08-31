@@ -37,7 +37,11 @@ from pipecat.frames.frames import (
 )
 
 from app.phase_emitter import TURN_LIVENESS
-from app.voice_safety import is_sensitive_actuation
+from app.voice_safety import (
+    is_sensitive_actuation,
+    saha_na_vlastni_hlas,
+    bezcilny_zasah,
+)
 from app.voice_fastlane import (
     CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
     SAMPLE_RATE as FASTLANE_SAMPLE_RATE,
@@ -357,6 +361,58 @@ class FastLaneMixin:
                     return
             except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
                 logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
+
+            # VLASTNI HLAS (2026-08-31). Zan si nesmi stahnout ani umlcet
+            # prehravac, kterym mluvi. Fail-closed: pri nejistote NEPUSTIT --
+            # nemy Zan je porucha, kterou nema jak ohlasit.
+            try:
+                duvod_hlas = saha_na_vlastni_hlas(
+                    function_name, getattr(params, "arguments", None))
+            except Exception as e:  # pragma: no cover - brzda nesmi shodit tool
+                logger.warning("⚠️ brzda vlastniho hlasu selhala — NEPOUSTIM: %r", e)
+                duvod_hlas = "brzda selhala, nepoustim naslepo"
+            if duvod_hlas:
+                logger.warning(
+                    "🔊 BRZDA vlastniho hlasu: %s(%r) NEPROVADIM — %s",
+                    function_name, getattr(params, "arguments", None), duvod_hlas,
+                )
+                self._rozbor(
+                    "vlastni-hlas",
+                    volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
+                    vysledek="neprovedeno",
+                    poznamka=duvod_hlas,
+                )
+                await params.result_callback(
+                    "Hlasitost jsem neměnil. Takhle bez určení zařízení bych "
+                    "ztlumil i sám sebe. Řekni, kterému zařízení se má "
+                    "hlasitost změnit."
+                )
+                return
+
+            # BEZCILNY ZASAH (2026-08-31). "Bez cile" v Home Assistantu neni
+            # "nic", ale "vsechno, co odpovida" -- u zhasinani cely dum.
+            try:
+                duvod_bezcil = bezcilny_zasah(
+                    function_name, getattr(params, "arguments", None))
+            except Exception as e:  # pragma: no cover - brzda nesmi shodit tool
+                logger.warning("⚠️ brzda bezcilneho zasahu selhala — NEPOUSTIM: %r", e)
+                duvod_bezcil = "brzda selhala, nepoustim naslepo"
+            if duvod_bezcil:
+                logger.warning(
+                    "🎯 BRZDA bezcilneho zasahu: %s(%r) NEPROVADIM — %s",
+                    function_name, getattr(params, "arguments", None), duvod_bezcil,
+                )
+                self._rozbor(
+                    "bezcilny-zasah",
+                    volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
+                    vysledek="neprovedeno",
+                    poznamka=duvod_bezcil,
+                )
+                await params.result_callback(
+                    "Neprovedl jsem to — nevím, čeho se to má týkat, a plošně "
+                    "to udělat nechci. Řekni, které zařízení nebo místnost."
+                )
+                return
 
             # OPRAVA OBLASTI (2026-08-31): model umí poslat `living_room`
             # místo „Obývák" a HA to odmítne jako INVALID_AREA — navenek to
@@ -702,6 +758,29 @@ class FastLaneMixin:
         except Exception as e:  # pragma: no cover
             logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
 
+#: Jak poznat, ze vysledek nastroje je ve skutecnosti chyba. MCP je vraci
+#: jako text, takze isinstance(..., Exception) je nechyti.
+_CHYBOVE_ZNAKY = (
+    "input validation error",
+    "error calling tool",
+    "matchfailederror",
+    "no_match",
+    "failed to",
+    "traceback",
+)
+
+
+def _vysledek_je_chyba(vysledek):
+    """True, kdyz vysledek nastroje hlasi chybu (vyjimkou i textem)."""
+    if isinstance(vysledek, Exception):
+        return True
+    try:
+        text = str(vysledek).lower()
+    except Exception:  # pragma: no cover
+        return False
+    return any(z in text for z in _CHYBOVE_ZNAKY)
+
+
     async def _run_fast_lane(self, plan, function_name, handler, params):
         """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
         lib = getattr(self, "phrase_library", None)
@@ -748,6 +827,28 @@ class FastLaneMixin:
         )
 
         verdict = await self._verify_after_action(pre, plan)
+
+        # NASTROJ SAM OHLASIL CHYBU (2026-08-31). MCP vraci chybu jako TEXT
+        # vysledku, ne jako vyjimku -- "Tool 'HassTurnOn' completed
+        # successfully" v logu znamena jen "HTTP probehlo". Zive v 17:46:05
+        # skoncil HassTurnOn na "Input validation error: 'light' is not one
+        # of [...]" (svetla jsou domena, ne device_class), do domu neodeslo
+        # NIC -- a Zan presto prehral vysledek_ok. Potvrdil uspech neceho,
+        # co se nestalo, coz je horsi nez mlceni (ustava: netvrdit nic,
+        # co jsi neoveril).
+        #
+        # Porovnani stavu to nechyti: kdyz se v dome mezitim zmeni cokoli
+        # jineho, vyjde "ok". Chybu proto bereme primo z vysledku nastroje.
+        # Kontroluje se i `captured` -- handler vraci vysledek callbackem,
+        # ne navratovou hodnotou, takze v `action_res` byva None.
+        if verdict == "ok" and (_vysledek_je_chyba(action_res)
+                                or any(_vysledek_je_chyba(c) for c in captured)):
+            logger.warning(
+                "🚫 fast-lane: %s vratil chybu, ale porovnani stavu rikalo ok "
+                "— beru to jako NEUSPECH: %.200s",
+                function_name, str(captured or action_res),
+            )
+            verdict = "fail"
 
         # Neúspěch → JEDEN pokus znovu (ústava, Princip 2 bod 4).
         if verdict == "fail":
