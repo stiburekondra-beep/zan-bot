@@ -4,12 +4,42 @@ import logging
 import os
 import time
 from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, Frame
+
+# Ramce, po kterych se vystupni proud na satelitu ZAHODI a zacina znovu.
+# Importuji se defenzivne: nazvy se mezi verzemi pipecatu lisi a chybejici
+# trida nesmi shodit most -- v nejhorsim pripade se nabeh chova jako driv.
+_PRERUSENI_TYPY = []
+for _jmeno in ("StartInterruptionFrame", "BotStoppedSpeakingFrame",
+               "TTSStoppedFrame", "InterruptionFrame", "CancelFrame"):
+    try:
+        _PRERUSENI_TYPY.append(getattr(__import__(
+            "pipecat.frames.frames", fromlist=[_jmeno]), _jmeno))
+    except Exception:  # pragma: no cover - starsi/novejsi pipecat
+        pass
+_PRERUSENI_TYPY = tuple(_PRERUSENI_TYPY)
 from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
 
 logger = logging.getLogger(__name__)
 
 # NABEH TICHA. Satelit (HA Voice PE) rozjizdi vystupni stream az s prvnim
-# bajtem, takze prvni ~300 ms kazde nove promluvy spolkne. Ondra 31. 8. 2026
+# bajtem, takze prvni ~300 ms kazde nove promluvy spolkne.
+#
+# PROC SE PREZBROJUJE PO PRERUSENI (31. 8. 2026, Ondra: "Misto MOMENT rekl
+# MENT"). Pipecat na zacatku odpovedi bezne vystreli KRATKY FALESNY ZACATEK
+# a hned ho zahodi -- doslovne z logu 18:28:33:
+#
+#     .262  Bot started speaking
+#     .263  nabeh: pred zacatek promluvy jde 280 ms ticha   <- nalepilo se SEM
+#     .267  Bot stopped speaking      <- o 4 ms pozdeji FLUSH, ticho je pryc
+#     .286  Bot started speaking      <- SKUTECNA rec, uz BEZ nabehu
+#
+# Nabeh se tim spotreboval na promluvu, ktera se nikdy neprehrala, a na tu
+# opravdovou uz nezbyl: mezera .267->.286 je 19 ms, tedy hluboko pod
+# NABEH_PAUZA_S, takze se nova promluva nerozpoznala. Satelit pak dostal
+# rovnou prvni slabiku a snedl ji.
+#
+# Merit odstup uz proto nestaci -- po kazdem ramci, ktery vystupni proud
+# ZAHAZUJE, se nabeh prezbroji, at je dalsi zvuk cimkoli. Ondra 31. 8. 2026
 # v labu slysel misto 'Podivam se na to' jen '...am se na to'. Plati to pro
 # vsechny tri zdroje zvuku (pusa Gemini, mluvci Piper, prednahrane fraze),
 # proto se ticho pridava tady, v jedinem hrdle vystupniho zvuku.
@@ -265,6 +295,22 @@ class RawAudioSerializer(FrameSerializer):
         For output audio frames, we just return the raw audio bytes.
         Other frames are not serialized (return empty bytes).
         """
+        # PREZBROJENI NABEHU. Tenhle ramec znamena "co je ve fronte na
+        # satelitu, zahod" -- pristi zvuk je tedy ZACATEK, i kdyby prisel
+        # za deset milisekund. Bez tohohle se nabeh spotreboval na falesny
+        # zacatek a skutecna prvni slabika sla do studeneho streamu.
+        if _PRERUSENI_TYPY and isinstance(frame, _PRERUSENI_TYPY):
+            if self._posledni_vystup:
+                logger.info('nabeh: %s -> prezbrojuju, dalsi zvuk je zacatek',
+                            type(frame).__name__)
+            self._posledni_vystup = 0.0
+            if self._tap_file is not None:
+                try:
+                    self._tap_file.close()
+                except Exception:  # pragma: no cover
+                    logger.debug('odposlech: zavreni souboru selhalo', exc_info=True)
+                self._tap_file = None
+
         if isinstance(frame, OutputAudioRawFrame):
             audio_bytes = frame.audio
             nyni = time.monotonic()
