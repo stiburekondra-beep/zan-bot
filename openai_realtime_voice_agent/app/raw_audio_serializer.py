@@ -17,6 +17,18 @@ NABEH_TICHA_MS = float(os.environ.get('ZAN_NABEH_TICHA_MS', '280'))
 # Mezera, po ktere se dalsi ramec povazuje za ZACATEK nove promluvy.
 NABEH_PAUZA_S = float(os.environ.get('ZAN_NABEH_PAUZA_S', '0.6'))
 
+# ODPOSLECH VYSTUPU (mereni doslovnosti, karta 2026-08-31-programator-hlasu-02).
+# Gemini 3.1 Live NEVRACI prepis toho, co samo reklo (pipecat si o
+# `output_audio_transcription` rekne, ale nic nechodi -- overeno na logu
+# 31. 8. 2026 17:23, kde bot mluvil 6,7 s a zadny transcript nedorazil).
+# Jedine misto, kde jde zjistit, CO OPRAVDU ZAZNELO, je tenhle bajtovy tok.
+# Kazda promluva se uklada jako samostatny WAV, ktery se pak da poslat
+# whisperu a porovnat s textem mozku.
+#
+# VYCHOZI STAV JE VYPNUTO: prazdna promenna = zadny zapis, zadna rezie.
+# Zapina se jen na dobu mereni (ZAN_TAP_DIR=/tmp/odposlech).
+TAP_DIR = os.environ.get('ZAN_TAP_DIR', '').strip()
+
 
 class RawAudioSerializer(FrameSerializer):
     """Serializer that treats all binary messages as raw PCM audio.
@@ -37,6 +49,9 @@ class RawAudioSerializer(FrameSerializer):
         self._input_sample_rate = input_sample_rate
         # Kdy naposledy odesel vystupni zvuk do zarizeni (nabeh ticha).
         self._posledni_vystup = 0.0
+        # Odposlech vystupu -- otevreny WAV probihajici promluvy (nebo None).
+        self._tap_file = None
+        self._tap_bytes = 0
         # Async callback invoked when the device sends {"type":"interrupt"} (the
         # "stop" wake word). Set by WebSocketHandler.build_pipeline once it has
         # the OpenAI service. We deliberately do NOT emit a pipecat
@@ -210,6 +225,40 @@ class RawAudioSerializer(FrameSerializer):
 
         return frame
     
+    def _tap(self, audio_bytes: bytes, nova_promluva: bool, rate: int) -> None:
+        """Ulozi probihajici promluvu do WAV souboru (mereni doslovnosti).
+
+        Kazda promluva = jeden soubor. Hlavicka se pri kazdem zapisu
+        prepisuje na aktualni delku, takze soubor je pouzitelny i drive,
+        nez promluva skonci -- nemusi se cekat na konec session.
+        """
+        import struct
+
+        if nova_promluva and self._tap_file is not None:
+            self._tap_file.close()
+            self._tap_file = None
+
+        if self._tap_file is None:
+            os.makedirs(TAP_DIR, exist_ok=True)
+            jmeno = os.path.join(
+                TAP_DIR, 'promluva-%s.wav' % time.strftime('%Y%m%d-%H%M%S'))
+            self._tap_file = open(jmeno, 'wb')
+            self._tap_bytes = 0
+            f = self._tap_file
+            f.write(b'RIFF' + struct.pack('<I', 36) + b'WAVEfmt ')
+            f.write(struct.pack('<IHHIIHH', 16, 1, 1, rate, rate * 2, 2, 16))
+            f.write(b'data' + struct.pack('<I', 0))
+            logger.info('odposlech: nova promluva -> %s', jmeno)
+
+        f = self._tap_file
+        f.write(audio_bytes)
+        self._tap_bytes += len(audio_bytes)
+        # Prubezna oprava delek v hlavicce -- soubor je tim cely cas platny.
+        f.seek(4);  f.write(struct.pack('<I', 36 + self._tap_bytes))
+        f.seek(40); f.write(struct.pack('<I', self._tap_bytes))
+        f.seek(0, 2)
+        f.flush()
+
     async def serialize(self, frame: Frame) -> bytes:
         """Serialize frame to binary message.
         
@@ -219,12 +268,21 @@ class RawAudioSerializer(FrameSerializer):
         if isinstance(frame, OutputAudioRawFrame):
             audio_bytes = frame.audio
             nyni = time.monotonic()
-            if NABEH_TICHA_MS > 0 and (nyni - self._posledni_vystup) > NABEH_PAUZA_S:
+            nova_promluva = (nyni - self._posledni_vystup) > NABEH_PAUZA_S
+            if NABEH_TICHA_MS > 0 and nova_promluva:
                 rate = int(getattr(frame, 'sample_rate', 0) or 24000)
                 vzorku = int(rate * NABEH_TICHA_MS / 1000.0)
                 audio_bytes = bytes(2 * vzorku) + audio_bytes
                 logger.info('nabeh: pred zacatek promluvy jde %.0f ms ticha (%d Hz)', NABEH_TICHA_MS, rate)
             self._posledni_vystup = nyni
+            if TAP_DIR:
+                # Chyba odposlechu NESMI umlcet Zana -- je to diagnostika,
+                # ne provozni cesta. Proto siroky except a zadny re-raise.
+                try:
+                    self._tap(audio_bytes, nova_promluva,
+                              int(getattr(frame, 'sample_rate', 0) or 24000))
+                except Exception:
+                    logger.debug('odposlech vystupu selhal', exc_info=True)
             logger.debug(f"📤 Serializing OutputAudioRawFrame: {len(audio_bytes)} bytes")
             return audio_bytes
         # For other frame types, return empty bytes (not serialized)

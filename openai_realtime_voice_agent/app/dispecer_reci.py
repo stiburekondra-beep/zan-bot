@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Awaitable, Callable, Optional
 
@@ -89,6 +90,45 @@ ROZBEH_S = 2.0
 #: `prubeh` a `smalltalk` tu nejsou proto, že po přestavbě do fronty
 #: vůbec nepadají (zamlouvání nahradil zvuk, viz `zan_bridge_tool`).
 DOSLOVNE_DRUHY = frozenset({"odpoved", "nalez", "oprava", "chyba"})
+
+#: KDO VYSLOVUJE obsah z `DOSLOVNE_DRUHY`.
+#:
+#:  * ``charon`` (výchozí) — vysloví ho KONVERZAČNÍ MODEL (Gemini Live,
+#:    hlas Charon) z tvrdé instrukce `HLAVICKA_DOSLOVA`.
+#:  * ``piper``  — vysloví ho lokální mluvčí `app/mluvci_piper.py`.
+#:
+#: PROČ ZPĚT PŘES MODEL (Ondra, 31. 8. 2026, poté co slyšel obojí):
+#:
+#:     „odpovida ale je to hnusny piper. At se mnou radeji mluvi ten charon
+#:      ale at mluvi tim konverzacnim modelem, ten byl alespon uveritelny.."
+#:
+#: Je to VĚDOMÁ výměna, ne vylepšení. Piper měl doslovnost danou
+#: KONSTRUKCÍ (text šel do syntézy, ne do modelu, takže se změnit nemohl);
+#: model ji mít takhle nemůže — má ji jen z instrukce, kterou smí porušit.
+#: Uvěřitelnost dostala přednost před laboratorní doslovností. Cena té
+#: výměny se proto MĚŘÍ, ne odhaduje, a fakta hlídá `voice_doslovnost.py`.
+#:
+#: Samostatné Gemini TTS API (`gemini-3.1-flash-tts-preview`) tudy NEVEDE:
+#: má sice tentýž hlas Charon a doslovnost 1:1, ale zní jako předčítání.
+#: Naměřeno 31. 8. 2026 na téhle krabici: 0,91 s do prvního zvuku streamem,
+#: 4,4–6,7 s bez streamu, ~0,10 Kč za větu.
+MLUVCI = (os.environ.get("ZAN_MLUVCI", "charon").strip().lower() or "charon")
+
+#: Tvrdá instrukce „jsi reproduktor, ne spoluautor". Drží tři pravidla,
+#: která se v `HLAVICKY` osvědčila: žádné číslice v instrukci, jeden pokyn
+#: (ne dva protichůdné) a obsah v uvozovkách oddělený od pokynu.
+HLAVICKA_DOSLOVA = (
+    "VYSLOV PŘESNĚ TOHLE A NIC JINÉHO. Jsi teď hlas mozku, ne jeho "
+    "spoluautor: přečti to slovo od slova, se vším, co tam je. NEPŘIDÁVEJ "
+    "žádný fakt, číslo, čas ani jméno, které tam není. NEUBÍREJ žádnou "
+    "výhradu ani nejistotu. NEKOMENTUJ to, NEOPAKUJ otázku a nic "
+    "neuzavírej. Smíš jen přirozeně intonovat"
+)
+
+
+def obal_doslova(tema: "Tema") -> str:
+    """Text mozku obalený tvrdou instrukcí „vyslov přesně tohle“."""
+    return "%s:\n„%s“" % (HLAVICKA_DOSLOVA, tema.obsah)
 
 HLAVICKY = {
     "odpoved": (
@@ -332,17 +372,54 @@ class DispecerReci:
             return None
 
         # --- 4a. DOSLOVNÁ CESTA: mluví mozek, pusa je jen reproduktor ---
+        #
+        # Dvě provedení téhož záměru, přepínač `ZAN_MLUVCI`:
+        #   charon — obsah vysloví KONVERZAČNÍ MODEL z tvrdé instrukce.
+        #            Jde to `_vyslov`, tedy toutéž cestou jako běžná řeč,
+        #            takže z reproduktoru zní jeden jediný hlas a intonace
+        #            zůstane živá.
+        #   piper  — obsah vysloví lokální mluvčí, znak po znaku.
+        #
+        # Fail-soft je OBOUSMĚRNÝ: když vybraná cesta nevyjde, zkusí se ta
+        # druhá, a teprve pak měkká hlavička (4b). Žán nesmí oněmět ani
+        # když spadne síť, dojde kvóta nebo se pusa zasekne.
         odeslano = False
         doslova = False
-        if tema.druh in DOSLOVNE_DRUHY and self._rekni_doslova is not None:
+        cesta = ""
+        chce_doslova = tema.druh in DOSLOVNE_DRUHY
+
+        if chce_doslova and MLUVCI != "piper":
+            try:
+                odeslano = await self._vyslov(obal_doslova(tema), True)
+            except Exception as exc:  # pragma: no cover - model nesmí umřít
+                logger.error("❌ dispečer: doslovná cesta přes model spadla (%r)", exc)
+                odeslano = False
+            if odeslano:
+                doslova = True
+                cesta = "charon"
+                self.vysloveno_doslova += 1
+                # `kontext_po_doslovne` se tu schválně NEPOSÍLÁ: model si
+                # text vyslovil sám, takže ho v kontextu UŽ MÁ. Poslat mu
+                # ho podruhé je druhý zdroj řeči o téže větě — přesně ten
+                # dvojhlas z poučení 2026-08-23.
+            else:
+                self.doslova_selhalo += 1
+                logger.warning(
+                    "⚠️ dispečer: model doslovnou cestu nepřijal (%s) — "
+                    "zkouším mluvčího: %.120s", tema.druh, tema.obsah,
+                )
+
+        if chce_doslova and not odeslano and self._rekni_doslova is not None:
             try:
                 odeslano = await self._rekni_doslova(tema.obsah)
             except Exception as exc:  # pragma: no cover - mluvčí nesmí umřít
                 logger.error("❌ dispečer: mluvčí spadl (%r)", exc)
                 odeslano = False
             if odeslano:
+                cesta = "piper"
                 doslova = True
-                self.vysloveno_doslova += 1
+                if MLUVCI == "piper":
+                    self.vysloveno_doslova += 1
                 # Pusa se musí dozvědět, co zaznělo — ale bez řeči.
                 try:
                     await self._vyslov(kontext_po_doslovne(tema), False)
@@ -377,7 +454,7 @@ class DispecerReci:
             self._rozbeh_do = nyni + self.rozbeh_s
         logger.info("💉 dispečer: vysloveno (druh=%s priorita=%d cesta=%s): %.120s",
                     tema.druh, tema.priorita,
-                    "doslova" if doslova else "pusa", tema.obsah)
+                    cesta or "pusa", tema.obsah)
         return tema
 
     async def _bezet(self) -> None:
