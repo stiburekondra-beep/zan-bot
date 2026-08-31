@@ -149,7 +149,18 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
                 and not getattr(self, "_fastlane_playing", False)
                 and isinstance(frame, (TTSAudioRawFrame, TTSTextFrame, LLMTextFrame))
             ):
-                logger.debug("🔇 fast-lane (gemini): zahozen %s", type(frame).__name__)
+                # Jednou za umlčení do INFO, ne u každého 20ms kusu audia:
+                # jinak je brzda v provozu NEVIDITELNÁ (Gemini pusa navíc
+                # nepíše `🤖 assistant:` do transcript_logu, takže by nebylo
+                # čím doložit, že opravdu mlčí).
+                znacka = getattr(self, "_fastlane_mute_until", 0.0)
+                if getattr(self, "_fastlane_drop_logged", None) != znacka:
+                    self._fastlane_drop_logged = znacka
+                    logger.info(
+                        "🔇 fast-lane (gemini): zahazuju řeč modelu — výsledek "
+                        "už řekla přednahraná pusa (první zahozený: %s)",
+                        type(frame).__name__,
+                    )
                 return
         except Exception as e:  # pragma: no cover - filtr nesmí shodit pipeline
             logger.warning("⚠️ fast-lane filtr (gemini) selhal, propouštím: %r", e)
