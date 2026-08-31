@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 
 from pipecat.frames.frames import (
@@ -41,6 +42,7 @@ from app.voice_safety import (
     is_sensitive_actuation,
     saha_na_vlastni_hlas,
     bezcilny_zasah,
+    oprav_domenu_a_tridu,
 )
 from app.voice_fastlane import (
     CHUNK_BYTES as FASTLANE_CHUNK_BYTES,
@@ -177,6 +179,36 @@ PROTISMER_S = 2.0
 #: jeden zásah.
 UTRZEK_OKNO_S = 3.0
 
+#: JAK DLOUHO SE CEKA NA PREPIS, KTERY JESTE NEDORAZIL (31. 8. 2026).
+#:
+#: Utrzkova pojistka se pta `posledni_prepis`. Jenze Gemini Live posila
+#: PREPIS a VOLANI NASTROJE dvema nezavislymi proudy a volani umi prijit
+#: DRIV. Doslovne z logu 18:49:36:
+#:
+#:     .271  Calling function [HassMediaSearchAndPlay] ...
+#:     .272  user: Pusti koncert.        <- prepis az o 1 ms POZDEJI
+#:
+#: V ten okamzik drzi `posledni_prepis` jeste PREDCHOZI tah, takze pojistka
+#: posuzuje uplne jinou vetu -- a smetli ji propusti. Presne tudy proslo
+#: 18:48:37 "zazemi bobrivaku" (ocista to jako utrzek OZNACI, overeno
+#: na vzorku), model z toho udelal HassTurnOff a v obyvaku se misto svetel
+#: vypnula zasuvka.
+#:
+#: Proto se u zasahu do domu kratce POCKA, az prepis tohoto tahu dorazi.
+#: Bezne to stoji jednotky milisekund (prepis uz je na ceste); plna cekaci
+#: doba padne jen tam, kde prepis nedorazi vubec.
+UTRZEK_CEKANI_S = float(os.environ.get("ZAN_UTRZEK_CEKANI_S", "0.4"))
+
+#: Jak stary smi byt prepis, aby se jeste pocital za "tenhle tah".
+UTRZEK_CERSTVY_S = 1.5
+
+#: Slova, po kterych je jasne, ze clovek mluvi o SVETLE, ne o zasuvce.
+_SVETLO_SLOVA = ("zhasni", "zhasnout", "rozsvit", "rozsvet", "rozsvec",
+                 "svetl", "lampa", "lampu", "lustr")
+
+#: Slova, po kterych je zasuvka opravdu mineny cil.
+_ZASUVKA_SLOVA = ("zasuvk", "zastrck", "switch", "vypinac")
+
 #: Nástroje, na které se útržková pojistka nevztahuje: čtení stavu (dvakrát
 #: přečíst nic nerozbije), vlastní mosty (`ask_zan` si očistu dělá sám ve
 #: `zan_bridge_tool`) a odpojení. Všechno ostatní JE zásah do domu.
@@ -234,6 +266,13 @@ def _vysledek_je_chyba(vysledek):
     return any(z in text for z in _CHYBOVE_ZNAKY)
 
 
+def _bez_diakritiky_lower(text: str) -> str:
+    """Male pismeno bez diakritiky -- na porovnavani slov z prepisu."""
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
 class FastLaneMixin:
     """Bezpečnostní brzda + rychlá dráha nad libovolnou pipecat LLM službou."""
 
@@ -277,6 +316,71 @@ class FastLaneMixin:
             return ""
         self.posledni_prepis_pouzit = True
         return getattr(o, "duvod", "") or "útržek"
+
+    async def _pockej_na_prepis(self, function_name: str) -> None:
+        """Kratce pocka, az dorazi prepis TOHOTO tahu (viz UTRZEK_CEKANI_S).
+
+        Bez tohohle cekani posuzuje utrzkova pojistka vetu z predchoziho
+        tahu, protoze volani nastroje umi predbehnout prepis. Nic nevraci --
+        jen zdrzi, aby mel `_utrzek_blokuje` co cist.
+        """
+        if function_name in UTRZEK_VYJIMKY or UTRZEK_CEKANI_S <= 0:
+            return
+
+        def _cerstvy() -> bool:
+            t = getattr(self, "posledni_prepis_t", 0.0)
+            if not t or getattr(self, "posledni_prepis_pouzit", False):
+                return False
+            return (time.monotonic() - t) <= UTRZEK_CERSTVY_S
+
+        if _cerstvy():
+            return
+        zacatek = time.monotonic()
+        while (time.monotonic() - zacatek) < UTRZEK_CEKANI_S:
+            await asyncio.sleep(0.02)
+            if _cerstvy():
+                logger.info(
+                    "\u23f1\ufe0f utrzkova pojistka: prepis dorazil o %.0f ms pozdeji nez "
+                    "volani %s -- cekani se vyplatilo",
+                    (time.monotonic() - zacatek) * 1000.0, function_name,
+                )
+                return
+        logger.info(
+            "\u23f1\ufe0f utrzkova pojistka: prepis tohoto tahu nedorazil do %.0f ms "
+            "(%s) -- posuzuju bez nej", UTRZEK_CEKANI_S * 1000.0, function_name,
+        )
+
+    def oprav_svetlo_vs_zasuvka(self, function_name: str, arguments) -> str:
+        """"Zhasni" nesmi skoncit na zasuvce. Vraci popis zmeny pro log.
+
+        Ziva zaminka (31. 8. 2026, 18:48:37): na "zhasni v obyvaku" poslal
+        model `domain: ['switch']` a v obyvaku se vypnula VOLNA ZASUVKA
+        (switch.sonoff_acc8007972), zatimco svetla svitila dal. Akce
+        USPELA, takze zadna brzda na selhani nepomuze -- byl to spatny CIL.
+
+        Prepisuje se jen tehdy, kdyz clovek prokazatelne mluvil o svetle
+        a zaroven NEzminil zasuvku. Kdyz o zasuvce mluvil, nechava se byt --
+        "vypni zasuvku v obyvaku" je legitimni povel.
+        """
+        if function_name not in ("HassTurnOn", "HassTurnOff", "HassLightSet"):
+            return ""
+        if not isinstance(arguments, dict) or arguments.get("name"):
+            return ""
+        domeny = arguments.get("domain")
+        if isinstance(domeny, str):
+            domeny = [domeny]
+        if not domeny or [str(d).lower() for d in domeny] != ["switch"]:
+            return ""
+        o = getattr(self, "posledni_prepis", None)
+        veta = _bez_diakritiky_lower(getattr(o, "text", "") or getattr(o, "puvodni", "") or "")
+        if not veta:
+            return ""
+        if any(z in veta for z in _ZASUVKA_SLOVA):
+            return ""
+        if not any(s in veta for s in _SVETLO_SLOVA):
+            return ""
+        arguments["domain"] = ["light"]
+        return "domain switch -> light (clovek mluvil o svetle, ne o zasuvce)"
 
     def fastlane_mute_model(self, duvod: str) -> None:
         """Zapne okno, ve kterém model nesmí komentovat výsledek."""
@@ -342,6 +446,13 @@ class FastLaneMixin:
             # neprovede a model se má doptat. Sedí PŘED vším ostatním: nemá
             # smysl opravovat oblast ani deduplikovat něco, co se vůbec nemá
             # stát. (Živě 10:46:12: `ne baklažánu.` → HassTurnOff → fail.)
+            # Nez se pojistky zeptame, musi mit CO cist: volani nastroje umi
+            # predbehnout prepis teze promluvy (log 18:49:36, rozdil 1 ms).
+            try:
+                await self._pockej_na_prepis(function_name)
+            except Exception as e:  # pragma: no cover - cekani nesmi shodit tool
+                logger.warning("⚠️ cekani na prepis selhalo, jedu dal: %r", e)
+
             try:
                 duvod_utrzku = self._utrzek_blokuje(function_name)
             except Exception as e:  # pragma: no cover - pojistka nesmí shodit tool
@@ -436,6 +547,27 @@ class FastLaneMixin:
                     "to udělat nechci. Řekni, které zařízení nebo místnost."
                 )
                 return
+
+            # DOMENA vs DEVICE_CLASS (2026-08-31). Model plete "light" do
+            # device_class, kam patri jen tridy jako door/window/tv. HA to
+            # odmitne a navenek to vypada, ze Zan nechce poslechnout.
+            try:
+                _zmeny = oprav_domenu_a_tridu(getattr(params, "arguments", None))
+                if _zmeny:
+                    logger.warning("🔁 %s: %s (opraveno pred odeslanim do domu)",
+                                   function_name, "; ".join(_zmeny))
+            except Exception as e:  # pragma: no cover - oprava nesmi shodit tool
+                logger.warning("⚠️ oprava domena/device_class selhala, jedu dal: %r", e)
+
+            # SVETLO vs ZASUVKA (2026-08-31). "Zhasni v obyvaku" skoncilo
+            # vypnutou zasuvkou, protoze model poslal domain: ['switch'].
+            try:
+                _z = self.oprav_svetlo_vs_zasuvka(
+                    function_name, getattr(params, "arguments", None))
+                if _z:
+                    logger.warning("\U0001f4a1 %s: %s", function_name, _z)
+            except Exception as e:  # pragma: no cover - oprava nesmi shodit tool
+                logger.warning("⚠️ oprava svetlo/zasuvka selhala, jedu dal: %r", e)
 
             # OPRAVA OBLASTI (2026-08-31): model umí poslat `living_room`
             # místo „Obývák" a HA to odmítne jako INVALID_AREA — navenek to
@@ -854,11 +986,31 @@ class FastLaneMixin:
         if verdict == "fail":
             logger.info("🔁 fast-lane: %s neprošlo, zkouším jednou znovu", function_name)
             await self.play_phrase("vysledek_fail")
+            # Vysledky DRUHEHO pokusu se musi posuzovat SAMOSTATNE. Kdyby se
+            # koukalo na cely `captured`, chyba z prvniho pokusu by prebila
+            # i povedeny druhy -- a ton uspechu by nezazněl ani po skutecnem
+            # uspechu. Proto se bere jen to, co pribylo po retry.
+            pred_retry = len(captured)
+            retry_vyjimka = None
             try:
                 await handler(params)
             except Exception as e:
+                retry_vyjimka = e
                 logger.warning("⚠️ fast-lane: druhý pokus selhal: %r", e)
             verdict = await self._verify_after_action(pre, plan)
+            # TYZ FILTR I PO RETRY (2026-08-31). Rani oprava chytala jen prvni
+            # pokus, takze retry vetev ji obchazela: v 18:45:51 selhaly OBA
+            # pokusy na teze validacni chybe a Zan presto prehral vysledek_ok.
+            # Ton uspechu smi zaznit jen po OVERENEM uspechu.
+            po_retry = captured[pred_retry:]
+            if verdict == "ok" and (retry_vyjimka is not None
+                                    or any(_vysledek_je_chyba(c) for c in po_retry)):
+                logger.warning(
+                    "🚫 fast-lane: druhy pokus %s taky vratil chybu, ale porovnani "
+                    "stavu rikalo ok — beru to jako NEUSPECH: %.200s",
+                    function_name, str(po_retry or retry_vyjimka),
+                )
+                verdict = "fail"
 
         self._mirror_to_zan(plan, function_name, args, verdict)
 

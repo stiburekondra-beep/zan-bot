@@ -623,9 +623,55 @@ class ZanBridge:
             await self._blocking(params, text)
             return
 
+        # JEDNA OTAZKA = JEDNA ODPOVED (31. 8. 2026). Ondra: "asi odpovedel
+        # 2x - zkontroluj". Doslovne z logu 18:44:
+        #
+        #   .40.447  Calling [zeptej_se_mozku] {'text': 'Kolik je stupnu v obyvaku?'}
+        #   .43.147  Calling [zeptej_se_mozku] {'text': 'Kolik je stupnu v obyvaku?'}
+        #
+        # Tentyz nastroj s IDENTICKYMI argumenty dvakrat, 2,7 s po sobe.
+        # Vznikly dva interaction_id, mozek bezel dvakrat a Zan rekl totez
+        # dvakrat jinymi slovy ("Dvacet sest stupnu, z cidla vzduchu
+        # v obyvaku" / "Dvacet sest stupnu rovnych, z cidla vzduchu SAWF-07P").
+        #
+        # Proc to nechytila dedup straz: jeji plne osmisekundove okno drzi
+        # jen OVERENY USPECH. `ask_zan` vraci hned {"status": "delegated"},
+        # coz uspech neni, takze okno spadlo na DEDUP_MILOST_S = 2,5 s --
+        # a druhe volani prislo o 2,7 s pozdeji, tesne za nim.
+        #
+        # Tady se to resi presne a bez casovych oken: dokud na tutez otazku
+        # BEZI dotaz, druhy se nezalozi. Az prvni dobehne, evidence se uklidi,
+        # takze pozdejsi lidske zopakovani teze otazky projde normalne.
+        _norm = " ".join(text.lower().split())
+        _bezici = getattr(self, "_pending_texty", None)
+        if _bezici is None:
+            _bezici = self._pending_texty = {}
+        _bezici = {i: t for i, t in _bezici.items() if i in self._pending}
+        self._pending_texty = _bezici
+        if _norm in set(_bezici.values()):
+            logger.warning(
+                "🔁 ask_zan: na tutez otazku uz bezi dotaz — DRUHY NEZAKLADAM "
+                "(model zopakoval volani): %.120s", text,
+            )
+            rozbor = getattr(self, "rozbor", None)
+            if rozbor is not None:
+                try:
+                    rozbor.nahlas("dvojity-dotaz", prepis=text,
+                                  volani="ask_zan(%r)" % text,
+                                  vysledek="nedelegovano podruhe",
+                                  poznamka="tataz otazka uz bezi")
+                except Exception:  # noqa: BLE001
+                    logger.debug("nahlaseni anomalie selhalo", exc_info=True)
+            await params.result_callback(
+                {"status": "delegated", "note": ACK_NOTE},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+
         self._seq += 1
         ask_id = self._seq
         interaction_id = uuid.uuid4().hex
+        _bezici[ask_id] = _norm
         while self.pending >= self.max_pending:
             oldest = min(self._pending)
             logger.warning(
@@ -649,6 +695,10 @@ class ZanBridge:
         )
         self._pending[ask_id] = task
         task.add_done_callback(lambda _t, i=ask_id: self._pending.pop(i, None))
+        # Evidence textu se uklidi spolu s dotazem, at pozdejsi zopakovani
+        # teze otazky uz neni blokovane.
+        task.add_done_callback(
+            lambda _t, i=ask_id: getattr(self, "_pending_texty", {}).pop(i, None))
         # Čas POLOŽENÍ otázky — z něj dispečer pozná, že odpověď dorazila
         # do jiného hovoru, než ke kterému patří (pravidlo čerstvosti).
         try:

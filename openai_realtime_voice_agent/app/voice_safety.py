@@ -152,3 +152,95 @@ def bezcilny_zasah(function_name, arguments):
         return ""
     return ("povel nema cil -- v Home Assistantu to neznamena nic, "
             "ale vsechno, co odpovida")
+
+
+# ---------------------------------------------------------------------------
+# DOMENA vs DEVICE_CLASS (31. 8. 2026). Model to plete opakovane -- dvakrat
+# za jedno odpoledne poslal `device_class: ['light']`, coz Home Assistant
+# odmitne, protoze "light" je DOMENA, ne trida zarizeni:
+#
+#   17:46:05  HassTurnOn  {'area': 'Obyvak', 'device_class': ['light']}
+#   18:45:51  HassTurnOff {'area': 'Obyvak', 'device_class': ['light']}
+#   -> Input validation error: 'light' is not one of ['identify', ..., 'gas']
+#
+# Navenek to vypada, ze Zan nechce poslechnout: zvuk zhasnuti zazni, ale
+# svetla zustanou svitit. Opravuje se to TADY, na nasi strane -- promptu se
+# to jen pripomene, ale spolehat se na nej nejde (poucen 31. 8.: model uz
+# tuhle chybu udelal i pote, co v promptu byla).
+#
+# POZOR NA PRUNIK: "switch" je ZAROVEN domena i device_class. Prehazuje se
+# proto jen hodnota, ktera patri vyhradne do toho druheho klice -- nikdy
+# nejednoznacna.
+# ---------------------------------------------------------------------------
+
+#: Domeny Home Assistanta, ktere davaji smysl u hlasovych povelu.
+_DOMENY = frozenset({
+    "light", "switch", "media_player", "cover", "fan", "lock", "climate",
+    "sensor", "binary_sensor", "vacuum", "humidifier", "water_heater",
+    "camera", "scene", "script", "automation", "input_boolean", "number",
+    "select", "button", "siren", "valve", "todo", "lawn_mower",
+})
+
+#: Povolene device_class, presne jak je vypisuje HA v chybove hlasce.
+_DEVICE_CLASSES = frozenset({
+    "identify", "restart", "update", "awning", "blind", "curtain", "damper",
+    "door", "garage", "gate", "shade", "shutter", "window", "outlet",
+    "switch", "tv", "speaker", "receiver", "projector", "water", "gas",
+})
+
+
+def oprav_domenu_a_tridu(arguments):
+    """Prehodi hodnoty mezi `domain` a `device_class`, kdyz jsou naopak.
+
+    Meni `arguments` NA MISTE a vraci seznam popisu zmen (pro log).
+    Nejednoznacne hodnoty (v obou mnozinach, napr. "switch") nechava byt.
+    """
+    if not isinstance(arguments, dict):
+        return []
+    zmeny = []
+
+    def _seznam(k):
+        v = arguments.get(k)
+        if v is None:
+            return None
+        return [v] if isinstance(v, str) else list(v)
+
+    tridy = _seznam("device_class")
+    domeny = _seznam("domain")
+
+    # device_class -> domain (napr. "light")
+    if tridy:
+        zustat, prehodit = [], []
+        for v in tridy:
+            k = str(v).strip().lower()
+            (prehodit if (k in _DOMENY and k not in _DEVICE_CLASSES)
+             else zustat).append(v)
+        if prehodit:
+            domeny = (domeny or []) + prehodit
+            zmeny.append("device_class %s -> domain" % prehodit)
+            if zustat:
+                arguments["device_class"] = zustat
+            else:
+                arguments.pop("device_class", None)
+
+    # domain -> device_class (napr. "tv")
+    if domeny:
+        zustat, prehodit = [], []
+        for v in domeny:
+            k = str(v).strip().lower()
+            (prehodit if (k in _DEVICE_CLASSES and k not in _DOMENY)
+             else zustat).append(v)
+        if prehodit:
+            hotove = arguments.get("device_class") or []
+            if isinstance(hotove, str):
+                hotove = [hotove]
+            arguments["device_class"] = list(hotove) + prehodit
+            zmeny.append("domain %s -> device_class" % prehodit)
+            domeny = zustat
+
+        if domeny:
+            arguments["domain"] = domeny
+        else:
+            arguments.pop("domain", None)
+
+    return zmeny
