@@ -211,6 +211,29 @@ def _dedup_klic(function_name: str, arguments) -> str:
     return f"{function_name}|{args}"
 
 
+#: Jak poznat, ze vysledek nastroje je ve skutecnosti chyba. MCP je vraci
+#: jako text, takze isinstance(..., Exception) je nechyti.
+_CHYBOVE_ZNAKY = (
+    "input validation error",
+    "error calling tool",
+    "matchfailederror",
+    "no_match",
+    "failed to",
+    "traceback",
+)
+
+
+def _vysledek_je_chyba(vysledek):
+    """True, kdyz vysledek nastroje hlasi chybu (vyjimkou i textem)."""
+    if isinstance(vysledek, Exception):
+        return True
+    try:
+        text = str(vysledek).lower()
+    except Exception:  # pragma: no cover
+        return False
+    return any(z in text for z in _CHYBOVE_ZNAKY)
+
+
 class FastLaneMixin:
     """Bezpečnostní brzda + rychlá dráha nad libovolnou pipecat LLM službou."""
 
@@ -757,29 +780,6 @@ class FastLaneMixin:
             asyncio.create_task(_send())
         except Exception as e:  # pragma: no cover
             logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
-
-#: Jak poznat, ze vysledek nastroje je ve skutecnosti chyba. MCP je vraci
-#: jako text, takze isinstance(..., Exception) je nechyti.
-_CHYBOVE_ZNAKY = (
-    "input validation error",
-    "error calling tool",
-    "matchfailederror",
-    "no_match",
-    "failed to",
-    "traceback",
-)
-
-
-def _vysledek_je_chyba(vysledek):
-    """True, kdyz vysledek nastroje hlasi chybu (vyjimkou i textem)."""
-    if isinstance(vysledek, Exception):
-        return True
-    try:
-        text = str(vysledek).lower()
-    except Exception:  # pragma: no cover
-        return False
-    return any(z in text for z in _CHYBOVE_ZNAKY)
-
 
     async def _run_fast_lane(self, plan, function_name, handler, params):
         """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
