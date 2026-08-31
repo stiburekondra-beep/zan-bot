@@ -17,7 +17,7 @@ NABEH_TICHA_MS = float(os.environ.get('ZAN_NABEH_TICHA_MS', '280'))
 # Mezera, po ktere se dalsi ramec povazuje za ZACATEK nove promluvy.
 NABEH_PAUZA_S = float(os.environ.get('ZAN_NABEH_PAUZA_S', '0.6'))
 
-# ODPOSLECH VYSTUPU (mereni doslovnosti, karta 2026-08-31-programator-hlasu-02).
+# ODPOSLECH VYSTUPU (mereni doslovnosti, karta 2026-08-31-programator-zana-19).
 # Gemini 3.1 Live NEVRACI prepis toho, co samo reklo (pipecat si o
 # `output_audio_transcription` rekne, ale nic nechodi -- overeno na logu
 # 31. 8. 2026 17:23, kde bot mluvil 6,7 s a zadny transcript nedorazil).
