@@ -28,6 +28,7 @@ from app.disconnect_tool import get_disconnect_tool_definition, create_disconnec
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
 from app.session_klient import SessionKlient
+from app.anomalie import RozborHovoru
 from app.prubeh_server import spust_prubeh_server
 from app.voice_fastlane import (
     PhraseLibrary,
@@ -750,6 +751,24 @@ class Application:
         # co se v domě dělo, i když to sám neprováděl.
         self.zan_event_url = fastlane_event_url(zan_voice_url)
         self.zan_event_token = zan_voice_token
+        # ROZBOR HOVORU ZA BĚHU (Ondra, 31. 8. 2026): anomálie výměny jdou
+        # Žánovi HNED, ne až do večerní revize ve 22:30. Jiná adresa i jiný
+        # token než kronika: `POST /event` je append-only (session nespustí),
+        # kdežto `POST /ask` volá `runClaude(kanal:'ask')` a Žán to opravdu
+        # vyhodnotí. Odpověď se jen loguje — nahlas ji nikdo neříká.
+        zan_code_url = (os.environ.get("ZAN_CODE_URL", "").strip()
+                        or (zan_voice_url.rsplit("/", 1)[0] + "/ask" if zan_voice_url else ""))
+        zan_code_token = os.environ.get("ZAN_CODE_TOKEN", "").strip()
+        rozbor_zapnut = os.environ.get("ZAN_ROZBOR_ENABLED", "true").strip().lower() \
+            not in ("false", "0", "no", "off")
+        self.rozbor = RozborHovoru(
+            zan_code_url, zan_code_token, zan_voice_chat_id,
+            event_url=self.zan_event_url, event_token=self.zan_event_token,
+            zapnuto=rozbor_zapnut,
+        )
+        logger.info("🔎 rozbor anomálií hlasu: %s (%s)",
+                    "zapnutý" if self.rozbor.zapnuto else "vypnutý",
+                    zan_code_url or "bez adresy")
         logger.info(
             "⚡ rychlá dráha: %s · zrcadlení do Žán-Code: %s",
             "zapnutá" if self.fastlane_enabled else "vypnutá",
@@ -768,6 +787,8 @@ class Application:
                 self.websocket_handler.broadcast_json,
             )
             self.zan_bridge.nastav_faze_getter(self.websocket_handler.aktualni_faze)
+            # Útržek v zadání `ask_zan` je taky anomálie výměny.
+            self.zan_bridge.rozbor = self.rozbor
             # STOP („zmlkni") musí umět vyprázdnit frontu — viz
             # `websocket_handler._on_device_interrupt`.
             self.websocket_handler.zan_bridge = self.zan_bridge
@@ -1094,6 +1115,8 @@ class Application:
             # protože ty zvuky a tóny jsou v ní.
             service.zan_event_url = self.zan_event_url
             service.zan_event_token = self.zan_event_token
+            # Rychlá dráha hlásí, co nevyšlo (fail/dedup/protismer/útržek).
+            service.rozbor = self.rozbor
             if self.zan_bridge_enabled and self.zan_bridge is not None:
                 # JEDEN MOZEK PRO CELÝ DŮM. `ask_zan` míří pořád na tentýž
                 # Žánův `/voice` (a tentýž chat) — dva satelity nesmí být dva
