@@ -29,6 +29,7 @@ takže se u nich NEPŘEHRÁVÁ ani průběhové „Odemykám.". Knihovna ty frá
 import json
 import logging
 import os
+import re
 import time
 import unicodedata
 import urllib.error
@@ -300,6 +301,12 @@ _ANGLICKE_OBLASTI = {
     "storage": "sklad", "storeroom": "sklad",
     "toilet": "zachod", "wc": "zachod",
     "utility_room": "technicka-mistnost",
+    # Doplněno 31. 8. po kontrole proti živému seznamu: garáž, dílna i
+    # zahrada v domě JSOU (do prvního výpisu se nevešly, `head -25` je
+    # uřízl a já z toho ukvapeně napsal „garáž v domě není").
+    "garage": "garaz",
+    "workshop": "dilna",
+    "garden": "zahrada",
 }
 
 #: Oblasti z HA se čtou jednou za tenhle čas (dům je nepřestavuje každou chvíli).
@@ -368,6 +375,90 @@ def oprav_area(hodnota: str) -> Optional[str]:
                     syrove, klic, len(kandidati))
         return None
     return kandidati[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Sekce „Dům" do promptu — skutečná jména, ne domněnky modelu
+# ---------------------------------------------------------------------------
+
+#: Kde žijí Žánovy vlastní rejstříky. Most vidí /config Home Assistanta jako
+#: /homeassistant (read-only mount); /config je fallback.
+ZAN_DATA_DIRS = ("/homeassistant/zan_data", "/config/zan_data")
+
+
+def _cti_zan_data(relativni: str) -> str:
+    for d in ZAN_DATA_DIRS:
+        cesta = os.path.join(d, relativni)
+        if os.path.isfile(cesta):
+            try:
+                with open(cesta, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError as e:
+                logger.warning("⚠️ %s se nedá přečíst: %r", cesta, e)
+    return ""
+
+
+def _tucna_jmena(text: str, stop_nadpis: str = "") -> List[str]:
+    """Jména z odrážek `- **Jméno** — …`.
+
+    Oba rejstříky mají tenhle tvar jako VLASTNÍ psané pravidlo („Jeden řádek
+    na kus/místnost"), takže se parsuje jejich konvence, ne náhodný tvar.
+    """
+    jmena = []
+    for radek in text.splitlines():
+        if stop_nadpis and radek.strip().startswith(stop_nadpis):
+            break
+        m = re.match(r"\s*-\s+\*\*(.+?)\*\*", radek)
+        if m:
+            jmeno = m.group(1).strip()
+            if jmeno and jmeno not in jmena:
+                jmena.append(jmeno)
+    return jmena
+
+
+def sekce_dum() -> str:
+    """Blok do systémového promptu: skutečné místnosti a zařízení domu.
+
+    PROČ (31. 8. 2026, 10:17): model si „obývák" přeložil na `living_room`,
+    HA povel odmítla (`INVALID_AREA`) a navenek to vypadalo, že Žán nechce
+    poslechnout. Nebyla to chyba chování, ale chyba ZNALOSTI — seznam
+    pokojů nikdy neviděl. Ondra na to: „A Žán má už tahák — má půdorys a má
+    Žapku a má teď i HA!!!" Má pravdu: nečeká se na nic, ta znalost existuje.
+
+    Skládá se ze tří ŽIVÝCH zdrojů, nikdy z natvrdo psaného seznamu:
+      * oblasti z Home Assistanta (`fetch_areas`) — jediná autorita na to,
+        jak se místnosti doopravdy jmenují,
+      * `zan_data/zarizeni/REJSTRIK.md` — lidská jména kusů HW,
+      * `zan_data/dum/MISTNOSTI.md` — místnosti, o kterých Žán něco ví.
+
+    Jen JMÉNA, žádné popisy: prompt se posílá v každém kole, takže se platí
+    za každé slovo znovu.
+    """
+    casti = []
+
+    oblasti = fetch_areas()
+    if oblasti:
+        nazvy = ", ".join(n for _, n in oblasti)
+        casti.append(
+            "MÍSTNOSTI (jediné, které v domě existují): " + nazvy + ".\n"
+            "Do nástroje piš přesně tenhle český název. NIKDY ho nepřekládej "
+            "do angličtiny („living_room\" neexistuje, je to „Obývák\") a "
+            "nevymýšlej si pokoje, které v seznamu nejsou — na takový se zeptej."
+        )
+
+    zarizeni = _tucna_jmena(_cti_zan_data("zarizeni/REJSTRIK.md"))
+    if zarizeni:
+        casti.append("ZAŘÍZENÍ, která znám jménem: " + ", ".join(zarizeni) + ".")
+
+    mistnosti = _tucna_jmena(_cti_zan_data("dum/MISTNOSTI.md"),
+                             stop_nadpis="## Co tu ještě není")
+    if mistnosti:
+        casti.append("MÍSTNOSTI, o kterých mám poznámky: " + ", ".join(mistnosti) + ".")
+
+    if not casti:
+        logger.warning("⚠️ sekce DŮM je prázdná — model zůstává bez jmen domu")
+        return ""
+    return "DŮM:\n" + "\n".join(casti) + "\n\n"
 
 
 def fetch_states(domains: Tuple[str, ...]) -> Dict[str, Tuple[str, Any, str]]:

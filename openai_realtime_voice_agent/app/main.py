@@ -32,6 +32,7 @@ from app.prubeh_server import spust_prubeh_server
 from app.voice_fastlane import (
     PhraseLibrary,
     event_url as fastlane_event_url,
+    sekce_dum,
 )
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
@@ -699,6 +700,25 @@ class Application:
                 "stručně a k věci, žádná vata.\n\n"
                 + instructions
             )
+
+        # SKUTEČNÁ JMÉNA DOMU (2026-08-31). Model si „obývák" přeložil na
+        # `living_room`, HA povel odmítla a navenek to vypadalo, že Žán nechce
+        # poslechnout. Nebyla to chyba chování, ale chyba ZNALOSTI. Jména se
+        # generují ze ŽIVÝCH zdrojů při startu mostu (oblasti z HA + Žánovy
+        # rejstříky), nikdy se nepíší natvrdo — jinak zastarají tiše.
+        # Sekce jde PŘED osobnost: je to fakt o světě, ne styl řeči.
+        try:
+            dum = sekce_dum()
+        except Exception as e:  # pragma: no cover - prompt nesmí shodit start
+            logger.warning("⚠️ sekci DŮM nejde složit, jedu bez ní: %r", e)
+            dum = ""
+        if dum:
+            instructions = instructions + "\n\n" + dum
+            logger.info(
+                "🏠 sekce DŮM v promptu: %d znaků (posílá se v KAŽDÉM kole)",
+                len(dum),
+            )
+
         self.instructions = instructions
         self.model = openai_model
         self.voice = openai_voice
