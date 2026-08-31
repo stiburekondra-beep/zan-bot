@@ -25,6 +25,7 @@ uvnitř mířil na skutečnou službu.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 
@@ -74,6 +75,59 @@ logger = logging.getLogger(__name__)
 #: odpověď na další povel.
 FASTLANE_MUTE_S = 6.0
 
+#: Okno, ve kterém se STEJNÉ volání STEJNÉHO nástroje bere jako duplicita.
+#:
+#: PROČ (31. 8. 2026, 09:42, Ondrův první povel na gemini puse): „Vypni
+#: televizi." se provedlo DVAKRÁT — `HassTurnOff:fc_6104322742753481559`
+#: v 09:42:30.640 a `HassTurnOff:fc_2373295578869622761` v 09:42:32.045.
+#: Ondra slyšel čtyři fráze místo dvou a po deseti vteřinách to umlčel
+#: tlačítkem. Mezi voláními je v logu vidět příčina:
+#: `gemini_live.llm:_create_initial_response:1369` — pipecat po výsledku
+#: nástroje nasype modelu celý kontext zpátky a model volání zopakuje.
+#: `run_llm=False` na to nedosáhne (u Gemini vyrábí odpověď server).
+#:
+#: Stráž je proto na VRSTVĚ VÝKONU nástroje, ne u konkrétní pusy: sedí ve
+#: `register_function`, kterým procházejí všechny nástroje obou pus, takže
+#: chrání i OpenAI (tam se dvojité volání zatím neukázalo, ale příčina —
+#: model, co po výsledku vidí kontext znovu — je společná).
+#:
+#: 8 s = pokrývá pozorovaný odstup 1,4 s s velkou rezervou a přitom je pod
+#: dobou, za kterou člověk vysloví druhý, MYŠLENÝ povel.
+TOOL_DEDUP_S = 8.0
+
+#: Nástroje, u kterých je OPAKOVÁNÍ ZÁMĚR, ne porucha — ty se nikdy
+#: nededuplikují:
+#:
+#: * čtení stavu a informací (`GetLiveContext`, `GetDateTime`,
+#:   `todo_get_items`, `web_search`) — dvakrát přečíst nic nerozbije a
+#:   zadržet druhé čtení by mohlo vrátit zastaralou pravdu o domě,
+#: * RELATIVNÍ a krokové úkony (`HassSetVolumeRelative`, `HassMediaNext`,
+#:   `HassMediaPrevious`) — „ztlum, ztlum" nebo „přeskoč, přeskoč" se má
+#:   sečíst; deduplikovat je by znamenalo ignorovat druhé přání.
+#:
+#: Všechno ostatní je zásah do domu s absolutním cílem (rozsviť, zhasni,
+#: zamkni seznam, pusť zálivku) — tam je druhé provedení do osmi vteřin
+#: vždycky chyba, ne přání.
+TOOL_DEDUP_VYJIMKY = frozenset({
+    "GetLiveContext",
+    "GetDateTime",
+    "todo_get_items",
+    "web_search",
+    "HassSetVolumeRelative",
+    "HassMediaNext",
+    "HassMediaPrevious",
+})
+
+
+def _dedup_klic(function_name: str, arguments) -> str:
+    """Otisk volání: jméno nástroje + argumenty nezávisle na pořadí klíčů."""
+    try:
+        args = json.dumps(arguments or {}, sort_keys=True, ensure_ascii=False,
+                          default=str)
+    except Exception:  # pragma: no cover - otisk nesmí shodit tool
+        args = repr(arguments)
+    return f"{function_name}|{args}"
+
 
 class FastLaneMixin:
     """Bezpečnostní brzda + rychlá dráha nad libovolnou pipecat LLM službou."""
@@ -97,6 +151,24 @@ class FastLaneMixin:
             self._fastlane_mute_until = 0.0
             if duvod:
                 logger.debug("🔈 fast-lane: umlčení zrušeno (%s)", duvod)
+
+    # -----------------------------------------------------------------------
+    # Dedup stráž: tentýž zásah do domu se do 8 s neprovede podruhé
+    # -----------------------------------------------------------------------
+
+    def _dedup_zaznamy(self) -> dict:
+        """Evidence běžících/nedávných volání. Per relace (per satelit)."""
+        zaznamy = getattr(self, "_tool_dedup", None)
+        if zaznamy is None:
+            zaznamy = {}
+            self._tool_dedup = zaznamy
+        return zaznamy
+
+    def _dedup_uklid(self, ted: float) -> None:
+        """Vyhodí, co je starší než okno — evidence nesmí růst donekonečna."""
+        zaznamy = self._dedup_zaznamy()
+        for klic in [k for k, z in zaznamy.items() if ted - z["t"] > TOOL_DEDUP_S]:
+            zaznamy.pop(klic, None)
 
     def register_function(self, function_name, handler, start_callback=None, *,
                           cancel_on_interruption: bool = True):  # type: ignore[override]
@@ -141,6 +213,74 @@ class FastLaneMixin:
             except Exception as e:  # pragma: no cover - brzda nesmí shodit tool
                 logger.warning(f"⚠️ safety-gate check selhal, propouštím tool: {e!r}")
 
+            # DEDUP STRÁŽ (2026-08-31): tentýž zásah do domu se do
+            # `TOOL_DEDUP_S` neprovede podruhé. Model po výsledku nástroje
+            # dostane kontext znovu a volání zopakuje (u Gemini prokazatelně,
+            # viz `TOOL_DEDUP_S`) — dům by pak úkon udělal dvakrát a rychlá
+            # dráha by přehrála dvě sady frází. Druhé volání dostane
+            # VÝSLEDEK PRVNÍHO, ať model nezůstane bez ack a nezacyklí se.
+            dedup_klic = None
+            if function_name not in TOOL_DEDUP_VYJIMKY:
+                ted = time.monotonic()
+                self._dedup_uklid(ted)
+                zaznamy = self._dedup_zaznamy()
+                dedup_klic = _dedup_klic(function_name, getattr(params, "arguments", None))
+                drivejsi = zaznamy.get(dedup_klic)
+                if drivejsi is not None:
+                    logger.warning(
+                        "⚠️ dedup: %s se stejnými argumenty už běží/proběhl před "
+                        "%.1f s — DRUHÉ VOLÁNÍ NEPROVÁDÍM (první: %s, druhé: %s)",
+                        function_name, ted - drivejsi["t"],
+                        drivejsi.get("tool_call_id", "?"),
+                        getattr(params, "tool_call_id", "?"),
+                    )
+                    # Počkej na výsledek prvního, ať vracíme pravdu, ne dohad.
+                    if not drivejsi["hotovo"].is_set():
+                        try:
+                            await asyncio.wait_for(
+                                drivejsi["hotovo"].wait(), timeout=TOOL_DEDUP_S
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "⚠️ dedup: první volání %s se do %.0f s neozvalo — "
+                                "vracím neutrální potvrzení", function_name, TOOL_DEDUP_S,
+                            )
+                    if drivejsi["hotovo"].is_set():
+                        await params.result_callback(
+                            drivejsi["vysledek"], properties=drivejsi["properties"]
+                        )
+                    else:
+                        await params.result_callback(
+                            {"status": "duplicate_ignored",
+                             "note": "Tentýž povel už probíhá. Nic neopakuj a mlč."},
+                            properties=FunctionCallResultProperties(run_llm=False),
+                        )
+                    return
+
+                # Zapiš se JAKO BĚŽÍCÍ dřív, než cokoli awaitneme — jinak by
+                # dvě souběžná volání proklouzla obě.
+                zaznam = {
+                    "t": ted,
+                    "tool_call_id": getattr(params, "tool_call_id", "?"),
+                    "hotovo": asyncio.Event(),
+                    "vysledek": None,
+                    "properties": None,
+                }
+                zaznamy[dedup_klic] = zaznam
+
+                # Výsledek si po cestě odchytneme, ať ho má čím dostat případná
+                # duplicita. Musí obalit callback DŘÍV, než ho převezme
+                # `_run_fast_lane` (ten si ho schovává jako `real_cb`).
+                puvodni_cb = params.result_callback
+
+                async def zapamatuj_a_posli(result, *, properties=None):
+                    zaznam["vysledek"] = result
+                    zaznam["properties"] = properties
+                    zaznam["hotovo"].set()
+                    return await puvodni_cb(result, properties=properties)
+
+                params.result_callback = zapamatuj_a_posli
+
             # RYCHLÁ DRÁHA (2026-08-22): u jednoduchých povelů, kde víme, co má
             # být po akci vidět ve stavu, jede tok „průběhová fráze HNED +
             # akce souběžně → ověření → tón". Cokoli jiného (a všechno, co
@@ -165,6 +305,12 @@ class FastLaneMixin:
                 return await handler(params)
             finally:
                 liveness.tool_finished()
+                # Kdyby nástroj spadl nebo callback nikdy nezavolal, ať
+                # případná duplicita nečeká celé okno nadarmo.
+                if dedup_klic is not None:
+                    zaznam = self._dedup_zaznamy().get(dedup_klic)
+                    if zaznam is not None and not zaznam["hotovo"].is_set():
+                        zaznam["hotovo"].set()
 
         super().register_function(
             function_name, liveness_tracked, start_callback, cancel_on_interruption=False
