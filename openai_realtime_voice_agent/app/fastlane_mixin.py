@@ -38,6 +38,7 @@ from pipecat.frames.frames import (
 )
 
 from app.phase_emitter import TURN_LIVENESS
+from app import hovor_log
 from app.voice_safety import (
     is_sensitive_actuation,
     saha_na_vlastni_hlas,
@@ -476,6 +477,33 @@ class FastLaneMixin:
                     "Zeptej se jednou krátkou větou, co má Žán udělat."
                 )
                 return
+
+            # TRVALY ZAZNAM (karta -21): "co z promluvy vzniklo". Sem se
+            # dostane jen tah, ktery utrzkova pojistka NEBLOKOVALA (ten
+            # pripad uz zapsal websocket_handler.na_prepis primo -- zna
+            # presny duvod bez zavislosti na tomhle miste). POZOR: pise se
+            # PRED dalsimi brzdami nize (safety-gate, vlastni hlas, bezcilny
+            # zasah, dedup) -- radek tedy rika "model se pokusil zavolat
+            # X", ne "X se provedlo". Kdyz zasah zablokuje NEKTERA z nich,
+            # tenhle radek uz existuje a dalsi se neprepisuje (znamy
+            # zjednoduseni v1, viz karta -21).
+            try:
+                if not getattr(self, "posledni_prepis_hovor_zapsano", False):
+                    _o = getattr(self, "posledni_prepis", None)
+                    _args = getattr(params, "arguments", None)
+                    _vysledek = (
+                        "delegovano_mozku" if function_name == "zeptej_se_mozku"
+                        else "%s(%r)" % (function_name, _args)
+                    )
+                    hovor_log.zapis(
+                        "clovek", kanal=getattr(self, "zan_client_id", None),
+                        prepis=getattr(_o, "puvodni", None),
+                        cisty=getattr(_o, "text", None),
+                        vysledek=_vysledek,
+                    )
+                    self.posledni_prepis_hovor_zapsano = True
+            except Exception as e:  # noqa: BLE001 - zapis nesmi shodit tool
+                logger.debug("zápis volání nástroje do hovory selhal: %r", e)
 
             # HARD BEZPEČNOSTNÍ BRZDA (2026-08-22): nevratné/rizikové cíle
             # (zámky, alarm, brány/garážová vrata, kotel) se na rychlé dráze

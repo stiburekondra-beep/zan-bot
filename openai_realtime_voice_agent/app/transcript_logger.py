@@ -44,6 +44,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 
+from app import hovor_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +90,18 @@ class TranscriptLogger(FrameProcessor):
                 self._assistant_buf = []
                 if text:
                     logger.info(f"🤖 assistant: {text}")
+                    try:
+                        # TRVALY ZAZNAM (karta -21), best-effort: tohle je
+                        # surovy prepis Gemini vystupu (output_transcription),
+                        # ne nas vlastni podnet -- proto zdroj="model", na
+                        # rozdil od spolehliveho zdroj="dispecer"
+                        # (dispecer_reci.py). Zive overeno 31. 8. 2026: pro
+                        # Gemini pusu se tahle vetev umi dlouho vubec
+                        # nespustit (Gemini neposle output_transcription),
+                        # i kdyz zvuk odpovedi hraje -- viz karta -21, diagnoza.
+                        hovor_log.zapis("zan", vysledek=text, zdroj="model")
+                    except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
+                        logger.debug("zápis modelové řeči do hovory selhal", exc_info=True)
 
         if self._capture in ("user", "both"):
             if isinstance(frame, TranscriptionFrame):

@@ -56,6 +56,7 @@ from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.transcript_logger import TranscriptLogger
 from app.prepis_ocista import ocisti
+from app import hovor_log
 
 
 def _nahlas_anomalii(service, druh: str, **kw) -> None:
@@ -819,6 +820,12 @@ class WebSocketHandler:
                     openai_service.posledni_prepis = o
                     openai_service.posledni_prepis_t = time.monotonic()
                     openai_service.posledni_prepis_pouzit = False
+                    # TRVALY ZAZNAM (karta -21): jeden radek JSONL na tuhle
+                    # promluvu -- napise se hned pro stopku/utrzek (vysledek uz
+                    # jisty), jinak ho "nahradi" fastlane_mixin.liveness_tracked
+                    # (zna jmeno volaneho nastroje) nebo odlozeny fallback flush
+                    # nize (kdyz model odpovi bez nastroje -- smalltalk).
+                    openai_service.posledni_prepis_hovor_zapsano = False
                 except Exception:  # noqa: BLE001
                     logger.debug("přepis se nepodařilo předat službě", exc_info=True)
 
@@ -837,6 +844,14 @@ class WebSocketHandler:
                         openai_service, "stopka-reci", prepis=text,
                         poznamka="holé %r v okně po akci — bráno jako zrušení" % cisty,
                     )
+                    try:
+                        hovor_log.zapis(
+                            "clovek", kanal=client_id, prepis=text, cisty=cisty,
+                            vysledek="zruseno_stopkou", stop=True,
+                        )
+                        openai_service.posledni_prepis_hovor_zapsano = True
+                    except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
+                        logger.debug("zápis stopky do hovory selhal", exc_info=True)
                     return
 
                 # ÚTRŽKOVÁ POJISTKA: po očistě nezbyl povel. Dál to nejde —
@@ -849,11 +864,46 @@ class WebSocketHandler:
                         openai_service, "utrzek", prepis=text,
                         poznamka="zahozeno před předáním (%s)" % o.duvod,
                     )
+                    try:
+                        hovor_log.zapis(
+                            "clovek", kanal=client_id, prepis=text, cisty=cisty,
+                            vysledek="zahozeno_utrzek (%s)" % o.duvod, utrzek=True,
+                        )
+                        openai_service.posledni_prepis_hovor_zapsano = True
+                    except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
+                        logger.debug("zápis útržku do hovory selhal", exc_info=True)
                     return
             try:
                 session_klient.reflex(cisty)
             except Exception:  # noqa: BLE001 — hlas na reflexu nikdy nestojí
                 logger.debug("reflex se nepodařilo odeslat", exc_info=True)
+
+            # TRVALY ZAZNAM, ODLOZENY FALLBACK (karta -21). Sem se dostane
+            # promluva, ktera NENI stopka ani utrzek -- muze z ni vzniknout
+            # volani nastroje (zapise fastlane_mixin.liveness_tracked, zna
+            # jmeno + argumenty), nebo model odpovi rovnou bez nastroje
+            # (smalltalk / pasmo A) a NIKDO by radek jinak nenapsal. Kratce
+            # pockame -- kdyz do te doby zapsal fastlane_mixin, flag uz je
+            # True a fallback jen tise skonci.
+            if o is not None and not o.stop and not o.utrzek:
+                async def _fallback_zapis_hovoru(o=o, text=text, cisty=cisty):
+                    await asyncio.sleep(2.5)
+                    try:
+                        if getattr(openai_service, "posledni_prepis", None) is not o:
+                            return  # prekryl to novejsi tah, neni co dopisovat
+                        if getattr(openai_service, "posledni_prepis_hovor_zapsano", False):
+                            return  # uz zapsal fastlane_mixin (volani nastroje)
+                        hovor_log.zapis(
+                            "clovek", kanal=client_id, prepis=text, cisty=cisty,
+                            vysledek="bez_nastroje (pravdepodobne prima odpoved, nezachyceno do 2.5s)",
+                        )
+                        openai_service.posledni_prepis_hovor_zapsano = True
+                    except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
+                        logger.debug("odlozeny zápis do hovory selhal", exc_info=True)
+                try:
+                    asyncio.create_task(_fallback_zapis_hovoru())
+                except Exception:  # noqa: BLE001
+                    logger.debug("odlozeny zápis se nepodařilo naplánovat", exc_info=True)
 
         if session_klient is None:
             na_prepis = None

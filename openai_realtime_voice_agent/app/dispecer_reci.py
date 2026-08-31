@@ -45,6 +45,7 @@ import os
 import time
 from typing import Awaitable, Callable, Optional
 
+from app import hovor_log
 from app.fronta_temat import (
     FrontaTemat,
     Tema,
@@ -518,6 +519,18 @@ class DispecerReci:
         logger.info("💉 dispečer: vysloveno (druh=%s priorita=%d cesta=%s): %.120s",
                     tema.druh, tema.priorita,
                     cesta or "pusa", tema.obsah)
+        try:
+            # `doslova=False` = tema.obsah byl jen PODNET modelu (zalozni
+            # cesta 4b) -- co model doopravdy rekl, muze byt jine slovy.
+            # `presne=True` (doslova pres charon/piper) znamena zaruceny
+            # doslovny text, coz je presne to, co Ondra potreboval pro
+            # posouzeni, jestli si Zan nevymysli (karta -21).
+            hovor_log.zapis(
+                "zan", vysledek=tema.obsah, zdroj="dispecer",
+                presne=doslova, druh=tema.druh, cesta=(cesta or "pusa"),
+            )
+        except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
+            logger.debug("zápis vyslovené věty do hovory selhal", exc_info=True)
         return tema
 
     async def _bezet(self) -> None:
