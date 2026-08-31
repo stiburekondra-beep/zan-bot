@@ -44,6 +44,8 @@ import os
 from typing import Any, Dict, List, Optional
 
 from google.genai.types import EndSensitivity
+from pipecat.frames.frames import LLMTextFrame, TTSAudioRawFrame, TTSTextFrame
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.google.gemini_live.llm import (
@@ -126,6 +128,32 @@ class SafeGeminiLiveLLMService(FastLaneMixin, GeminiLiveLLMService):
             self._settings["language"] = "cs-CZ"
             self._language_code = "cs-CZ"
             logger.info("🌐 Gemini: languageCode=cs-CZ (%s)", model_name)
+
+    async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):  # type: ignore[override]
+        """Když frázi řekla rychlá dráha, řeč modelu se do zařízení nepustí.
+
+        U OpenAI pusy se dvojhlas dá zastavit u zdroje (nepošle se
+        ``response.create`` — viz ``SafeRealtimeLLMService._create_response``).
+        Gemini Live tuhle páku NEMÁ: ``send_tool_response()`` rozmluví model
+        přímo na serveru a klient odpověď dostane, ať chce nebo ne. Jediné
+        místo, kde se dá pravidlo „mluvila rychlá dráha → model už výsledek
+        nekomentuje" vynutit, je tedy cesta rámců ven.
+
+        Zahazuje se jen OBSAH řeči (audio + text). Řídicí rámce (start/stop,
+        fáze, metriky) jdou dál, aby transport ani LED prstenec neuvázly
+        v „replying".
+        """
+        try:
+            if (
+                self.fastlane_muted()
+                and not getattr(self, "_fastlane_playing", False)
+                and isinstance(frame, (TTSAudioRawFrame, TTSTextFrame, LLMTextFrame))
+            ):
+                logger.debug("🔇 fast-lane (gemini): zahozen %s", type(frame).__name__)
+                return
+        except Exception as e:  # pragma: no cover - filtr nesmí shodit pipeline
+            logger.warning("⚠️ fast-lane filtr (gemini) selhal, propouštím: %r", e)
+        return await super().push_frame(frame, direction)
 
     async def _handle_connection_error(self, error: Exception) -> bool:  # type: ignore[override]
         """Terminální pád gemini pusy nesmí skončit smyčkou ``ErrorFrame``.

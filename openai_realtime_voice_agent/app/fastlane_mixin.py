@@ -52,9 +52,51 @@ from app.voice_fastlane import (
 
 logger = logging.getLogger(__name__)
 
+#: Jak dlouho po přehrané frázi platí „model už k tomu nic neříká".
+#:
+#: DVOJHLAS (Ondra, 31. 8. 2026 08:58): „řekl jsem mu ať zhasne v obýváku a on
+#: pustí to přednahrané a pak ještě dořekne". Z logu: rychlá dráha přehrála
+#: `zhasinam__obyvak` + tón `vysledek_ok` a vrátila výsledek s
+#: `run_llm=False` — a model přesto v 08:58:25 řekl „Hotovo, světlo v obýváku
+#: je zhasnuté."
+#:
+#: PROČ `run_llm=False` NESTAČÍ: ten příznak umí zastavit jen JEDNU cestu —
+#: `LLMAssistantAggregator._handle_function_call_result` (push_context_frame).
+#: Jenže konec uživatelova tahu pošle do služby vlastní kontextový rámec a
+#: `pipecat/services/openai/realtime/llm.py:_process_completed_function_calls`
+#: si po odeslání výsledku nástroje zavolá `_create_response()` sám —
+#: bez ohledu na `run_llm`. U Gemini Live je to ještě tvrdší: `send_tool_response`
+#: rozmluví model přímo na serveru a klient s tím nemá co dělat.
+#:
+#: Proto je pravidlo vynucené KÓDEM a na úrovni Žána, ne poskytovatele:
+#: **když frázi řekla rychlá dráha, model výsledek už nekomentuje.**
+#: Okno je krátké schválně — dorovnává jen doběh téhož tahu, nesmí spolknout
+#: odpověď na další povel.
+FASTLANE_MUTE_S = 6.0
+
 
 class FastLaneMixin:
     """Bezpečnostní brzda + rychlá dráha nad libovolnou pipecat LLM službou."""
+
+    # -----------------------------------------------------------------------
+    # Umlčení modelu po přehrané frázi (obě pusy)
+    # -----------------------------------------------------------------------
+
+    def fastlane_mute_model(self, duvod: str) -> None:
+        """Zapne okno, ve kterém model nesmí komentovat výsledek."""
+        self._fastlane_mute_until = time.monotonic() + FASTLANE_MUTE_S
+        logger.info("🔇 fast-lane: model umlčen na %.0f s (%s)", FASTLANE_MUTE_S, duvod)
+
+    def fastlane_muted(self) -> bool:
+        """Platí právě teď „mluvila rychlá dráha, model mlčí"?"""
+        return time.monotonic() < getattr(self, "_fastlane_mute_until", 0.0)
+
+    def fastlane_unmute(self, duvod: str = "") -> None:
+        """Zruší umlčení — nový tah uživatele, nebo jsme ho právě spotřebovali."""
+        if getattr(self, "_fastlane_mute_until", 0.0):
+            self._fastlane_mute_until = 0.0
+            if duvod:
+                logger.debug("🔈 fast-lane: umlčení zrušeno (%s)", duvod)
 
     def register_function(self, function_name, handler, start_callback=None, *,
                           cancel_on_interruption: bool = True):  # type: ignore[override]
@@ -150,6 +192,9 @@ class FastLaneMixin:
         if not pcm:
             logger.info("🔇 fráze %r není v knihovně — nechávám mluvit model", zamer)
             return False
+        # Vlastní hlas rychlé dráhy nesmí spadnout do filtru, který u Gemini
+        # pusy zahazuje řeč modelu během umlčení (`fastlane_muted`).
+        self._fastlane_playing = True
         try:
             await self.push_frame(TTSStartedFrame())
             for i in range(0, len(pcm), FASTLANE_CHUNK_BYTES):
@@ -166,6 +211,8 @@ class FastLaneMixin:
         except Exception as e:  # pragma: no cover - přehrání nesmí shodit tool
             logger.warning("⚠️ přehrání fráze %s selhalo: %r", zamer, e)
             return False
+        finally:
+            self._fastlane_playing = False
 
     async def _verify_after_action(self, pre, plan) -> str:
         """Přečte stav PO akci a vrátí verdikt: ok / fail / unconfirmed / ha_down.
@@ -240,6 +287,12 @@ class FastLaneMixin:
             speak_task, action_task, return_exceptions=True
         )
         spoke = spoke is True
+        if spoke:
+            # Od téhle chvíle platí: mluvila rychlá dráha → model mlčí.
+            # Zapíná se HNED po frázi (ne až u výsledku), protože odpověď
+            # modelu umí spustit i konec uživatelova tahu, který přijde dřív,
+            # než doběhne ověřování stavu v HA.
+            self.fastlane_mute_model(f"{function_name}/{zamer}")
         if isinstance(action_res, Exception):
             logger.warning("⚠️ fast-lane: HA akce selhala: %r", action_res)
         logger.info(
@@ -294,7 +347,9 @@ class FastLaneMixin:
             return
 
         # Selhalo i podruhé → poctivá věta + diagnostiku převezme Žán-Code.
+        # Tady model mluvit MUSÍ (má zavolat ask_zan), takže umlčení zrušíme.
         await self.play_phrase("nepovedlo_se")
+        self.fastlane_unmute("selhání — model má převzít a zavolat ask_zan")
         cil = plan.target or plan.area or "to"
         await real_cb(
             "Akce se nepovedla ani na druhý pokus a ověřený stav to potvrzuje. "

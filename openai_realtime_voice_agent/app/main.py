@@ -144,6 +144,38 @@ class SafeRealtimeLLMService(FastLaneMixin, OpenAIRealtimeLLMService):
     async def _truncate_current_audio_response(self):  # type: ignore[override]
         return
 
+    async def _create_response(self):  # type: ignore[override]
+        """Když frázi řekla rychlá dráha, model výsledek už nekomentuje.
+
+        DVOJHLAS (Ondra, 31. 8. 2026): „řekl jsem mu ať zhasne v obýváku a on
+        pustí to přednahrané a pak ještě dořekne." Rychlá dráha vrací výsledek
+        s ``FunctionCallResultProperties(run_llm=False)``, jenže ten příznak
+        hlídá jen agregátor kontextu. Konec uživatelova tahu pošle do služby
+        vlastní kontextový rámec a pipecat si v
+        ``_process_completed_function_calls()`` po odeslání výsledku nástroje
+        zavolá ``_create_response()`` SÁM (0.0.97,
+        ``pipecat/services/openai/realtime/llm.py:562``) — ``run_llm`` se ho
+        vůbec netýká. V logu je to vidět doslova: v 08:58:23,560 tón
+        ``vysledek_ok`` z knihovny, v 08:58:23.946 „Creating response",
+        v 08:58:25 model „Hotovo, světlo v obýváku je zhasnuté."
+
+        Brzda je jednorázová a časově omezená (``FASTLANE_MUTE_S``), aby
+        spolkla jen doběh TOHOTO tahu, nikdy odpověď na další povel.
+        """
+        if self.fastlane_muted():
+            self.fastlane_unmute("spotřebováno — odpověď modelu přeskočena")
+            logger.info(
+                "🔇 fast-lane: přeskakuju odpověď modelu — výsledek už řekla "
+                "přednahraná pusa"
+            )
+            return
+        return await super()._create_response()
+
+    async def _handle_user_started_speaking(self, frame):  # type: ignore[override]
+        """Nový tah uživatele umlčení ruší — brzda nesmí přežít svůj tah."""
+        self.fastlane_unmute("uživatel začal mluvit")
+        return await super()._handle_user_started_speaking(frame)
+
     async def _handle_evt_response_done(self, evt):  # type: ignore[override]
         """Keep Pipecat metrics and report usage into the SHARED budget.
 
@@ -637,8 +669,11 @@ class Application:
                 "• JEDNODUCHÉ OVLÁDÁNÍ DOMU udělej SÁM svými HA nástroji, HNED, "
                 "bez ask_zan: rozsvítit/zhasnout světla, zapnout/vypnout zásuvku "
                 "nebo spotřebič, hudba a hlasitost (play/pause/další/ztlumit), "
-                "čtení stavů a teploty. Zavolej nástroj rovnou a pak řekni jednu "
-                "krátkou větu s výsledkem.\n"
+                "čtení stavů a teploty. U OVLÁDÁNÍ (světla, zásuvky, spotřebiče, "
+                "hudba, hlasitost) zavolej nástroj rovnou a pak MLČ — výsledek "
+                "ohlásí systém sám z přednahrané knihovny (viz RYCHLÁ PUSA níž). "
+                "U ČTENÍ (jaká je teplota, co svítí) odpověz sám jednou krátkou "
+                "větou.\n"
                 "• ask_zan zavolej JEN když jde o: psaní nebo změnu automatizací "
                 "a konfigurace, diagnostiku typu „proč něco nejede\", tvorbu "
                 "dashboardu, cokoli na víc než dvě věty přemýšlení, nebo když si "
