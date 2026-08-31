@@ -72,6 +72,7 @@ from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.services.openai.realtime import events as rt_events
 
 from app.dispecer_reci import DispecerReci
+from app.prepis_ocista import ocisti
 from app.zdroj_zarizeni import payload_voice, zdroj_zarizeni
 
 if TYPE_CHECKING:
@@ -478,6 +479,35 @@ class ZanBridge:
         if not text:
             await params.result_callback("Neslyšel jsem zadání.")
             return
+
+        # OČISTA ZADÁNÍ (31. 8. 2026). Model do `text` přepošle, co slyšel —
+        # včetně wake wordu a šumu. Živě z logu 10:44:44:
+        # `ask_zan {'text': 'baklažán'}`, a v 10:45:11
+        # `{'text': 'baklažán rozsvítit jedno světlo…'}`. Mozek má dostat
+        # POVEL, ne oslovení; útržek se mu neposílá vůbec.
+        ocista = ocisti(text)
+        if ocista.utrzek:
+            logger.warning("🗑 útržek: ask_zan(%r) — %s, mozku to neposílám",
+                           text, ocista.duvod)
+            rozbor = getattr(self, "rozbor", None)
+            if rozbor is not None:
+                try:
+                    rozbor.nahlas("utrzek-ask", prepis=text,
+                                  volani="ask_zan(%r)" % text,
+                                  vysledek="nedelegováno",
+                                  poznamka="zadání není povel (%s)" % ocista.duvod)
+                except Exception:  # noqa: BLE001
+                    logger.debug("nahlášení anomálie selhalo", exc_info=True)
+            await params.result_callback(
+                {"status": "ignored",
+                 "note": "To nebyl povel, jen zbytek oslovení nebo šum. "
+                         "Nic jsem nepředal. Mlč, nebo se zeptej jednou krátkou větou."},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        if ocista.zmeneno:
+            logger.info("🧽 ask_zan: %r → %r", text, ocista.text)
+        text = ocista.text
 
         service = getattr(params, "llm", None)
         if service is not None and service is not self._service:

@@ -160,6 +160,31 @@ RYCHLA_DRAHA_ZVUKY = frozenset({
 #: takže druhý z protichůdné dvojice se NEPROVEDE a model se má doptat.
 PROTISMER_S = 2.0
 
+#: Jak dlouho po FINÁLNÍM přepisu se z něj ještě soudí, co model dělá.
+#:
+#: PROČ (31. 8. 2026, 10:46:12): přepis `ne baklažánu.` dorazil v 10:46:12.366
+#: a o dvě milisekundy později model zavolal `HassTurnOff` na poslední zmíněné
+#: světlo. Není to povel — je to zbytek wake wordu se záporem. Zásah do domu
+#: postavený na útržku se NEPROVEDE.
+#:
+#: Okno je krátké schválně: má pokrýt doběh TÉHOŽ tahu (pozorováno < 5 ms),
+#: ne zablokovat povel, který člověk řekne vzápětí správně. Záznam se navíc
+#: SPOTŘEBUJE (`posledni_prepis_pouzit`), takže jeden útržek zablokuje nejvýš
+#: jeden zásah.
+UTRZEK_OKNO_S = 3.0
+
+#: Nástroje, na které se útržková pojistka nevztahuje: čtení stavu (dvakrát
+#: přečíst nic nerozbije), vlastní mosty (`ask_zan` si očistu dělá sám ve
+#: `zan_bridge_tool`) a odpojení. Všechno ostatní JE zásah do domu.
+UTRZEK_VYJIMKY = frozenset({
+    "GetLiveContext",
+    "GetDateTime",
+    "todo_get_items",
+    "web_search",
+    "ask_zan",
+    "disconnect",
+})
+
 #: Průběhový záměr → zvuk, který ho zastoupí. Hlasitost a ztlumení tady
 #: schválně NEJSOU: „ztlum" není zapnutí ani vypnutí, tam mluví model.
 ZVUK_MISTO_RECI = {
@@ -188,6 +213,43 @@ class FastLaneMixin:
     # -----------------------------------------------------------------------
     # Umlčení modelu po přehrané frázi (obě pusy)
     # -----------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # Útržková pojistka + hlášení anomálií
+    # -----------------------------------------------------------------------
+
+    def _rozbor(self, druh: str, **kw) -> None:
+        """Anomálie výměny → Žánovi k rozboru (`app/anomalie.py`)."""
+        rozbor = getattr(self, "rozbor", None)
+        if rozbor is None:
+            return
+        try:
+            if "prepis" not in kw:
+                o = getattr(self, "posledni_prepis", None)
+                kw["prepis"] = getattr(o, "puvodni", "") if o is not None else ""
+            rozbor.nahlas(druh, **kw)
+        except Exception:  # pragma: no cover - hlásič nesmí shodit tool
+            logger.debug("nahlášení anomálie selhalo", exc_info=True)
+
+    def _utrzek_blokuje(self, function_name: str) -> str:
+        """Vrátí důvod, proč se zásah NEMÁ provést. Prázdný řetězec = jeď.
+
+        Ptá se posledního finálního přepisu, který most slyšel (věší ho tam
+        `websocket_handler.na_prepis`). Když to nebyl povel, model jedná na
+        šumu a dům na to nemá reagovat. Záznam se spotřebuje, takže další
+        (už správný) povel projde.
+        """
+        if function_name in UTRZEK_VYJIMKY:
+            return ""
+        o = getattr(self, "posledni_prepis", None)
+        if o is None or not getattr(o, "utrzek", False):
+            return ""
+        if getattr(self, "posledni_prepis_pouzit", False):
+            return ""
+        if time.monotonic() - getattr(self, "posledni_prepis_t", 0.0) > UTRZEK_OKNO_S:
+            return ""
+        self.posledni_prepis_pouzit = True
+        return getattr(o, "duvod", "") or "útržek"
 
     def fastlane_mute_model(self, duvod: str) -> None:
         """Zapne okno, ve kterém model nesmí komentovat výsledek."""
@@ -248,6 +310,35 @@ class FastLaneMixin:
         inspects the signature to pick the calling convention).
         """
         async def liveness_tracked(params):
+            # ÚTRŽKOVÁ POJISTKA (2026-08-31): poslední věc, kterou most slyšel,
+            # nebyl povel — jen wake word, "ne", citoslovce. Zásah do domu se
+            # neprovede a model se má doptat. Sedí PŘED vším ostatním: nemá
+            # smysl opravovat oblast ani deduplikovat něco, co se vůbec nemá
+            # stát. (Živě 10:46:12: `ne baklažánu.` → HassTurnOff → fail.)
+            try:
+                duvod_utrzku = self._utrzek_blokuje(function_name)
+            except Exception as e:  # pragma: no cover - pojistka nesmí shodit tool
+                logger.warning("⚠️ útržková pojistka selhala, propouštím tool: %r", e)
+                duvod_utrzku = ""
+            if duvod_utrzku:
+                o = getattr(self, "posledni_prepis", None)
+                logger.warning(
+                    "🗑 útržek: %s(%r) NEPROVÁDÍM — poslední přepis %r nebyl povel (%s)",
+                    function_name, getattr(params, "arguments", None),
+                    getattr(o, "puvodni", ""), duvod_utrzku,
+                )
+                self._rozbor(
+                    "utrzek-zasah",
+                    volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
+                    vysledek="neprovedeno",
+                    poznamka="poslední přepis nebyl povel (%s)" % duvod_utrzku,
+                )
+                await params.result_callback(
+                    "Poslední, co bylo slyšet, nebyl povel — nic jsem neprovedl. "
+                    "Zeptej se jednou krátkou větou, co má Žán udělat."
+                )
+                return
+
             # HARD BEZPEČNOSTNÍ BRZDA (2026-08-22): nevratné/rizikové cíle
             # (zámky, alarm, brány/garážová vrata, kotel) se na rychlé dráze
             # NEPROVÁDĚJÍ — vždy přes ask_zan (elevace + potvrzení v Žán-Code).
@@ -303,6 +394,12 @@ class FastLaneMixin:
                         function_name, ted - drivejsi["t"],
                         drivejsi.get("tool_call_id", "?"),
                         getattr(params, "tool_call_id", "?"),
+                    )
+                    self._rozbor(
+                        "dedup",
+                        volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
+                        vysledek="druhé volání neprovedeno",
+                        poznamka="stejný nástroj se stejnými argumenty do %.0f s" % TOOL_DEDUP_S,
                     )
                     # Počkej na výsledek prvního, ať vracíme pravdu, ne dohad.
                     if not drivejsi["hotovo"].is_set():
@@ -399,6 +496,12 @@ class FastLaneMixin:
                             "🚫 protichůdný povel na %r: %s vs %s do %.1f s — "
                             "NEPROVÁDÍM, model se má doptat",
                             cil, posl["smer"], smer, ted2 - posl["t"])
+                        self._rozbor(
+                            "protismer",
+                            volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
+                            vysledek="druhý z dvojice neproveden",
+                            poznamka="protichůdné povely na %r do %.1f s" % (cil, PROTISMER_S),
+                        )
                         self.fastlane_unmute("protichůdné povely — model se ptá")
                         await params.result_callback(
                             "V jednom tahu dorazily protichůdné povely (zapnout "
@@ -587,6 +690,16 @@ class FastLaneMixin:
             verdict = await self._verify_after_action(pre, plan)
 
         self._mirror_to_zan(plan, function_name, args, verdict)
+
+        # ANOMÁLIE → ŽÁNOVI HNED (ne až do večerní revize). Úspěch se nehlásí:
+        # rozbor stojí tokeny a Žán má řešit, co NEVYŠLO.
+        if verdict != "ok":
+            self._rozbor(
+                "vysledek_%s" % verdict,
+                volani="%s(%r)" % (function_name, args),
+                vysledek=verdict,
+                poznamka="rychlá dráha: %s" % plan.label,
+            )
 
         # ÚSPĚCH = ZVUK A TÓN, ŽÁDNÁ SLOVA (Ondra, 31. 8.): „akce sama je
         # potvrzení". Zvuk zapnutí/vypnutí už zazněl, teď jen tón — a model

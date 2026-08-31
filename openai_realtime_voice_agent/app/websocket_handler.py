@@ -55,6 +55,18 @@ from app.session_manager import SessionManager
 from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.transcript_logger import TranscriptLogger
+from app.prepis_ocista import ocisti
+
+
+def _nahlas_anomalii(service, druh: str, **kw) -> None:
+    """Anomalie hovoru -> Zanovi k rozboru. Nikdy nesmi shodit tah."""
+    rozbor = getattr(service, "rozbor", None)
+    if rozbor is None:
+        return
+    try:
+        rozbor.nahlas(druh, **kw)
+    except Exception:  # noqa: BLE001 - hlasic nesmi shodit hlas
+        logger.debug("nahlaseni anomalie selhalo", exc_info=True)
 from app.client_registry import (
     ClientRegistry,
     ClientSlot,
@@ -781,10 +793,65 @@ class WebSocketHandler:
         # tak — obraz se jen přepne dřív, než domluví.
         session_klient = self.session_klient
 
+        # OČISTA PŘEPISU (31. 8. 2026). Tohle je JEDINÉ místo, kudy finální
+        # uživatelský přepis v mostu teče dál — proto se čistí tady a všichni
+        # ostatní (reflex plátna, rychlá dráha přes `posledni_prepis`) dostanou
+        # už jen očištěný text. Důvod je v `app/prepis_ocista.py`: wake word
+        # prosakoval do povelu (`baklažánrozsvítit…`) a na útržku `ne baklažánu.`
+        # model vystřelil `HassTurnOff` → `vysledek_fail`.
         def na_prepis(text):
             session_klient.heard()
             try:
-                session_klient.reflex(text)
+                o = ocisti(text)
+            except Exception:  # noqa: BLE001 — očista nesmí shodit hlas
+                logger.debug("očista přepisu selhala, beru text syrový", exc_info=True)
+                o = None
+
+            cisty = text if o is None else o.text
+            if o is not None:
+                if o.zmeneno:
+                    logger.info("🧽 přepis očištěn: %r → %r", text, cisty)
+                # Rychlá dráha se na tenhle záznam ptá, NEŽ provede zásah do
+                # domu (`fastlane_mixin._utrzek_blokuje`). U gemini pusy dorazí
+                # přepis prokazatelně dřív než volání nástroje téhož tahu
+                # (10:46:12.366 přepis → 10:46:12.368 HassTurnOff).
+                try:
+                    openai_service.posledni_prepis = o
+                    openai_service.posledni_prepis_t = time.monotonic()
+                    openai_service.posledni_prepis_pouzit = False
+                except Exception:  # noqa: BLE001
+                    logger.debug("přepis se nepodařilo předat službě", exc_info=True)
+
+                # STOPKA ŘEČÍ: holé "ne" nebo "stop" v okně po akci není nový
+                # povel, ale zrušení. Napojeno na TUTÉŽ stopku jako tlačítko
+                # zařízení (`_on_device_interrupt` níž), ať se to chová stejně.
+                if o.stop and getattr(openai_service, "fastlane_muted", None) is not None \
+                        and openai_service.fastlane_muted():
+                    logger.info("🛑 stopka řečí (%r) v okně po akci — ruším, "
+                                "nový povel z toho nedělám", cisty)
+                    try:
+                        asyncio.create_task(_on_device_interrupt())
+                    except Exception:  # noqa: BLE001
+                        logger.debug("stopku řečí nešlo naplánovat", exc_info=True)
+                    _nahlas_anomalii(
+                        openai_service, "stopka-reci", prepis=text,
+                        poznamka="holé %r v okně po akci — bráno jako zrušení" % cisty,
+                    )
+                    return
+
+                # ÚTRŽKOVÁ POJISTKA: po očistě nezbyl povel. Dál to nejde —
+                # ani na reflex, ani do paměti. Model dostane audio tak jako
+                # tak, ale ze šumu se aspoň nestane text, na který se jedná.
+                if o.utrzek:
+                    logger.warning("🗑 útržek: %r (%s) — nepředávám dál",
+                                   text, o.duvod)
+                    _nahlas_anomalii(
+                        openai_service, "utrzek", prepis=text,
+                        poznamka="zahozeno před předáním (%s)" % o.duvod,
+                    )
+                    return
+            try:
+                session_klient.reflex(cisty)
             except Exception:  # noqa: BLE001 — hlas na reflexu nikdy nestojí
                 logger.debug("reflex se nepodařilo odeslat", exc_info=True)
 
