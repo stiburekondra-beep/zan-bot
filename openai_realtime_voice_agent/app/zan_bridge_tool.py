@@ -649,6 +649,12 @@ class ZanBridge:
         )
         self._pending[ask_id] = task
         task.add_done_callback(lambda _t, i=ask_id: self._pending.pop(i, None))
+        # Čas POLOŽENÍ otázky — z něj dispečer pozná, že odpověď dorazila
+        # do jiného hovoru, než ke kterému patří (pravidlo čerstvosti).
+        try:
+            self.dispecer.zaznamenej_otazku(interaction_id)
+        except Exception:  # pragma: no cover - evidence nesmí shodit dotaz
+            logger.debug("evidence času otázky selhala", exc_info=True)
         logger.info("🧠 ask_zan #%d delegováno na pozadí (iid=%s, běží %d): %.120s",
                     ask_id, interaction_id, self.pending, text)
 

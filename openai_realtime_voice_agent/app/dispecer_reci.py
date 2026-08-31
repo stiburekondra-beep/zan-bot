@@ -114,6 +114,32 @@ DOSLOVNE_DRUHY = frozenset({"odpoved", "nalez", "oprava", "chyba"})
 #: 4,4–6,7 s bez streamu, ~0,10 Kč za větu.
 MLUVCI = (os.environ.get("ZAN_MLUVCI", "charon").strip().lower() or "charon")
 
+#: PRAVIDLO ČERSTVOSTI. Jak dlouho po POLOŽENÍ OTÁZKY se odpověď ještě smí
+#: vyslovit jako odpověď.
+#:
+#: PROČ (Ondra, 31. 8. 2026): „Zan doodpovida na otazky po nekolika
+#: minutach..je to divne.." Mezitím se stihne zeptat na něco jiného, takže
+#: odpověď dorazí do úplně jiného hovoru a zní jako nesmysl. Odpovědět na
+#: otázku, na kterou se člověk už neptá, je HORŠÍ NEŽ MLČET.
+#:
+#: Pozor na rozdíl, kvůli kterému to samotné TTL neřeší: `TTL_ODPOVED` se
+#: měří od chvíle, kdy odpověď DORAZILA do fronty. Když mozek počítá čtyři
+#: minuty, je jeho odpověď v okamžiku zařazení stará nula sekund a projde.
+#: Tady se měří stáří OTÁZKY, což je jediné, co odpovídá lidské zkušenosti.
+CERSTVOST_S = float(os.environ.get("ZAN_CERSTVOST_S", "20"))
+
+#: Značka, kterou dostane odpověď, jež dorazila po `CERSTVOST_S`.
+ZNACKA_POZDNI = "pozdni"
+
+#: Rámování pozdní odpovědi. NEZAHAZUJE se — informace je pořád platná,
+#: jen se nesmí tvářit jako reakce na to, co člověk řekl naposledy.
+HLAVICKA_POZDNI = (
+    "TOHLE JE ODPOVĚĎ NA STARŠÍ DOTAZ, ne na to, co ti člověk řekl "
+    "naposledy. Uveď ji tak, aby to bylo poznat — začni „ještě k tomu, "
+    "na co ses ptal před chvílí“ nebo podobně — a pak vyslov "
+    "PŘESNĚ tohle, slovo od slova, beze změny faktů"
+)
+
 #: Tvrdá instrukce „jsi reproduktor, ne spoluautor". Drží tři pravidla,
 #: která se v `HLAVICKY` osvědčila: žádné číslice v instrukci, jeden pokyn
 #: (ne dva protichůdné) a obsah v uvozovkách oddělený od pokynu.
@@ -127,8 +153,15 @@ HLAVICKA_DOSLOVA = (
 
 
 def obal_doslova(tema: "Tema") -> str:
-    """Text mozku obalený tvrdou instrukcí „vyslov přesně tohle“."""
-    return "%s:\n„%s“" % (HLAVICKA_DOSLOVA, tema.obsah)
+    """Text mozku obalený tvrdou instrukcí „vyslov přesně tohle“.
+
+    Pozdní odpověď (značka `ZNACKA_POZDNI`) dostane jiné rámování — musí
+    být slyšet, že se vztahuje ke staršímu dotazu.
+    """
+    hlavicka = HLAVICKA_DOSLOVA
+    if ZNACKA_POZDNI in (tema.znacka or ""):
+        hlavicka = HLAVICKA_POZDNI
+    return "%s:\n„%s“" % (hlavicka, tema.obsah)
 
 HLAVICKY = {
     "odpoved": (
@@ -234,6 +267,8 @@ class DispecerReci:
         self._rozbeh_do: Optional[float] = None
         self.vysloveno = 0
         self.zahozeno_watchdogem = 0
+        #: interaction_id -> kdy člověk položil otázku (monotonic).
+        self._otazky: dict = {}
 
     # -- vstupy (jediná povolená cesta k řeči) ----------------------------
 
@@ -291,6 +326,21 @@ class DispecerReci:
             druh="smalltalk", nyni=nyni,
         )
 
+    def zaznamenej_otazku(self, interaction_id: str,
+                          nyni: Optional[float] = None) -> None:
+        """Zapíše, KDY člověk položil otázku. Volá most při `ask_zan`.
+
+        Bez tohohle záznamu se stáří odpovědi nedá spočítat — fronta zná
+        jen okamžik, kdy odpověď dorazila. Když záznam chybí (starší most,
+        odpověď bez otázky), pravidlo čerstvosti se neuplatní: radši
+        vyslovit než mlčet kvůli chybějícímu údaji.
+        """
+        self._otazky[interaction_id] = time.monotonic() if nyni is None else nyni
+        if len(self._otazky) > 64:
+            hranice = (time.monotonic() if nyni is None else nyni) - 600.0
+            for iid in [k for k, v in self._otazky.items() if v < hranice]:
+                self._otazky.pop(iid, None)
+
     def _pridej(
         self, text: str, priorita: int, platnost_s: float, interaction_id: str,
         *, druh: str, run_llm: bool = True, znacka: str = "",
@@ -300,6 +350,19 @@ class DispecerReci:
         if not obsah:
             logger.info("dispečer: prázdný text (druh=%s) — nezařazuju", druh)
             return False
+        # PRAVIDLO ČERSTVOSTI — jen pro obsah, který se tváří jako odpověď.
+        # Průběžné hlášky a smalltalk mají vlastní krátké TTL a stárnutí
+        # otázky je u nich bezpředmětné.
+        polozeno = self._otazky.get(interaction_id)
+        if polozeno is not None and druh in DOSLOVNE_DRUHY:
+            stari = (time.monotonic() if nyni is None else nyni) - polozeno
+            if stari > CERSTVOST_S:
+                znacka = (znacka + "," + ZNACKA_POZDNI).strip(",")
+                logger.warning(
+                    "⏳ dispečer: odpověď dorazila %.0f s po otázce (limit %.0f s) — "
+                    "uvedu ji jako odpověď na STARŠÍ dotaz: %.80s",
+                    stari, CERSTVOST_S, obsah,
+                )
         self.fronta.pridej(Tema(
             obsah=obsah,
             priorita=priorita,
