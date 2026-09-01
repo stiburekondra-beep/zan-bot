@@ -100,14 +100,18 @@ FASTLANE_MUTE_S = 6.0
 #: chrání i OpenAI (tam se dvojité volání zatím neukázalo, ale příčina —
 #: model, co po výsledku vidí kontext znovu — je společná).
 #:
-#: 8 s = pokrývá pozorovaný odstup 1,4 s s velkou rezervou a přitom je pod
-#: dobou, za kterou člověk vysloví druhý, MYŠLENÝ povel.
+#: OD 1. 9. 2026 UŽ TOHLE ČÍSLO O DUPLICITĚ NEROZHODUJE. Zůstalo ve dvou
+#: rolích, kde je čas na místě: (a) jak dlouho duplicita čeká na výsledek
+#: prvního volání, (b) nouzové okno pro kanál BEZ přepisu, kde není podle
+#: čeho poznat tah (viz `_dedup_je_duplicita`). O duplicitě rozhoduje TAH.
 TOOL_DEDUP_S = 8.0
 
-#: Jak dlouho se drží NEÚSPĚŠNÝ výsledek. Jen tak dlouho, aby spolkl okamžité
-#: echo modelu (pozorováno 1,3-1,6 s) — ne aby zablokoval člověka, který povel
-#: zopakuje právě proto, že poprvé nezabral.
-DEDUP_MILOST_S = 2.5
+#: STROP EVIDENCE. Jak dlouho smí záznam nejdéle ležet, než ho úklid vyhodí.
+#: NENÍ to rozhodovací znak duplicity — jen pojistka, aby evidence nerostla
+#: donekonečna, kdyby přepis tahu nikdy nedorazil a razítko se nezměnilo.
+#: Proto je štědrý: v praxi o ničem nerozhoduje, protože nový tah vyhodí
+#: záznam mnohem dřív.
+DEDUP_STROP_S = 60.0
 
 #: Nástroje, u kterých je OPAKOVÁNÍ ZÁMĚR, ne porucha — ty se nikdy
 #: nededuplikují:
@@ -412,11 +416,64 @@ class FastLaneMixin:
         return zaznamy
 
     def _dedup_uklid(self, ted: float) -> None:
-        """Vyhodí, co je starší než okno — evidence nesmí růst donekonečna."""
+        """Vyhodí, co překročilo strop — evidence nesmí růst donekonečna.
+
+        Tohle NENÍ rozhodování o duplicitě (to dělá `_dedup_je_duplicita`
+        podle tahu), jen úklid paměti.
+        """
         zaznamy = self._dedup_zaznamy()
         for klic in [k for k, z in zaznamy.items()
-                     if ted - z["t"] > z.get("okno", TOOL_DEDUP_S)]:
+                     if ted - z["t"] > DEDUP_STROP_S]:
             zaznamy.pop(klic, None)
+
+    def _dedup_tah(self) -> float:
+        """Razítko TAHU = jedné lidské promluvy.
+
+        `websocket_handler.na_prepis` ho přepíše při KAŽDÉM finálním
+        přepisu (`posledni_prepis_t`), takže dvě volání se stejným
+        razítkem vznikla z TÉŽE věty — druhé je echo modelu, ne druhé
+        přání člověka. `liveness_tracked` navíc nahoře awaituje
+        `_pockej_na_prepis`, takže tady je přepis tohohle tahu už
+        k dispozici (volání nástroje umí přepis o pár ms předběhnout).
+
+        0.0 = razítko není (kanál bez přepisu, testy) → padá se na čas.
+        """
+        try:
+            return float(getattr(self, "posledni_prepis_t", 0.0) or 0.0)
+        except (TypeError, ValueError):  # pragma: no cover
+            return 0.0
+
+    def _dedup_je_duplicita(self, zaznam: dict, ted: float) -> bool:
+        """Je tohle volání duplicitou dřívějšího záznamu?
+
+        ROZHODUJE TAH, NE STOPKY (1. 9. 2026):
+
+        * dokud první volání BĚŽÍ, je druhé duplicita vždycky — na tutéž
+          otázku se druhý dotaz nezakládá,
+        * doběhlé volání je duplicita, jen když je ze STEJNÉHO tahu;
+          jakmile člověk promluví znovu, je to nové přání a projde
+          okamžitě — i za půl vteřiny,
+        * bez razítka tahu (kanál bez přepisu, testy) se padá na původní
+          časové okno `TOOL_DEDUP_S`,
+        * přes `DEDUP_STROP_S` už duplicita není nikdy (úklid paměti).
+
+        PROČ PRYČ OD ČASU: časové okno je slabé z principu — ať se zvolí
+        jakákoli hodnota, jednou přijde volání o chlup později. 31. 8.
+        v 15:19:47,272 a 15:19:50,493 se `HassTurnOff` provedl dvakrát
+        bez druhého vysloveného povelu: okno tehdy spadlo na 2,5 s
+        (výsledek nebyl `verified_success`) a druhé volání přišlo za
+        2,7 s. Tah je oproti tomu tvrdý znak: model si v jednom tahu
+        nový přepis nevyrobí, člověk bez nového přepisu nepromluví.
+        """
+        if not zaznam["hotovo"].is_set():
+            return True
+        if ted - zaznam["t"] > DEDUP_STROP_S:
+            return False
+        tah_ted = self._dedup_tah()
+        tah_zaznam = zaznam.get("tah", 0.0)
+        if tah_ted and tah_zaznam:
+            return tah_ted == tah_zaznam
+        return (ted - zaznam["t"]) < TOOL_DEDUP_S
 
     def register_function(self, function_name, handler, start_callback=None, *,
                           cancel_on_interruption: bool = True):  # type: ignore[override]
@@ -626,10 +683,23 @@ class FastLaneMixin:
                 zaznamy = self._dedup_zaznamy()
                 dedup_klic = _dedup_klic(function_name, getattr(params, "arguments", None))
                 drivejsi = zaznamy.get(dedup_klic)
+                if drivejsi is not None and not self._dedup_je_duplicita(drivejsi, ted):
+                    # JINÝ TAH = člověk povel řekl ZNOVU. Není to echo
+                    # modelu, je to nové přání — starý záznam zahodíme
+                    # a volání pustíme dál. Brzda, která by spolkla
+                    # i legitimní druhý povel, je horší než dvojí
+                    # provedení.
+                    logger.info(
+                        "dedup: %s se stejnými argumenty už proběhl, ale v JINÉM "
+                        "tahu — člověk to řekl znovu, PROVÁDÍM", function_name,
+                    )
+                    zaznamy.pop(dedup_klic, None)
+                    drivejsi = None
                 if drivejsi is not None:
                     logger.warning(
                         "⚠️ dedup: %s se stejnými argumenty už běží/proběhl před "
-                        "%.1f s — DRUHÉ VOLÁNÍ NEPROVÁDÍM (první: %s, druhé: %s)",
+                        "%.1f s v TÉMŽ tahu — DRUHÉ VOLÁNÍ NEPROVÁDÍM "
+                        "(první: %s, druhé: %s)",
                         function_name, ted - drivejsi["t"],
                         drivejsi.get("tool_call_id", "?"),
                         getattr(params, "tool_call_id", "?"),
@@ -638,7 +708,7 @@ class FastLaneMixin:
                         "dedup",
                         volani="%s(%r)" % (function_name, getattr(params, "arguments", None)),
                         vysledek="druhé volání neprovedeno",
-                        poznamka="stejný nástroj se stejnými argumenty do %.0f s" % TOOL_DEDUP_S,
+                        poznamka="stejný nástroj se stejnými argumenty v témž tahu",
                     )
                     # Počkej na výsledek prvního, ať vracíme pravdu, ne dohad.
                     if not drivejsi["hotovo"].is_set():
@@ -671,9 +741,10 @@ class FastLaneMixin:
                     "hotovo": asyncio.Event(),
                     "vysledek": None,
                     "properties": None,
-                    # Dokud běží, drží plné okno — souběžná duplicita se nesmí
-                    # provést. Po dokončení se okno podle výsledku upraví níž.
-                    "okno": TOOL_DEDUP_S,
+                    # RAZÍTKO TAHU, ze kterého volání vzešlo. Podle něj se
+                    # pozná echo modelu (týž tah) od druhého přání člověka
+                    # (jiný tah). Viz `_dedup_je_duplicita`.
+                    "tah": self._dedup_tah(),
                 }
                 zaznamy[dedup_klic] = zaznam
 
@@ -685,16 +756,15 @@ class FastLaneMixin:
                 async def zapamatuj_a_posli(result, *, properties=None):
                     zaznam["vysledek"] = result
                     zaznam["properties"] = properties
-                    # NEÚSPĚCH SE NECACHUJE NADLOUHO. Kdyby ano, člověk by
-                    # řekl povel znovu (protože nezabral) a stráž by mu vrátila
-                    # ten STARÝ neúspěch, aniž by to kdokoli zkusil — z pojistky
-                    # proti dvojímu provedení by byla pojistka proti opravě.
-                    # Plné okno drží jen OVĚŘENÝ ÚSPĚCH; po neúspěchu zůstává
-                    # jen krátká milost, která spolkne echo modelu (~1,4 s),
-                    # ale lidské zopakování povelu pustí dál.
-                    uspech = (isinstance(result, dict)
-                              and result.get("status") == "verified_success")
-                    zaznam["okno"] = TOOL_DEDUP_S if uspech else DEDUP_MILOST_S
+                    # OKNO SE UŽ PODLE VÝSLEDKU NEUPRAVUJE (1. 9. 2026).
+                    # Dřív se po neúspěchu srazilo na 2,5 s, aby člověk
+                    # mohl povel zopakovat. Jenže `verified_success` vyrábí
+                    # jediné místo (`_run_fast_lane`), takže na 2,5 s padala
+                    # i delegace na mozek a všechno mimo rychlou dráhu —
+                    # a druhé volání modelu se za tu hranici vešlo.
+                    # Obojí teď řeší TAH: echo modelu je v témž tahu
+                    # (blokuje se navždy), lidské zopakování je v jiném
+                    # (projde hned). Viz `_dedup_je_duplicita`.
                     zaznam["hotovo"].set()
                     return await puvodni_cb(result, properties=properties)
 
