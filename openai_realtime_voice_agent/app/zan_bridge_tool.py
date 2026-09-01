@@ -585,17 +585,30 @@ class ZanBridge:
         # `ask_zan {'text': 'baklažán'}`, a v 10:45:11
         # `{'text': 'baklažán rozsvítit jedno světlo…'}`. Mozek má dostat
         # POVEL, ne oslovení; útržek se mu neposílá vůbec.
-        ocista = ocisti(text)
+        #
+        # OKNO ROZHOVORU (1. 9. 2026) — TÁŽ výjimka jako v mostu
+        # (`websocket_handler.na_prepis`), protože tudy vede DRUHÁ cesta
+        # k mozku: pusa přepošle, co slyšela, do `ask_zan`. Kdyby okno
+        # platilo jen v mostu, onboardingová odpověď („Eliška") by prošla
+        # očistou přepisu a zaraženě skončila tady. Stav je týž objekt,
+        # takže se obě cesty nemůžou rozejít.
+        ceka = False
+        try:
+            ceka = bool(self.dispecer.ceka_na_odpoved())
+        except Exception:  # noqa: BLE001 — stav nesmí shodit dotaz
+            logger.debug("stav okna rozhovoru se nepodařilo zjistit", exc_info=True)
+        ocista = ocisti(text, ceka_na_odpoved=ceka)
         if ocista.utrzek:
-            logger.warning("🗑 útržek: ask_zan(%r) — %s, mozku to neposílám",
-                           text, ocista.duvod)
+            logger.warning("🗑 útržek: ask_zan(%r) — %s (ceka_na_odpoved=%s), "
+                           "mozku to neposílám", text, ocista.duvod, ceka)
             rozbor = getattr(self, "rozbor", None)
             if rozbor is not None:
                 try:
                     rozbor.nahlas("utrzek-ask", prepis=text,
                                   volani="ask_zan(%r)" % text,
                                   vysledek="nedelegováno",
-                                  poznamka="zadání není povel (%s)" % ocista.duvod)
+                                  poznamka="zadání není povel (%s, ceka_na_odpoved=%s)"
+                                           % (ocista.duvod, ceka))
                 except Exception:  # noqa: BLE001
                     logger.debug("nahlášení anomálie selhalo", exc_info=True)
             await params.result_callback(

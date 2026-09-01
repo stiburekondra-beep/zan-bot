@@ -132,6 +132,31 @@ CERSTVOST_S = float(os.environ.get("ZAN_CERSTVOST_S", "20"))
 #: Značka, kterou dostane odpověď, jež dorazila po `CERSTVOST_S`.
 ZNACKA_POZDNI = "pozdni"
 
+#: OKNO ROZHOVORU. Jak dlouho po ŽÁNOVĚ otázce platí, že krátká věta je
+#: ODPOVĚĎ, a ne útržek (`prepis_ocista.ocisti(..., ceka_na_odpoved=True)`).
+#:
+#: PROČ VŮBEC (1. 9. 2026, onboardingový rozhovor): útržková pojistka je
+#: psaná pro POVEL a zahazuje všechno do dvou slov bez záměru. Onboarding
+#: se ale skládá skoro jen z takových odpovědí — „Eliška", „tři roky",
+#: „ne, Maruška". Z 99 lidských promluv 1. 9. došlo k mozku PĚT, patnáct
+#: skončilo na téhle pojistce.
+#:
+#: PROČ DVACET SEKUND:
+#:  * okno se otevírá v okamžiku, kdy dispečer otázku VYDÁ, ne kdy ji
+#:    Žán dořekne — samotné vyslovení jedné věty ukrojí pár sekund
+#:    (`ROZBEH_S` = 2 s jen na rozjezd pusy), takže na rozmyšlenou
+#:    zbývá zhruba patnáct;
+#:  * v rozhovoru se člověk nadechne dýl než u povelu — jméno dítěte
+#:    nebo věk si vybaví, u povelu nemá co vybavovat;
+#:  * a zároveň to musí být KRÁTKÉ: každá sekunda navíc je sekunda, kdy
+#:    je útržková brzda vypnutá a projde i skutečný šum.
+#: Shodou okolností je to stejné číslo jako `CERSTVOST_S`, ale měří něco
+#: jiného (tam stáří ČLOVĚKOVY otázky) — proto vlastní konstanta.
+#:
+#: Je to ODHAD, ne měření: nastavená hodnota se ráno ověří z
+#: `hovory/*.jsonl` (pole `ceka_na_odpoved`) a podle toho se dolaďuje.
+OKNO_ODPOVEDI_S = float(os.environ.get("ZAN_OKNO_ODPOVEDI_S", "20"))
+
 #: Rámování pozdní odpovědi. NEZAHAZUJE se — informace je pořád platná,
 #: jen se nesmí tvářit jako reakce na to, co člověk řekl naposledy.
 HLAVICKA_POZDNI = (
@@ -151,6 +176,22 @@ HLAVICKA_DOSLOVA = (
     "výhradu ani nejistotu. NEKOMENTUJ to, NEOPAKUJ otázku a nic "
     "neuzavírej. Smíš jen přirozeně intonovat"
 )
+
+
+#: Co se za otazníkem ještě smí vyskytnout, aniž by přestal být poslední.
+#: Uvozovky a mezery tam sype rámování textu, tečka bývá překlep modelu.
+_PO_OTAZNIKU = " \t\r\n.\"'„“”‚‘)]}»"
+
+
+def konci_otazkou(text: str) -> bool:
+    """Končí Žánova věta otázkou?
+
+    Schválně JEN otazník, ne heuristika na tázací slova: „řeknu ti, kolik
+    je hodin" je oznámení, ne dotaz, a falešně otevřené okno rozhovoru
+    znamená vypnutou útržkovou brzdu na `OKNO_ODPOVEDI_S` sekund. Radši
+    okno neotevřít (chová se jako dosud) než ho otevřít na oznámení.
+    """
+    return str(text or "").rstrip(_PO_OTAZNIKU).endswith("?")
 
 
 def obal_doslova(tema: "Tema") -> str:
@@ -268,8 +309,15 @@ class DispecerReci:
         self._rozbeh_do: Optional[float] = None
         self.vysloveno = 0
         self.zahozeno_watchdogem = 0
-        #: interaction_id -> kdy člověk položil otázku (monotonic).
+        #: interaction_id -> kdy ČLOVĚK položil otázku (monotonic).
+        #: POZOR na jméno: tohle je otázka směrem K Žánovi (plní ji
+        #: `zan_bridge_tool` při `ask_zan`) a slouží pravidlu čerstvosti.
+        #: Opačný směr — kdy se ptal ŽÁN — drží `_zan_se_ptal_t` níž.
         self._otazky: dict = {}
+        #: Kdy naposledy ŽÁN položil otázku (monotonic), nebo None.
+        #: Dokud je čerstvá, je krátká lidská věta ODPOVĚĎ, ne útržek —
+        #: viz `OKNO_ODPOVEDI_S` a `ceka_na_odpoved()`.
+        self._zan_se_ptal_t: Optional[float] = None
 
     # -- vstupy (jediná povolená cesta k řeči) ----------------------------
 
@@ -342,6 +390,44 @@ class DispecerReci:
             for iid in [k for k, v in self._otazky.items() if v < hranice]:
                 self._otazky.pop(iid, None)
 
+    # -- okno rozhovoru („Žán se právě na něco zeptal") -------------------
+
+    def zaznamenej_svou_otazku(self, text: str,
+                               nyni: Optional[float] = None) -> bool:
+        """Otevře okno rozhovoru, KDYŽ Žánova věta končí otazníkem.
+
+        Volají to dvě místa a obě jsou tu schválně:
+
+        1. `tik()` po vyslovení — SPOLEHLIVÁ cesta. Otázky onboardingu
+           přicházejí z mozku přes `/prubeh` a jdou tudy vždycky.
+        2. `transcript_logger` (asistentský odposlech) — BEST EFFORT pro
+           otázky, které si vymyslí sama pusa. U Gemini se ta větev umí
+           dlouho vůbec nespustit (nepošle `output_transcription`), takže
+           se na ni nedá stavět; jako druhý zdroj ale nevadí.
+
+        Vrací True, když se okno opravdu otevřelo (na logování).
+        """
+        if not konci_otazkou(text):
+            return False
+        self._zan_se_ptal_t = time.monotonic() if nyni is None else nyni
+        return True
+
+    def ceka_na_odpoved(self, nyni: Optional[float] = None) -> bool:
+        """Ptal se Žán před méně než `OKNO_ODPOVEDI_S` sekundami?
+
+        FAIL-CLOSED: bez záznamu (Žán se neptal, nebo se otázka nikam
+        nezapsala) vrací False, tedy útržková pojistka platí v plné síle
+        jako dosud. Okno se otevírá jen na DOLOŽENOU otázku.
+        """
+        if self._zan_se_ptal_t is None:
+            return False
+        nyni = time.monotonic() if nyni is None else nyni
+        return (nyni - self._zan_se_ptal_t) <= OKNO_ODPOVEDI_S
+
+    def zavri_okno_odpovedi(self) -> None:
+        """Zavře okno rozhovoru dřív, než vyprší (STOP, konec session)."""
+        self._zan_se_ptal_t = None
+
     def _pridej(
         self, text: str, priorita: int, platnost_s: float, interaction_id: str,
         *, druh: str, run_llm: bool = True, znacka: str = "",
@@ -384,6 +470,9 @@ class DispecerReci:
         """STOP / „zmlkni" / změna tématu — po tomhle už nesmí nic promluvit."""
         self.fronta.vyprazdni(duvod)
         self._rozbeh_do = None
+        # Okno rozhovoru se zavírá s frontou: po „zmlkni" ani po výměně
+        # session už na nic nečekáme a útržková brzda má platit naplno.
+        self.zavri_okno_odpovedi()
 
     # -- smyčka -----------------------------------------------------------
 
@@ -512,6 +601,13 @@ class DispecerReci:
             return None
 
         self.vysloveno += 1
+        # OKNO ROZHOVORU: tohle je jediné místo, kde se dá spolehlivě říct,
+        # že Žán něco ŘEKL a co to bylo. Když to byla otázka, otevírá se
+        # okno, ve kterém krátká lidská věta není útržek, ale ODPOVĚĎ
+        # (`prepis_ocista.ocisti(..., ceka_na_odpoved=True)`).
+        if self.zaznamenej_svou_otazku(tema.obsah, nyni=nyni):
+            logger.info("❓ dispečer: Žán se zeptal — okno odpovědi otevřené "
+                        "(druh=%s): %.120s", tema.druh, tema.obsah)
         # Rozběh platí pro OBĚ cesty: i doslovná řeč chvíli hraje z reproduktoru
         # a druhá položka by ji překřičela.
         if (doslova or tema.run_llm) and self.rozbeh_s > 0:

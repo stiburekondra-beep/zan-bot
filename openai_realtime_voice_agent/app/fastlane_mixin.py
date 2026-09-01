@@ -313,14 +313,28 @@ class FastLaneMixin:
         if function_name in UTRZEK_VYJIMKY:
             return ""
         o = getattr(self, "posledni_prepis", None)
-        if o is None or not getattr(o, "utrzek", False):
+        if o is None:
+            return ""
+        # PŘÍSNÝ verdikt schválně (1. 9. 2026). `o.utrzek` od zavedení okna
+        # rozhovoru („Žán se právě zeptal") krátkou větu propouští — to je
+        # správně pro MOZEK, ale ne pro RUCE. Kdyby se tahle brzda řídila
+        # měkkým verdiktem, otevřelo by okno rozhovoru na dvacet sekund
+        # i cestu k zásahu do domu ze slova „Eliška". Fallback na `utrzek`
+        # je jen pro starší objekt bez toho pole.
+        prisne = getattr(o, "utrzek_prisne", None)
+        if prisne is None:
+            prisne = getattr(o, "utrzek", False)
+        if not prisne:
             return ""
         if getattr(self, "posledni_prepis_pouzit", False):
             return ""
         if time.monotonic() - getattr(self, "posledni_prepis_t", 0.0) > UTRZEK_OKNO_S:
             return ""
         self.posledni_prepis_pouzit = True
-        return getattr(o, "duvod", "") or "útržek"
+        # Prázdný `duvod` při přísném útržku znamená, že text pustilo dál
+        # okno rozhovoru — ať je to v logu poznat, ne schované pod „útržek".
+        return (getattr(o, "duvod", "") or
+                "útržek propuštěný oknem rozhovoru — na dům se v něm nesahá")
 
     async def _pockej_na_prepis(self, function_name: str) -> None:
         """Kratce pocka, az dorazi prepis TOHOTO tahu (viz UTRZEK_CEKANI_S).

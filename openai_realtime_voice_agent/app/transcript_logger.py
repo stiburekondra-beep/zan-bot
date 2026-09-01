@@ -57,10 +57,17 @@ class TranscriptLogger(FrameProcessor):
             the LLM), "user" (TranscriptionFrame, place BEFORE the LLM), or "both".
     """
 
-    def __init__(self, capture: str = "both", on_user_final=None, **kwargs):
+    def __init__(self, capture: str = "both", on_user_final=None,
+                 on_assistant_final=None, **kwargs):
         super().__init__(**kwargs)
         self._capture = capture
         self._assistant_buf: list[str] = []
+        # Volitelný odposlech toho, co Žán DOŘEKL. Používá ho okno
+        # rozhovoru (`dispecer_reci.zaznamenej_svou_otazku`): když věta
+        # končí otazníkem, je krátká lidská odpověď odpověď, ne útržek.
+        # BEST EFFORT — u Gemini se tahle větev umí dlouho nespustit
+        # (viz poznámka níž), spolehlivý zdroj je dispečer sám.
+        self._on_assistant_final = on_assistant_final
         # Volitelný odposlech FINÁLNÍHO uživatelského přepisu. Používá ho
         # `session_klient` („slyšeli jsme řeč" → posun okna ticha na plátně).
         # Schválně tady: `TranscriptionFrame` je jediný bod v rouře, kde
@@ -102,6 +109,11 @@ class TranscriptLogger(FrameProcessor):
                         hovor_log.zapis("zan", vysledek=text, zdroj="model")
                     except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
                         logger.debug("zápis modelové řeči do hovory selhal", exc_info=True)
+                    if self._on_assistant_final is not None:
+                        try:
+                            self._on_assistant_final(text)
+                        except Exception as e:  # noqa: BLE001 - odposlech nesmí shodit rouru
+                            logger.warning(f"⚠️ odposlech řeči Žána selhal: {e!r}")
 
         if self._capture in ("user", "both"):
             if isinstance(frame, TranscriptionFrame):

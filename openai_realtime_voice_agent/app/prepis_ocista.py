@@ -26,7 +26,10 @@ Tři různé poruchy jednoho vstupu:
 Modul je ČISTÁ FUNKCE: žádná síť, žádný stav, žádný side effect. Kdo ho volá,
 rozhodne sám, co se zahozeným útržkem udělá (``websocket_handler`` ho neposílá
 na reflex, ``zan_bridge_tool`` ho nedeleguje mozku a ``fastlane_mixin`` po něm
-neprovede zásah do domu).
+neprovede zásah do domu). To platí i po přidání okna rozhovoru
+(``ocisti(raw, ceka_na_odpoved=True)``, 1. 9. 2026): stav „Žán se právě na
+něco zeptal" drží ``dispecer_reci.DispecerReci`` — sem se předává jako
+argument, aby modul zůstal testovatelný bez času a bez pipecatu.
 
 POZOR na hranici zodpovědnosti: u Gemini Live model slyší ZVUK, ne náš přepis —
 očista textu tedy sama o sobě modelu nezabrání promluvit. Zabrání jen tomu, aby
@@ -150,7 +153,20 @@ class Ocista:
     #: Přepis po očistě — tohle se posílá dál (reflex, ask_zan, paměť).
     text: str
     #: True = po očistě nezbyl povel. Nikam se nepředává, jen se zaloguje.
+    #: V okně rozhovoru (`ceka_na_odpoved=True`) je True jen u prázdna.
     utrzek: bool = False
+    #: Verdikt PŘÍSNÉ brzdy — jako by okno rozhovoru vůbec nebylo.
+    #:
+    #: PROČ ZVLÁŠŤ (inventura brzd, 1. 9. 2026): `utrzek` čte i
+    #: `fastlane_mixin._utrzek_blokuje`, který jím zastavuje ZÁSAH DO DOMU
+    #: (18:48:37, 31. 8.: z útržku „zazemi bobrivaku" vznikl `HassTurnOff`
+    #: a v obýváku se vypnula zásuvka). Otevřít okno rozhovoru pro mozek
+    #: je jedna věc; nechat model v tom okně sáhnout na dům kvůli slovu
+    #: „Eliška" je věc úplně jiná. Mozek tedy dostane odpověď, ale ruce
+    #: zůstávají svázané přesně jako dosud — brzda se opravdu NERUŠÍ.
+    #: Krátký povel se ZÁMĚREM („Zhasni.") tím dotčený není, ten přísnou
+    #: pojistkou prochází taky.
+    utrzek_prisne: bool = False
     #: Proč je to útržek. Prázdné, když utrzek=False.
     duvod: str = ""
     #: True = holé „ne / stop / zmlkni". V okně po akci to znamená ZRUŠ.
@@ -202,8 +218,37 @@ def sundej_wake(text: str) -> str:
     return hodnota
 
 
-def ocisti(raw: str) -> Ocista:
-    """Jediný vstupní bod: syrový přepis → co poslat dál a jestli vůbec."""
+def ocisti(raw: str, ceka_na_odpoved: bool = False) -> Ocista:
+    """Jediný vstupní bod: syrový přepis → co poslat dál a jestli vůbec.
+
+    Args:
+        raw: syrový přepis ze STT.
+        ceka_na_odpoved: **Žán se právě na něco zeptal a čeká odpověď.**
+            Viz `OKNO_ROZHOVORU` níž — v tom okně se útržková pojistka
+            zužuje na jediný důvod: po očistě nezbyl žádný text.
+
+    OKNO ROZHOVORU (1. 9. 2026, onboardingový rozhovor)
+    ---------------------------------------------------
+    Brzda výš je psaná pro POVEL. U povelu je „Eliška" opravdu šum: nikdo
+    neřídí dům jedním podstatným jménem. V ROZHOVORU je to ale celá
+    odpověď — a onboarding se skládá skoro jen z takových: „Eliška",
+    „tři roky", „ne, Maruška", „ano".
+
+    Změřeno na `hovory/2026-09-01.jsonl`: z 99 lidských promluv se
+    k mozku dostalo PĚT. Patnáct spadlo přesně sem, na útržkovou pojistku.
+
+    Brzda se proto NERUŠÍ — jen dostává kontext. Mimo okno platí očista
+    beze změny (staré testy to hlídají), uvnitř okna je útržkem jen text,
+    ze kterého po očistě nezbylo vůbec nic (typicky holé oslovení).
+
+    `stop` se počítá STEJNĚ v obou režimech: holé „stop / zmlkni / ne"
+    zůstává stopkou i v rozhovoru a volající ji vyhodnocuje DŘÍV než
+    útržkovou pojistku (`websocket_handler.na_prepis`), takže okno
+    rozhovoru na zrušení běžící akce nesahá. Cena té volby: mimo okno po
+    akci projde v rozhovoru „zmlkni" dál jako text (dosud se zahodilo).
+    Model dostane zvuk tak jako tak, takže tím nic nového nezaznívá —
+    jen to mozek uvidí i v textu.
+    """
     puvodni = str(raw or "")
     text = re.sub(r"\s+", " ", rozlep(puvodni)).strip()
     text = sundej_wake(text)
@@ -223,18 +268,26 @@ def ocisti(raw: str) -> Ocista:
     # ale ani šum — volající to v okně po akci bere jako zrušení.
     stop = bool(holy) and not obsah and any(h in _STOPKA for h in holy)
 
-    duvod = ""
+    # PŘÍSNÝ verdikt — počítá se VŽDY, bez ohledu na okno rozhovoru.
+    # Drží na něm brzda zásahu do domu (viz `Ocista.utrzek_prisne`).
+    duvod_prisne = ""
     if not text:
-        duvod = "po očistě nezbylo nic"
+        duvod_prisne = "po očistě nezbylo nic"
     elif not obsah:
-        duvod = "jen wake word, souhlas/nesouhlas nebo citoslovce"
+        duvod_prisne = "jen wake word, souhlas/nesouhlas nebo citoslovce"
     elif len(obsah) <= 2 and not zamer:
-        duvod = "zbytek bez slovesa a bez známého záměru (%s)" % " ".join(obsah)
+        duvod_prisne = "zbytek bez slovesa a bez známého záměru (%s)" % " ".join(obsah)
+
+    # MĚKKÝ verdikt — ten rozhoduje, jestli se text předá dál (mozek,
+    # reflex, paměť). V okně rozhovoru je útržkem jen prázdno.
+    duvod = "po očistě nezbylo nic" if not text else (
+        "" if ceka_na_odpoved else duvod_prisne)
 
     return Ocista(
         puvodni=puvodni,
         text=text,
         utrzek=bool(duvod),
+        utrzek_prisne=bool(duvod_prisne),
         duvod=duvod,
         stop=stop,
         zmeneno=(text != puvodni.strip()),

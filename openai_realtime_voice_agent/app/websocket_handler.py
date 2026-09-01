@@ -800,10 +800,45 @@ class WebSocketHandler:
         # už jen očištěný text. Důvod je v `app/prepis_ocista.py`: wake word
         # prosakoval do povelu (`baklažánrozsvítit…`) a na útržku `ne baklažánu.`
         # model vystřelil `HassTurnOff` → `vysledek_fail`.
+        #
+        # OKNO ROZHOVORU (1. 9. 2026). Útržková pojistka je psaná pro POVEL
+        # a zahazuje všechno do dvou slov bez záměru. Onboardingový rozhovor
+        # se ale skládá skoro jen z takových odpovědí („Eliška", „tři roky",
+        # „ne, Maruška") — z 99 lidských promluv 1. 9. došlo k mozku PĚT,
+        # patnáct spadlo právě sem. Brzda se proto neruší, jen dostává
+        # kontext: dokud Žán čeká na odpověď, je krátká věta ODPOVĚĎ.
+        # Stav drží dispečer řeči (jediný, kdo ví, co Žán opravdu řekl).
+        def _zan_ceka_na_odpoved() -> bool:
+            """Ptal se Žán před chvílí? FAIL-CLOSED — při jakékoli
+            nejistotě False, tedy očista beze změny jako dosud."""
+            try:
+                bridge = getattr(self, "zan_bridge", None)
+                dispecer = getattr(bridge, "dispecer", None)
+                if dispecer is None:
+                    return False
+                return bool(dispecer.ceka_na_odpoved())
+            except Exception:  # noqa: BLE001 — stav nesmí shodit hlas
+                logger.debug("stav okna rozhovoru se nepodařilo zjistit", exc_info=True)
+                return False
+
+        def _zan_dorekl(text):
+            """Odposlech řeči pusy → druhý (best-effort) zdroj otázek Žána.
+            Spolehlivý zdroj je dispečer sám, tohle chytá jen otázky, které
+            si vymyslí pusa a dispečerem vůbec neprojdou."""
+            try:
+                bridge = getattr(self, "zan_bridge", None)
+                dispecer = getattr(bridge, "dispecer", None)
+                if dispecer is not None and dispecer.zaznamenej_svou_otazku(text):
+                    logger.info("❓ pusa se zeptala — okno odpovědi otevřené: %.120s",
+                                text)
+            except Exception:  # noqa: BLE001 — odposlech nesmí shodit hlas
+                logger.debug("otázku pusy se nepodařilo zaznamenat", exc_info=True)
+
         def na_prepis(text):
             session_klient.heard()
+            ceka = _zan_ceka_na_odpoved()
             try:
-                o = ocisti(text)
+                o = ocisti(text, ceka_na_odpoved=ceka)
             except Exception:  # noqa: BLE001 — očista nesmí shodit hlas
                 logger.debug("očista přepisu selhala, beru text syrový", exc_info=True)
                 o = None
@@ -858,21 +893,38 @@ class WebSocketHandler:
                 # ani na reflex, ani do paměti. Model dostane audio tak jako
                 # tak, ale ze šumu se aspoň nestane text, na který se jedná.
                 if o.utrzek:
-                    logger.warning("🗑 útržek: %r (%s) — nepředávám dál",
-                                   text, o.duvod)
+                    # `ceka_na_odpoved` je v logu SCHVÁLNĚ i u zahozeného
+                    # útržku: bez něj se z logu nedá poznat, jestli okno
+                    # rozhovoru bylo zavřené (brzda zabrala právem), nebo
+                    # otevřené a text byl prázdný i tak.
+                    logger.warning("🗑 útržek: %r (%s, ceka_na_odpoved=%s) — "
+                                   "nepředávám dál", text, o.duvod, ceka)
                     _nahlas_anomalii(
                         openai_service, "utrzek", prepis=text,
-                        poznamka="zahozeno před předáním (%s)" % o.duvod,
+                        poznamka="zahozeno před předáním (%s, ceka_na_odpoved=%s)"
+                                 % (o.duvod, ceka),
                     )
                     try:
                         hovor_log.zapis(
                             "clovek", kanal=client_id, prepis=text, cisty=cisty,
                             vysledek="zahozeno_utrzek (%s)" % o.duvod, utrzek=True,
+                            ceka_na_odpoved=ceka,
                         )
                         openai_service.posledni_prepis_hovor_zapsano = True
                     except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
                         logger.debug("zápis útržku do hovory selhal", exc_info=True)
                     return
+
+            # DŮKAZ, ŽE OKNO ROZHOVORU ZABRALO. Bez tohohle řádku by ráno
+            # nešlo odlišit „okno funguje" od „dneska nikdo nic krátkého
+            # neřekl" — nepřítomnost útržku sama o sobě nedokazuje nic.
+            # `utrzek_prisne` je verdikt, jako by okno vůbec nebylo.
+            okno_pomohlo = bool(
+                o is not None and ceka and not o.utrzek and o.utrzek_prisne)
+            if okno_pomohlo:
+                logger.info("💬 okno rozhovoru: %r by byl útržek, ale Žán "
+                            "se právě zeptal — posílám dál jako ODPOVĚĎ", cisty)
+
             try:
                 session_klient.reflex(cisty)
             except Exception:  # noqa: BLE001 — hlas na reflexu nikdy nestojí
@@ -886,7 +938,8 @@ class WebSocketHandler:
             # pockame -- kdyz do te doby zapsal fastlane_mixin, flag uz je
             # True a fallback jen tise skonci.
             if o is not None and not o.stop and not o.utrzek:
-                async def _fallback_zapis_hovoru(o=o, text=text, cisty=cisty):
+                async def _fallback_zapis_hovoru(o=o, text=text, cisty=cisty,
+                                                 ceka=ceka, okno_pomohlo=okno_pomohlo):
                     await asyncio.sleep(2.5)
                     try:
                         if getattr(openai_service, "posledni_prepis", None) is not o:
@@ -896,6 +949,7 @@ class WebSocketHandler:
                         hovor_log.zapis(
                             "clovek", kanal=client_id, prepis=text, cisty=cisty,
                             vysledek="bez_nastroje (pravdepodobne prima odpoved, nezachyceno do 2.5s)",
+                            ceka_na_odpoved=ceka, okno_pomohlo=okno_pomohlo,
                         )
                         openai_service.posledni_prepis_hovor_zapsano = True
                     except Exception:  # noqa: BLE001 - zapis nesmi shodit hlas
@@ -912,14 +966,14 @@ class WebSocketHandler:
                 context_aggregator.user(),
                 TranscriptLogger(capture="user", on_user_final=na_prepis),
                 openai_service,
-                TranscriptLogger(capture="assistant"),
+                TranscriptLogger(capture="assistant", on_assistant_final=_zan_dorekl),
                 context_aggregator.assistant(),
             ])
         else:
             pipeline_components.extend([
                 TranscriptLogger(capture="user", on_user_final=na_prepis),
                 openai_service,
-                TranscriptLogger(capture="assistant"),
+                TranscriptLogger(capture="assistant", on_assistant_final=_zan_dorekl),
             ])
 
         pipeline_components.append(output_activity_tracker)
