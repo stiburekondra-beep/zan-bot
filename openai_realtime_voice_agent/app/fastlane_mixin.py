@@ -58,6 +58,7 @@ from app.voice_fastlane import (
     _norm,
     room_variant,
     _post_event_blocking,
+    ZrcadloVymen,
 )
 
 logger = logging.getLogger(__name__)
@@ -576,6 +577,16 @@ class FastLaneMixin:
             except Exception as e:  # noqa: BLE001 - zapis nesmi shodit tool
                 logger.debug("zápis volání nástroje do hovory selhal: %r", e)
 
+            # TENHLE TAH SI BERE MOZEK → do vlákna ho zapíše server sám
+            # (`POST /voice` píše obě půlky pod `kanal:'hlas'`). Kdyby ho
+            # zrcadlil i most, byl by celý rozhovor s mozkem ve vlákně dvakrát
+            # a strop na kanál by polovinu paměti hlasu vyplýtval na kopie.
+            if function_name == "zeptej_se_mozku":
+                try:
+                    self.zrcadlo_vymen.mozek_to_prevzal()
+                except Exception as e:  # noqa: BLE001 - paměť nesmí shodit tool
+                    logger.debug("priznak prevzal-mozek se nepodarilo nastavit: %r", e)
+
             # HARD BEZPEČNOSTNÍ BRZDA (2026-08-22): nevratné/rizikové cíle
             # (zámky, alarm, brány/garážová vrata, kotel) se na rychlé dráze
             # NEPROVÁDĚJÍ — vždy přes ask_zan (elevace + potvrzení v Žán-Code).
@@ -1024,6 +1035,62 @@ class FastLaneMixin:
             asyncio.create_task(_send())
         except Exception as e:  # pragma: no cover
             logger.debug("zrcadlení se nepodařilo naplánovat: %r", e)
+
+    # -----------------------------------------------------------------------
+    # KONVERZAČNÍ VÝMĚNA DO PAMĚTI DOMU (obnoveno 2. 9. 2026)
+    #
+    # `_mirror_to_zan` výš posílá AKCE (co se v domě stalo). Tohle posílá ŘEČ
+    # (co se v domě řeklo) — a to je jiná věc: akce jde do kroniky, řeč do
+    # společného vlákna, ze kterého se skládá prompt každé další odpovědi na
+    # KTERÉMKOLI kanálu. Bez toho Telegram o hlasu neví (změřeno 1. 9.:
+    # 7 z 69 promluv) a večerní uzávěrka nemá z čeho psát hlasovou paměť.
+    #
+    # Fire-and-forget, hlas na to nikdy nečeká; chyba jen do logu.
+    # -----------------------------------------------------------------------
+
+    @property
+    def zrcadlo_vymen(self) -> ZrcadloVymen:
+        """Líné založení — mixin nemá vlastní `__init__` (dědí ho po službě)."""
+        z = getattr(self, "_zrcadlo_vymen", None)
+        if z is None:
+            z = ZrcadloVymen(odeslat=self._posli_vymenu)
+            self._zrcadlo_vymen = z
+        return z
+
+    def _posli_vymenu(self, payload: dict) -> None:
+        """Odeslání na pozadí. Stejná cesta i token jako `_mirror_to_zan`."""
+        url = getattr(self, "zan_event_url", "")
+        if not url:
+            return
+        token = getattr(self, "zan_event_token", "")
+
+        async def _send():
+            try:
+                await asyncio.to_thread(_post_event_blocking, url, token, payload)
+                logger.debug("↪️ výměna zrcadlena do Žán-Code (%d+%d znaků)",
+                             len(payload.get("text_user", "")),
+                             len(payload.get("text_asistent", "")))
+            except Exception as e:
+                logger.info("ℹ️ zrcadlení výměny neprošlo (hlas to neřeší): %r", e)
+
+        try:
+            asyncio.create_task(_send())
+        except Exception as e:  # pragma: no cover - bez smyčky se nic nestane
+            logger.debug("zrcadlení výměny se nepodařilo naplánovat: %r", e)
+
+    def vymena_clovek_rekl(self, text: str) -> None:
+        """Volá `websocket_handler.na_prepis` — až za útržkovou a stopkovou brzdou."""
+        try:
+            self.zrcadlo_vymen.clovek_rekl(text)
+        except Exception as e:  # noqa: BLE001 - paměť nesmí shodit hlas
+            logger.debug("lidskou půlku výměny se nepodařilo uložit: %r", e)
+
+    def vymena_pusa_odpovedela(self, text: str) -> None:
+        """Volá `websocket_handler._zan_dorekl` na konci promluvy pusy."""
+        try:
+            self.zrcadlo_vymen.pusa_odpovedela(text)
+        except Exception as e:  # noqa: BLE001 - paměť nesmí shodit hlas
+            logger.debug("výměnu se nepodařilo spárovat: %r", e)
 
     async def _run_fast_lane(self, plan, function_name, handler, params):
         """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""

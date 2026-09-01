@@ -833,6 +833,14 @@ class WebSocketHandler:
                                 text)
             except Exception:  # noqa: BLE001 — odposlech nesmí shodit hlas
                 logger.debug("otázku pusy se nepodařilo zaznamenat", exc_info=True)
+            # PAMĚŤ DOMU (2. 9. 2026): tady se výměna uzavírá — člověk už
+            # mluvil, pusa dořekla. Odsud jde `POST /event {typ:"vymena"}` do
+            # Žán-Code a z něj dva řádky do společného vlákna. Fire-and-forget.
+            try:
+                if hasattr(openai_service, "vymena_pusa_odpovedela"):
+                    openai_service.vymena_pusa_odpovedela(text)
+            except Exception:  # noqa: BLE001 — paměť nesmí shodit hlas
+                logger.debug("výměnu se nepodařilo uzavřít", exc_info=True)
 
         def na_prepis(text):
             session_klient.heard()
@@ -929,6 +937,16 @@ class WebSocketHandler:
                 session_klient.reflex(cisty)
             except Exception:  # noqa: BLE001 — hlas na reflexu nikdy nestojí
                 logger.debug("reflex se nepodařilo odeslat", exc_info=True)
+
+            # PAMĚŤ DOMU (2. 9. 2026): lidská půlka výměny. SCHVÁLNĚ AŽ TADY —
+            # nad tímhle řádkem se vrací stopka i útržek, a ty do rozhovoru
+            # nepatří („ne baklažánu." není věta, kterou si má dům pamatovat).
+            # Odeslání se stane až s odpovědí pusy (`_zan_dorekl`).
+            try:
+                if hasattr(openai_service, "vymena_clovek_rekl"):
+                    openai_service.vymena_clovek_rekl(cisty)
+            except Exception:  # noqa: BLE001 — paměť nesmí shodit hlas
+                logger.debug("lidskou půlku výměny se nepodařilo uložit", exc_info=True)
 
             # TRVALY ZAZNAM, ODLOZENY FALLBACK (karta -21). Sem se dostane
             # promluva, ktera NENI stopka ani utrzek -- muze z ni vzniknout

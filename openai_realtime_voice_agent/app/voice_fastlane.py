@@ -594,3 +594,85 @@ def build_exchange_event(kdo: str, text_user: str, text_asistent: str) -> dict:
         "text_asistent": text_asistent or "",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+
+
+# ---------------------------------------------------------------------------
+# ZRCADLO VÝMĚN — párování „co člověk řekl" s „co pusa odpověděla"
+#
+# PROČ TO VZNIKÁ ZNOVU (2. 9. 2026). `build_exchange_event` výš byla od 25. 8.
+# hot-patch v běžícím kontejneru; do gitu se 30. 8. zachránila jen DEFINICE,
+# volající ne (commit b0bae1e: „Zatím se nikde nevolá"). Při dalším rebuildu
+# tedy zrcadlení zmizelo — poslední `typ:"vymena"` v kronice je z 27. 8.
+# Změřeno 1. 9.: z 69 lidských promluv u televize skončilo ve společném
+# vlákně sedm. Dům si nepamatoval, co se v něm nahlas řeklo.
+#
+# PROČ SAMOSTATNÁ TŘÍDA A NE DVA ŘÁDKY V MIXINU. Párování má pravidla, která
+# se dají splést, a mixin se bez `pipecat` ani nenaimportuje — testovat by
+# se to nedalo. Tady je to čistá logika: dovnitř text, ven payload.
+#
+# PROČ SE VÝMĚNA S MOZKEM NEZRCADLÍ. Když tah odejde na `POST /voice`, zapíše
+# obě půlky do vlákna sám server (`kanal:'hlas'`, dovnitř i ven). Zrcadlit ji
+# podruhé by znamenalo celý ten rozhovor ve vlákně DVAKRÁT — a strop na kanál
+# by pak polovinu paměti hlasu vyplýtval na kopie.
+# ---------------------------------------------------------------------------
+
+#: Jak dlouho čeká lidská půlka na odpověď pusy. Delší pauza znamená, že
+#: odpověď patří k něčemu jinému (nebo se pusa ozvala sama od sebe) a slepit
+#: je dohromady by vyrobilo výměnu, která se nestala.
+OKNO_VYMENY_S = float(os.environ.get("ZAN_VYMENA_OKNO_S", "180") or 180)
+
+
+class ZrcadloVymen:
+    """Spáruje lidskou promluvu s odpovědí pusy a pošle ji jako `typ:"vymena"`.
+
+    `odeslat(payload)` je jediná cesta ven — kdo ji dodá, ten rozhoduje, jestli
+    se posílá na pozadí (most: `asyncio.create_task`) nebo se jen zapíše do
+    seznamu (test). Tahle třída sama nikdy nesahá na síť ani na smyčku.
+    """
+
+    def __init__(self, *, odeslat, kdo: str = "voice",
+                 okno_s: float = OKNO_VYMENY_S, hodiny=time.monotonic) -> None:
+        self._odeslat = odeslat
+        self._kdo = kdo or "voice"
+        self._okno_s = float(okno_s)
+        self._hodiny = hodiny
+        self._text_cloveka = ""
+        self._kdy = 0.0
+        self._prevzal_mozek = False
+
+    def clovek_rekl(self, text: str) -> None:
+        """Finální přepis promluvy člověka. Čeká, až pusa odpoví."""
+        self._text_cloveka = (text or "").strip()
+        self._kdy = self._hodiny() if self._text_cloveka else 0.0
+        # Nový tah — předchozí verdikt „tohle si vzal mozek" už neplatí.
+        self._prevzal_mozek = False
+
+    def mozek_to_prevzal(self) -> None:
+        """Tenhle tah jde přes `POST /voice`; do vlákna ho zapíše server sám."""
+        self._prevzal_mozek = True
+
+    def pusa_odpovedela(self, text: str) -> Optional[dict]:
+        """Konec promluvy pusy → případné odeslání výměny. Vrací poslaný payload."""
+        odpoved = (text or "").strip()
+        clovek, kdy = self._text_cloveka, self._kdy
+        # Půlka se spotřebuje vždycky, i když se nakonec neposílá: jinak by se
+        # tatáž věta přilepila k příští odpovědi a ve vlákně byla dvakrát.
+        self._text_cloveka, self._kdy = "", 0.0
+
+        if self._prevzal_mozek:
+            self._prevzal_mozek = False
+            return None
+        if kdy and (self._hodiny() - kdy) > self._okno_s:
+            # Stará půlka se zahazuje, ale odpověď pusy se zapsat MÁ — Žán se
+            # umí ozvat i sám od sebe a i to je věc, kterou si má pamatovat.
+            clovek = ""
+        if not clovek and not odpoved:
+            return None
+
+        payload = build_exchange_event(self._kdo, clovek, odpoved)
+        try:
+            self._odeslat(payload)
+        except Exception as e:  # noqa: BLE001 — paměť nikdy neshodí hlas
+            logger.info("ℹ️ výměnu se nepodařilo odeslat (hlas to neřeší): %r", e)
+            return None
+        return payload
