@@ -90,6 +90,73 @@ def test_odvozenina_neni_osloveni():
     assert o.text == "baklažánová pomazánka na nákup"
 
 
+# --- budicí slovo "Maruno" (2. 9. 2026) -------------------------------------
+#
+# PROČ (dětský test, `baklazan-hq/research/2026-09-02_detsky-test.md`,
+# zaseknutí 3). Domácnost od 2. 9. 2026 budí slovem „Maruno" — stará slova
+# („Hej Žáne", „Baklažáne", „Žáne") zůstávají jen ve firmwaru satelitu.
+# `_WAKE` je ale neznal: oslovení „Maruno" zůstávalo v přepisu jako OBSAH,
+# takže „Maruno Maruno Maruno" šlo modelu jako věta a brzda zásahu do domu
+# (`fastlane_mixin._utrzek_blokuje`) soudila jinou větu, než si Žán myslel.
+
+def test_maruno_rozsvit_neni_utrzek():
+    o = ocisti("Maruno, rozsviť")
+    assert o.text == "rozsviť"
+    assert o.utrzek is False
+
+
+def test_maruno_trikrat_je_utrzek():
+    # Jen oslovení, dokola — po očistě nezbyde nic.
+    o = ocisti("Maruno Maruno Maruno")
+    assert o.text == ""
+    assert o.utrzek is True
+    assert o.duvod == "po očistě nezbylo nic"
+
+
+def test_maruno_samotne_v_okne_zustava_utrzkem():
+    # Samotné oslovení není odpověď — i v okně rozhovoru z něj po očistě
+    # nezbyde nic, a to je jediný důvod, který v okně přežívá.
+    o = ocisti("Maruno", ceka_na_odpoved=True)
+    assert o.utrzek is True
+    assert o.duvod == "po očistě nezbylo nic"
+
+
+@pytest.mark.parametrize("veta,ocekavany_text", [
+    ("maruna pohádku", "pohádku"),
+    ("marunko, zhasni", "zhasni"),
+    ("maruně, kolik je hodin?", "kolik je hodin?"),
+    ("marun rozsviť v obýváku", "rozsviť v obýváku"),
+    ("MARUNO rozsviť", "rozsviť"),
+])
+def test_maruno_sklonene_a_komolene_tvary(veta, ocekavany_text):
+    o = ocisti(veta)
+    assert o.text == ocekavany_text
+    assert "marun" not in o.text.lower()
+
+
+def test_maruno_uvnitr_vety_zustava():
+    # Uvnitř věty je to obsah, ne oslovení — stejné pravidlo jako u baklažánu.
+    o = ocisti("napiš na nákup maruna a rajčata")
+    assert o.text == "napiš na nákup maruna a rajčata"
+    assert o.utrzek is False
+
+
+# --- staré budicí slovo "Žáne" (samostatně, bez "bakla-" prefixu) ----------
+
+def test_zane_samostatne_bez_baklazanu():
+    assert ocisti("Žáne, rozsviť v obýváku").text == "rozsviť v obýváku"
+    assert ocisti("zane rozsviť v obýváku").text == "rozsviť v obýváku"
+
+
+def test_stare_hej_zane_beze_zmeny():
+    # "Hej" není náběhové slovo ani wake word, takže se sundej_wake nedotkne
+    # ničeho na začátku věty — a "zhasni" má jasný záměr, takže to není
+    # útržek. Přidání "žáne" do _WAKE tohle chování nesmí rozbít.
+    o = ocisti("Hej Žáne, zhasni")
+    assert o.text == "Hej Žáne, zhasni"
+    assert o.utrzek is False
+
+
 # --- útržková pojistka -----------------------------------------------------
 
 @pytest.mark.parametrize("veta", [

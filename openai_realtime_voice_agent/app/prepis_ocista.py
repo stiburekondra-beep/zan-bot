@@ -31,6 +31,13 @@ neprovede zásah do domu). To platí i po přidání okna rozhovoru
 něco zeptal" drží ``dispecer_reci.DispecerReci`` — sem se předává jako
 argument, aby modul zůstal testovatelný bez času a bez pipecatu.
 
+Wake word NENÍ jen ``baklažán`` (dětský test, 2. 9. 2026): domácnost od
+2. 9. 2026 budí slovem „Maruno", staré tvary („Hej Žáne", „Baklažáne",
+„Žáne") zůstávají ve firmwaru satelitu. Bez pokrytí „Maruno" v ``_WAKE``
+zůstávalo oslovení v přepisu jako OBSAH — „Maruno Maruno Maruno" šlo
+modelu jako věta a útržková brzda (bod 3 výš) soudila jinou větu, než si
+Žán myslel.
+
 POZOR na hranici zodpovědnosti: u Gemini Live model slyší ZVUK, ne náš přepis —
 očista textu tedy sama o sobě modelu nezabrání promluvit. Zabrání jen tomu, aby
 se ŠUM stal POVELEM v místech, kudy jde text: reflex plátna, ``ask_zan`` a
@@ -48,10 +55,21 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 #: Wake word ve všech tvarech, s diakritikou i bez ní (STT ji občas neudělá).
-#: Pády, které reálně padají do přepisu: baklažán / baklažáne (vokativ) /
-#: baklažánu (dativ, lokál) / baklažána (genitiv, akuzativ) / baklažánem.
-#: ``ovi``/``ovy`` jsou tam kvůli komolení, ne kvůli gramatice.
-_WAKE = r"bakla[žz][áa]n(?:e|u|a|em|i|ovi|ovy)?"
+#: Tři budicí slova, dvě generace (viz dětský test, 2. 9. 2026 — oslovení
+#: „Maruno" zůstávalo v přepisu jako obsah, protože ho tahle množina
+#: neznala; „Maruno Maruno Maruno" šlo modelu jako věta):
+#:   - ``baklažán`` — staré, dosud ve firmwaru satelitu. Pády, které reálně
+#:     padají do přepisu: baklažán / baklažáne (vokativ) / baklažánu
+#:     (dativ, lokál) / baklažána (genitiv, akuzativ) / baklažánem.
+#:     ``ovi``/``ovy`` jsou tam kvůli komolení, ne kvůli gramatice.
+#:   - ``Žáne`` — staré, samostatně bez „bakla-" prefixu (z „Hej, Žáne").
+#:   - ``Maruno`` — NOVÉ od 2. 9. 2026, domácí budicí slovo. Skloněné
+#:     a komolené tvary z přepisu: maruno / maruna / marunko / maruně
+#:     (``marune`` bez diakritiky) / marun (uříznuté STT).
+_WAKE_BAKLAZAN = r"bakla[žz][áa]n(?:e|u|a|em|i|ovi|ovy)?"
+_WAKE_ZANE = r"[žz][áa]ne"
+_WAKE_MARUNO = r"marun(?:o|a|ko|[eě])?"
+_WAKE = r"(?:%s|%s|%s)" % (_WAKE_BAKLAZAN, _WAKE_ZANE, _WAKE_MARUNO)
 
 #: Wake word jako CELÉ slovo — na rozpoznání „z věty nezbylo nic než oslovení".
 _WAKE_SLOVO = re.compile(r"^%s$" % _WAKE, re.IGNORECASE)
