@@ -53,15 +53,25 @@ OPTION_DEFAULTS: Dict[str, str] = {
     'max_output_tokens': '0',
     # --- Conversation ---
     'follow_up_listen_seconds': '8',
-    'follow_up_open_delay_ms': '700',
-    'wake_open_delay_ms': '700',
+    # 0 ms (2. 9. 2026). Vlastník: „když on domluví, tak je pauza, pak se
+    # chvilku vypne a otevře se poslouchací část — ztratí se tam začátek
+    # odpovědi." Po ŽÁNOVĚ řeči není co přeslechnout: budicí pípnutí zní
+    # jen u `wake`, ne tady. Prodleva po probuzení (`wake_open_delay_ms`)
+    # zůstává 400 — tam pípnutí opravdu hraje.
+    'follow_up_open_delay_ms': '0',
+    'wake_open_delay_ms': '400',
     'vad_eagerness': 'low',
     'phase_idle_debounce_ms': '1500',
     # --- Web search ---
     'enable_web_search': 'true',
     'web_search_model': 'gpt-5.5',
     # --- Audio ---
-    'playback_prebuffer_ms': '150',
+    # 150 -> 400 ms (2. 9. 2026): vlastník slyšel „rknu se na to" místo
+    # „Mrknu se na to" — zesilovač satelitu se rozjíždí s prvním paketem
+    # a první slabiku spolkne. Náběh ticha (280 ms, viz raw_audio_serializer)
+    # existuje už od 31. 8.; tohle je druhá polovina téhož — víc audia
+    # v bufferu, než se začne hrát.
+    'playback_prebuffer_ms': '400',
     'noise_reduction': 'off',
     # --- Home Assistant ---
     'ha_mcp_url': '',

@@ -52,6 +52,7 @@ async def spust_prubeh_server(
     host: Optional[str] = None,
     port: Optional[int] = None,
     token: Optional[str] = None,
+    drzi: Optional[Callable[[Optional[str]], dict]] = None,
 ):
     """Nastartuje HTTP server s jediným endpointem `POST /prubeh`.
 
@@ -115,6 +116,39 @@ async def spust_prubeh_server(
             logger.error("❌ /prubeh: zařazení selhalo: %r", exc)
             return {"ok": False, "duvod": "vnitřní chyba"}
         return {"ok": zarazeno}
+
+    @api.get("/drzim")
+    async def _drzim(zarizeni: str = "", authorization: str = Header(default="")):
+        """Drží most tohle zařízení? JEDEN MLUVČÍ NA ZAŘÍZENÍ.
+
+        PROČ (2. 9. 2026): vlastník hlásil „Voice PE promluvil dvojitě".
+        Na satelit vedou DVĚ zvukové cesty — most posílá vlastní PCM po
+        websocketu a jádro (nebo runner) umí témuž zařízení poslat announce
+        přes Home Assistant `media_player`. Když se potkají, mluví dva
+        hlasy z jednoho repráku. Runner pohádek proti tomu má `GET /mluvim`
+        („kdo se ptá, ať mlčí — jeden vypravěč") — most takové čidlo dosud
+        neměl, takže se ho nikdo nemohl zeptat.
+
+        Odpověď je ÚDAJ, ne rozkaz: `drzim` = most má se zařízením živou
+        relaci, `mluvim` = právě z něj zní řeč. Co s tím volající udělá,
+        rozhoduje volající.
+
+        FAIL-OPEN JE NA STRANĚ VOLAJÍCÍHO, a schválně: když se most neozve,
+        má announce PROBĚHNOUT. Ticho je horší než dvojhlas — dvojhlas je
+        trapný, ticho vypadá jako rozbitý dům.
+        """
+        if authorization.removeprefix("Bearer ").strip() != token:
+            raise HTTPException(status_code=404, detail="not found")
+        if drzi is None:
+            # Čidlo není zapojené. Přiznat to je důležitější než hádat:
+            # `drzim: false` by volajícího pustil announcovat vždycky.
+            return {"ok": False, "duvod": "čidlo není zapojené"}
+        try:
+            stav = drzi(zarizeni.strip() or None)
+        except Exception as exc:  # pragma: no cover - čidlo nesmí shodit most
+            logger.error("❌ /drzim: čtení stavu selhalo: %r", exc)
+            return {"ok": False, "duvod": "vnitřní chyba"}
+        return {"ok": True, **stav}
 
     @api.get("/zdravi")
     async def _zdravi():

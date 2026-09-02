@@ -533,18 +533,18 @@ class Application:
         # hardware tail so the mic doesn't catch the reply's own end. Sent to the
         # device in `hello`; lower = snappier, higher = safer against echo.
         try:
-            follow_up_open_delay_ms = int(os.environ.get("FOLLOW_UP_OPEN_DELAY_MS", "700"))
+            follow_up_open_delay_ms = int(os.environ.get("FOLLOW_UP_OPEN_DELAY_MS", "0"))
         except (TypeError, ValueError):
-            follow_up_open_delay_ms = 700
+            follow_up_open_delay_ms = 0
         follow_up_open_delay_ms = max(0, min(5000, follow_up_open_delay_ms))
         # Same idea at the WAKE boundary: delay (ms) after the wake chime before
         # the mic opens, so the chime's own hardware tail doesn't leak into the
         # fresh mic and become a ghost turn (the wake-path twin of
         # follow_up_open_delay_ms — the yaml wake handler reads it via a lambda).
         try:
-            wake_open_delay_ms = int(os.environ.get("WAKE_OPEN_DELAY_MS", "700"))
+            wake_open_delay_ms = int(os.environ.get("WAKE_OPEN_DELAY_MS", "400"))
         except (TypeError, ValueError):
-            wake_open_delay_ms = 700
+            wake_open_delay_ms = 400
         wake_open_delay_ms = max(0, min(5000, wake_open_delay_ms))
         # Playback jitter buffer (ms): the device holds incoming TTS until this
         # much has accumulated before playing, so a brief network hiccup doesn't

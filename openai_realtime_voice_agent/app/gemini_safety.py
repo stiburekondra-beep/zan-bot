@@ -45,7 +45,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from google.genai.types import Blob, EndSensitivity
+from google.genai.types import Blob, EndSensitivity, StartSensitivity
 from pipecat.frames.frames import (
     LLMTextFrame,
     TranscriptionFrame,
@@ -676,14 +676,30 @@ def build_gemini_vad_params(eagerness: Optional[str],
                 "⚠️ google.genai.types.EndSensitivity nezná %r — jedu bez ní", end_name
             )
             end_name = None
+    # Začátek řeči — táž fail-soft cesta jako u konce: když ho google-genai
+    # v téhle verzi nezná, jedeme bez něj. Délka ticha je to hlavní a platí
+    # i tak; shodit kvůli citlivosti celou pusu by bylo horší.
+    start_name = plan.get("start_sensitivity")
+    start_sensitivity = None
+    if start_name:
+        start_sensitivity = getattr(StartSensitivity, str(start_name), None)
+        if start_sensitivity is None:
+            logger.warning(
+                "⚠️ google.genai.types.StartSensitivity nezná %r — jedu bez ní",
+                start_name,
+            )
+            start_name = None
     params = GeminiVADParams(
         end_sensitivity=end_sensitivity,
+        start_sensitivity=start_sensitivity,
         silence_duration_ms=plan.get("silence_duration_ms"),
         prefix_padding_ms=plan.get("prefix_padding_ms"),
     )
     logger.info(
-        "🎚️ Gemini VAD: eagerness=%s → end_sensitivity=%s, silence=%sms, prefix=%sms",
-        eagerness, end_name or "(server default)",
+        "🎚️ Gemini VAD: eagerness=%s → start_sensitivity=%s, end_sensitivity=%s, "
+        "silence=%sms, prefix=%sms",
+        eagerness, start_name or "(server default)",
+        end_name or "(server default)",
         plan.get("silence_duration_ms"), plan.get("prefix_padding_ms"),
     )
     return params

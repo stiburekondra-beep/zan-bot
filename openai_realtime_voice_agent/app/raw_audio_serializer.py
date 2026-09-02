@@ -21,6 +21,49 @@ from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializer
 
 logger = logging.getLogger(__name__)
 
+# POLOVICNI DUPLEX (2. 9. 2026). Satelit slysi sam sebe a Gemini si vlastni
+# slova bota prepise jako `user`. Doslovne z logu:
+#
+#     19:23:28.879  Bot started speaking
+#     19:23:31.645  Bot stopped speaking
+#     19:23:38,667  user: To neni.
+#     19:23:38,669  user: Je 19:23.      <- to rekl BOT, ne clovek
+#
+# a probuzeni behem vlastni reci:
+#
+#     19:24:25.902  Bot started speaking
+#     19:24:28.193  device wake received
+#     19:24:43.832  device wake received
+#
+# AEC na zarizeni na to nestaci. Dokud tedy z repraku zni rec, mikrofon se
+# do Gemini NEPOSILA a `wake` se ignoruje.
+#
+# JAK SE POZNA, ZE BOT MLUVI: podle `_posledni_vystup` -- casu posledniho
+# odchoziho audio chunku. Zadna nova drata mezi objekty: kdo audio odesila,
+# ten uz to tady vi. A `_PRERUSENI_TYPY` (BotStoppedSpeaking, preruseni)
+# ten cas nuluji, takze se mikrofon otevre OKAMZITE, ne az po dobehu.
+#
+# PRERUSENI SLOVEM "STOP" TIM NETRPI: firmware na nej posila jinou zpravu
+# (`{"type":"interrupt"}`, viz vetev nize), ne `wake` -- ta se zpracuje
+# vzdycky a rovnou preruseni vyvola.
+POLODUPLEX = (os.environ.get("ZAN_POLODUPLEX", "1").strip().lower()
+              not in ("0", "false", "off", "ne"))
+
+# Jak dlouho po poslednim odchozim chunku se jeste povazuje za "bot mluvi".
+# Chunky jdou behem reci hustě za sebou; mezera vetsi nez tohle znamena
+# ticho. 300 ms = dobeh reproduktoru a ozveny v pokoji.
+POLODUPLEX_DOBEH_S = float(os.environ.get("ZAN_POLODUPLEX_DOBEH_S", "0.3"))
+
+# LOOKBACK. Zahodit paket a otevrit mikrofon az potom znamena, ze prvni
+# slabika CLOVEKA spadne do doby, kdy jeste dobihal repro -- presne ta
+# ztrata, na kterou si vlastnik stezoval ("ztrati se tam zacatek odpovedi").
+# Zavreny mikrofon proto neni kos, ale kruhovy buffer: co se behem dobehu
+# naslo, se pri otevreni posle ZPETNE pred aktualnim paketem.
+#
+# Delka odpovida dobehu; vic drzet nema smysl (to uz je Zanova rec, ne
+# clovekova). Bajtu = rate * s * 2 (16bit mono).
+POLODUPLEX_LOOKBACK_S = float(os.environ.get("ZAN_POLODUPLEX_LOOKBACK_S", "0.3"))
+
 # NABEH TICHA. Satelit (HA Voice PE) rozjizdi vystupni stream az s prvnim
 # bajtem, takze prvni ~300 ms kazde nove promluvy spolkne.
 #
@@ -107,6 +150,11 @@ class RawAudioSerializer(FrameSerializer):
         # Resets the dangling-VAD guard's "speech since wake" tracker. Set by
         # WebSocketHandler.build_pipeline.
         self._on_wake = None
+        # Poloduplex: drzi se jen kvuli logu, ať se `🔇/🎙️` nepise u kazdého
+        # 20ms paketu, ale jen při změně.
+        self._mic_byl_zavren = False
+        # Kruhovy buffer doběhu — viz POLODUPLEX_LOOKBACK_S.
+        self._lookback = bytearray()
         # Async callback pro {"type":"ping"} — keepalive od zařízení. Odpověď
         # `pong` musí jít NA TENTO satelit; dřív na ni čekala obsluha
         # `on_client_message`, kterou pipecat vůbec nezná (BaseObject na ni jen
@@ -138,6 +186,26 @@ class RawAudioSerializer(FrameSerializer):
     def set_wake_handler(self, handler):
         """Register the async no-arg callback fired on a device 'wake'."""
         self._on_wake = handler
+
+    def mic_zavren(self) -> bool:
+        """Mluvi prave ted Zan z repraku? Pak se mikrofon neposloucha.
+
+        Vraci `False`, kdyz poloduplex neni zapnuty nebo kdyz jeste nic
+        neznelo -- zavreny mikrofon je vyjimka, otevreny je vychozi stav.
+        """
+        if not POLODUPLEX or not self._posledni_vystup:
+            return False
+        return (time.monotonic() - self._posledni_vystup) < POLODUPLEX_DOBEH_S
+
+    def _ohlas_mic(self, zavreno: bool) -> None:
+        """Do logu jde jen ZMENA stavu, ne kazdy paket (chunky jsou po 20 ms)."""
+        if zavreno == self._mic_byl_zavren:
+            return
+        self._mic_byl_zavren = zavreno
+        if zavreno:
+            logger.info("🔇 mic zavřen (bot mluví)")
+        else:
+            logger.info("🎙️ mic otevřen")
 
     def set_ping_handler(self, handler):
         """Register the async no-arg callback fired on a device 'ping'."""
@@ -207,6 +275,12 @@ class RawAudioSerializer(FrameSerializer):
                 # turn boundary for the dangling-VAD guard: until the user
                 # actually speaks, any server-VAD end-of-turn is a stale segment
                 # from the previous turn closing late (→ garbage response).
+                if self.mic_zavren():
+                    # Probuzeni z vlastniho hlasu (19:24:28 a 19:24:43 behem
+                    # `Bot started speaking`). Skutecne preruseni chodi jako
+                    # `{"type":"interrupt"}` -- to se zpracuje vzdycky.
+                    logger.info("👋 wake během řeči Žána — ignoruju (poloduplex)")
+                    return None
                 logger.info("👋 device wake received")
                 if self._on_wake is not None:
                     try:
@@ -239,6 +313,30 @@ class RawAudioSerializer(FrameSerializer):
         if not isinstance(message, bytes):
             # Skip anything that isn't bytes or a known text control frame.
             return None
+
+        # POLOVICNI DUPLEX. Dokud z repraku zni Zanuv hlas, mikrofon do
+        # Gemini nejde -- jinak si model prepise vlastni slova jako `user`
+        # a odpovi sam sobe. Zahazuje se cely paket (ne ticho misto nej):
+        # server VAD pak nema co spustit.
+        zavreno = self.mic_zavren()
+        self._ohlas_mic(zavreno)
+        if zavreno:
+            # Neni to kos, je to pamet posledniho dobehu. Do Gemini to
+            # nejde (server VAD by si Zanuv hlas vzal jako `user`), ale az
+            # se mikrofon otevre, pojede tohle napred.
+            strop = int(self._input_sample_rate * POLODUPLEX_LOOKBACK_S) * 2
+            self._lookback.extend(message)
+            if strop > 0 and len(self._lookback) > strop:
+                del self._lookback[:len(self._lookback) - strop]
+            return None
+
+        if self._lookback:
+            # Prvni paket po otevreni nese i dobeh — jinak by se prvni
+            # slabika cloveka ztratila v dobe, kdy jeste hral repro.
+            logger.info("🎙️ mic otevřen — posílám %d ms doběhu zpětně",
+                        len(self._lookback) / 2.0 / max(1, self._input_sample_rate) * 1000.0)
+            message = bytes(self._lookback) + message
+            self._lookback.clear()
 
         # Validate audio format: 16-bit = 2 bytes per sample
         if len(message) % 2 != 0:

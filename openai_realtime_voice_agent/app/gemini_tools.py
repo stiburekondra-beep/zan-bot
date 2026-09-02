@@ -50,12 +50,29 @@ DROPPED_SCHEMA_KEYS = frozenset(
 #: pod 200 ms se promluva trhá na fragmenty") a z měření sondy: s čistým
 #: server VAD přišel toolCall za 525 ms, což byla nejrychlejší varianta ze
 #: všech 14 běhů.
+#: ``start_sensitivity`` (2. 9. 2026): most ho dosud NENASTAVOVAL vůbec,
+#: takže začátek řeči řešil server po svém. ``START_SENSITIVITY_HIGH``
+#: znamená „chytej začátek dřív" — první slabika po probuzení se pak
+#: neztratí. Je to druhá půlka téhož nastavení: konec citlivý MÁLO (ať
+#: neutíná), začátek citlivý HODNĚ (ať nic nezmešká).
 VAD_EAGERNESS_PLANS: Dict[str, Dict[str, Optional[object]]] = {
-    "low": {"end_sensitivity": "END_SENSITIVITY_LOW", "silence_duration_ms": 1000},
-    "medium": {"end_sensitivity": "END_SENSITIVITY_LOW", "silence_duration_ms": 800},
-    "high": {"end_sensitivity": "END_SENSITIVITY_HIGH", "silence_duration_ms": 500},
+    # `low` = to, co dům jede: nejdelší ticho, tedy nejmíň useknutých vět.
+    # 1000 → 1200 ms (2. 9. 2026): vlastník hlásil „neposlouchá dlouho
+    # a utne se mi". Průvodce Live API dává 500–800 ms jako běžné pásmo;
+    # dítě i dospělý v půlce věty dělají pauzu delší, a cena omylu je tady
+    # nesymetrická — o 400 ms delší čekání nikdo nepozná, useknutou větu ano.
+    "low": {"end_sensitivity": "END_SENSITIVITY_LOW",
+            "start_sensitivity": "START_SENSITIVITY_HIGH",
+            "silence_duration_ms": 1200},
+    "medium": {"end_sensitivity": "END_SENSITIVITY_LOW",
+               "start_sensitivity": "START_SENSITIVITY_HIGH",
+               "silence_duration_ms": 800},
+    "high": {"end_sensitivity": "END_SENSITIVITY_HIGH",
+             "start_sensitivity": "START_SENSITIVITY_HIGH",
+             "silence_duration_ms": 500},
     # „auto" = nechat rozhodnout server, jen rozumná délka ticha.
-    "auto": {"end_sensitivity": None, "silence_duration_ms": 800},
+    "auto": {"end_sensitivity": None, "start_sensitivity": None,
+             "silence_duration_ms": 800},
 }
 
 #: Pod tuhle hranici se ticho nepustí ani na výslovné přání — Live API
