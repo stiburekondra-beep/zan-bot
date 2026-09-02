@@ -39,6 +39,8 @@ from pipecat.frames.frames import (
 
 from app.phase_emitter import TURN_LIVENESS
 from app import hovor_log
+from app import utrzek_argumenty
+from app import predani_mozku
 from app.voice_safety import (
     is_sensitive_actuation,
     saha_na_vlastni_hlas,
@@ -203,7 +205,15 @@ UTRZEK_OKNO_S = 3.0
 #: Proto se u zasahu do domu kratce POCKA, az prepis tohoto tahu dorazi.
 #: Bezne to stoji jednotky milisekund (prepis uz je na ceste); plna cekaci
 #: doba padne jen tam, kde prepis nedorazi vubec.
-UTRZEK_CEKANI_S = float(os.environ.get("ZAN_UTRZEK_CEKANI_S", "0.4"))
+#:
+#: 400 ms -> 1500 ms (2. 9. 2026, 18:02:56). Vecer u televize spolkla
+#: pojistka detskou prosbu o pohadku: cekala 400 ms, prepis nedorazil
+#: a soudila podle utrzku `hotylek` z predchoziho tahu. Cekat dyl je
+#: LEVNE (plna doba padne jen tam, kde prepis nedorazi vubec) a levnejsi
+#: nez spolknuty povel. Zaroven to ale ten vecer NEZACHRANI -- prepis te
+#: promluvy nedorazil ani pozdeji, a proto vedle cekani stoji druhy
+#: svedek: `app/utrzek_argumenty`.
+UTRZEK_CEKANI_S = float(os.environ.get("ZAN_UTRZEK_CEKANI_S", "1.5"))
 
 #: Jak stary smi byt prepis, aby se jeste pocital za "tenhle tah".
 UTRZEK_CERSTVY_S = 1.5
@@ -277,6 +287,30 @@ def _bez_diakritiky_lower(text: str) -> str:
     import unicodedata
     nfkd = unicodedata.normalize("NFKD", str(text or ""))
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _omluva_z_argumentu(sluzba, function_name: str, arguments) -> str:
+    """Most → čistý úsudek v ``app.utrzek_argumenty``. Vrací důvod, nebo ''.
+
+    Běží v executoru, protože si smí (jednou za pět minut) došlápnout na
+    runner pohádek pro seznam titulů. Blokovat kvůli tomu smyčku by
+    znamenalo vyměnit spolknutý povel za koktající hlas.
+
+    ASYMETRIE, NA KTERÉ TO 2. 9. 2026 SPADLO. ``_pockej_na_prepis``
+    považuje za „přepis tohohle tahu" jen razítko mladší než
+    :data:`UTRZEK_CERSTVY_S` (1,5 s) — a v 18:02:56 tedy správně ohlásilo
+    „nedorazil". ``_utrzek_blokuje`` ale vetuje podle širšího okna
+    :data:`UTRZEK_OKNO_S` (3 s), takže vetovalo přepisem, který samo
+    čekání odmítlo jako CIZÍ tah. Tady se soudí podle toho užšího,
+    poctivějšího pravidla: když přepis tohohle tahu nedorazil, rozhoduje
+    argument. Když dorazil, veto platí a argument nemá co dodat.
+    """
+    o = getattr(sluzba, "posledni_prepis", None)
+    t = getattr(sluzba, "posledni_prepis_t", 0.0) or 0.0
+    dorazil = bool(t) and (time.monotonic() - float(t)) <= UTRZEK_CERSTVY_S
+    utrzek = (getattr(o, "puvodni", "") or getattr(o, "text", "") or "")
+    return utrzek_argumenty.omluva(function_name, arguments,
+                                   prepis_dorazil=dorazil, utrzek=utrzek)
 
 
 class FastLaneMixin:
@@ -513,6 +547,14 @@ class FastLaneMixin:
         FunctionCallParams signature, so the wrapper does too (pipecat
         inspects the signature to pick the calling convention).
         """
+        # DVEŘE K MOZKU pro rychlou dráhu (2. 9. 2026). Mozek se registruje
+        # jako nástroj `zeptej_se_mozku`; most si tady jeho obsluhu schová,
+        # aby za ním mohl jít SÁM, když rychlá dráha nedokáže. Bez toho by
+        # „předej to mozku" byl slib bez dosahu — mixin na `ZanBridge` odjinud
+        # nedosáhne.
+        if function_name == "zeptej_se_mozku":
+            self._mozek_handler = handler
+
         async def liveness_tracked(params):
             # ÚTRŽKOVÁ POJISTKA (2026-08-31): poslední věc, kterou most slyšel,
             # nebyl povel — jen wake word, "ne", citoslovce. Zásah do domu se
@@ -531,6 +573,35 @@ class FastLaneMixin:
             except Exception as e:  # pragma: no cover - pojistka nesmí shodit tool
                 logger.warning("⚠️ útržková pojistka selhala, propouštím tool: %r", e)
                 duvod_utrzku = ""
+
+            # DRUHÝ SVĚDEK, kdyz prvni nedorazil (2. 9. 2026, 18:02:56).
+            # Kdyz prepis TOHOTO tahu neprisel, nesmi o povelu rozhodovat
+            # utrzek z tahu PREDCHOZIHO -- v tom pripade se soudi
+            # z ARGUMENTU volani. Plati jen pro veci, ktere jdou vzit zpet
+            # jednim slovem (pohadka, hudba); dum zustava fail-closed,
+            # protoze `utrzek_argumenty.MEKKE_NASTROJE` je vycet.
+            if duvod_utrzku:
+                try:
+                    duvod_omluvy = await asyncio.get_running_loop().run_in_executor(
+                        None, _omluva_z_argumentu, self, function_name,
+                        getattr(params, "arguments", None))
+                except Exception as e:  # pragma: no cover - svedek nesmi shodit tool
+                    logger.warning("⚠️ ctení argumentu selhalo, utrzek plati: %r", e)
+                    duvod_omluvy = ""
+                if duvod_omluvy:
+                    logger.info(
+                        "🎧 utrzkova pojistka: prepis tahu nedorazil, ale %s "
+                        "-- %s PROVADIM", duvod_omluvy, function_name,
+                    )
+                    self._rozbor(
+                        "utrzek-prepsan-argumentem",
+                        volani="%s(%r)" % (function_name,
+                                           getattr(params, "arguments", None)),
+                        vysledek="provedeno",
+                        poznamka=duvod_omluvy,
+                    )
+                    duvod_utrzku = ""
+
             if duvod_utrzku:
                 o = getattr(self, "posledni_prepis", None)
                 logger.warning(
@@ -1224,14 +1295,97 @@ class FastLaneMixin:
             await self.play_phrase("vysledek_fail")
         self.fastlane_unmute("neúspěch nebo bez zvuku — pravdu musí říct model")
         params.result_callback = real_cb
-        await real_cb(self._verdict_text(verdict, plan, captured))
+
+        # A TEĎ ZA MOZKEM (2. 9. 2026). Model řekne jednu krátkou větu
+        # („mrknu se na to") a souběžně jde dotaz s původní větou člověka
+        # do mozku, který má rejstřík domu. Do téhle chvíle výměna skončila
+        # u „nepotvrdilo se to" a nikdo se nedozvěděl proč.
+        predano = False
+        try:
+            predano = await self._predej_mozku(
+                verdict, function_name, getattr(params, "arguments", None))
+        except Exception as e:  # noqa: BLE001 - předání nesmí shodit tool
+            logger.warning("⚠️ předání mozku selhalo, jedu dál: %r", e)
+
+        await real_cb(self._verdict_text(verdict, plan, captured,
+                                         predano=predano))
+
+    async def _predej_mozku(self, verdict: str, function_name: str,
+                            arguments) -> bool:
+        """Co rychlá dráha nedokázala, jde za mozkem. Vrací, jestli se předalo.
+
+        PROČ (2. 9. 2026, 17:48:40 a 17:49:07): dvakrát po sobě
+        ``HassTurnOn ... = unconfirmed`` a tím to skončilo — model řekl
+        „nepotvrdilo se to" a nikdo se nedozvěděl proč. Mozek má oproti
+        rychlé dráze rejstřík domu (``zan_data/zarizeni``), takže umí buď
+        najít správnou entitu, nebo se jednou větou zeptat. Rychlá dráha
+        má jen intent a jméno, které řekl model.
+
+        Jde to TOUŽ cestou jako ``zeptej_se_mozku`` (``ZanBridge.handler``),
+        ne vlastním HTTP voláním: druhá cesta k mozku by se s tou první
+        dřív nebo později rozešla v očistě, v dispečerovi i v logu.
+
+        Pojistka proti smyčce a rozhodnutí, co se předává, jsou v
+        ``app/predani_mozku`` — čistý úsudek, který jde otestovat bez
+        pipecatu.
+        """
+        razitko = getattr(self, "posledni_prepis_t", 0.0) or 0.0
+        if not predani_mozku.predat(verdict, razitko,
+                                    getattr(self, "_predano_tah", 0.0)):
+            return False
+        handler = getattr(self, "_mozek_handler", None)
+        if handler is None:
+            logger.warning("⚠️ %s: mozek není zapojený (zeptej_se_mozku "
+                           "neregistrován) — nemám kam předat",
+                           predani_mozku.ZNACKA)
+            return False
+        o = getattr(self, "posledni_prepis", None)
+        veta = (getattr(o, "text", "") or getattr(o, "puvodni", "") or "")
+        text = predani_mozku.zadani(veta, function_name, arguments, verdict)
+        self._predano_tah = razitko
+
+        class _Shim:
+            """Nejmenší `params`, jaké obsluha mozku potřebuje."""
+            arguments = {"text": text}
+
+            @staticmethod
+            async def result_callback(*a, **kw):
+                # Odpověď mozku jde do řeči vlastní cestou (dispečer);
+                # tady se jen nesmí spadnout na chybějícím callbacku.
+                return None
+
+        logger.info("🧠 %s: %s(%r) = %s → ptám se mozku na %r",
+                    predani_mozku.ZNACKA, function_name, arguments, verdict,
+                    veta or "(bez přepisu)")
+        try:
+            await handler(_Shim)
+        except Exception as e:  # noqa: BLE001 - předání nesmí shodit tool
+            logger.warning("⚠️ %s: nepovedlo se (%r)", predani_mozku.ZNACKA, e)
+            return False
+        self._rozbor(
+            "fastlane-predano-mozku",
+            volani="%s(%r)" % (function_name, arguments),
+            vysledek=verdict,
+            poznamka="rychlá dráha nedokázala, ptám se mozku",
+        )
+        return True
 
     @staticmethod
-    def _verdict_text(verdict: str, plan, captured) -> str:
-        """Text pro model, když knihovna frází chybí — pořád jen ověřená pravda."""
+    def _verdict_text(verdict: str, plan, captured, predano: bool = False) -> str:
+        """Text pro model, když knihovna frází chybí — pořád jen ověřená pravda.
+
+        `predano=True` znamená, že se dotaz UŽ POSLAL mozku (viz
+        `_predej_mozku`). Model pak má říct JEDNU krátkou větu a mlčet —
+        odpověď přijde z mozku vlastní cestou. Kdyby se ptal i on, byla by
+        na jednu věc dvě volání a v pokoji dva hlasy.
+        """
         cil = plan.target or plan.area or "to"
         if verdict == "ok":
             return f"Ověřeno: {plan.label} — {cil} je v požadovaném stavu. Řekni jednu krátkou větu."
+        if predano:
+            return ("Nepotvrdilo se to a UŽ JSEM SE ZEPTAL mozku, který má rejstřík "
+                    "domu. Řekni jednu krátkou větu typu „Mrknu se na to.\" a dál "
+                    "mlč — odpověď dorazí sama. Nevolej ask_zan, je to už na cestě.")
         if verdict == "unconfirmed":
             return ("Povel odešel, ale zařízení stav nepotvrdilo. Řekni přesně tohle, "
                     "netvrď úspěch.")
