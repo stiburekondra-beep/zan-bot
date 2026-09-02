@@ -1093,6 +1093,21 @@ class Application:
                     session_properties=session_properties,
                     start_audio_paused=False
                 )
+                # A/B POSLECH POTŘEBUJE ZÁZNAM (karta -25, „blokující
+                # předpoklad"): analýza logu 24. 8. skončila na tom, že
+                # `gpt-realtime`, `realtime-2` ani `cedar` nemají v logu
+                # JEDINÝ výskyt — most model ani hlas při startu netiskl,
+                # takže u žádné nahrávky nešlo prokázat, kterou variantu
+                # Ondra zrovna poslouchal. Gemini větev to hlásí od 31. 8.
+                # (`✅ Gemini pusa: model=… hlas=…`), OpenAI větev do
+                # dneška ne.
+                logger.info(
+                    "✅ OpenAI pusa: model=%s hlas=%s rychlost=%.2f "
+                    "VAD=%s/%s přepis=%s nástrojů=%d",
+                    self.model, self.voice, self.openai_speed,
+                    self.turn_detection_type, self.vad_eagerness,
+                    self.transcription_model or "—", len(all_tools),
+                )
             # ADRESNÝ KANÁL: účtenka o spotřebě i lokální potvrzení jdou na
             # TENHLE satelit, ne broadcastem všem (jinak by se druhému satelitu
             # rozsvítil prstenec kvůli povelu z jiné místnosti).
