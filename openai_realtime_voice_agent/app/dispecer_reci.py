@@ -132,6 +132,22 @@ CERSTVOST_S = float(os.environ.get("ZAN_CERSTVOST_S", "20"))
 #: Značka, kterou dostane odpověď, jež dorazila po `CERSTVOST_S`.
 ZNACKA_POZDNI = "pozdni"
 
+#: Značka „tuhle větu položil mozek jako OTÁZKU a čeká odpověď".
+#:
+#: Proč nestačí otazník (2. 9. 2026, nález z rešerše režimu Učitel):
+#: sokratovská otázka učitele, výzva ve hře i doplňovačka průvodce často
+#: otazníkem nekončí — „Řekni mi, kolik je pět a sedm.", „Zkus to znovu.",
+#: „Teď ty." Dítě odpoví jedním slovem („dvanáct", „modrá", „ano"), a to
+#: bez otevřeného okna spadne jako útržek. Heuristika na otazník je tedy
+#: správná, ale ne úplná — a rozšiřovat ji na tázací slova by otevíralo
+#: okno na oznámení (viz `konci_otazkou`).
+#:
+#: Řešení: kdo otázku POLOŽIL, ten o ní ví. Mozek to smí říct výslovně
+#: (`ceka_na_odpoved: true` v odpovědi na `/voice`), most tomu věří a okno
+#: otevře bez ohledu na interpunkci. Heuristika zůstává jako záloha pro
+#: otázky, které si vymyslí sama pusa.
+ZNACKA_PTAM_SE = "ptam_se"
+
 #: OKNO ROZHOVORU. Jak dlouho po ŽÁNOVĚ otázce platí, že krátká věta je
 #: ODPOVĚĎ, a ne útržek (`prepis_ocista.ocisti(..., ceka_na_odpoved=True)`).
 #:
@@ -393,7 +409,8 @@ class DispecerReci:
     # -- okno rozhovoru („Žán se právě na něco zeptal") -------------------
 
     def zaznamenej_svou_otazku(self, text: str,
-                               nyni: Optional[float] = None) -> bool:
+                               nyni: Optional[float] = None,
+                               *, ptam_se: Optional[bool] = None) -> bool:
         """Otevře okno rozhovoru, KDYŽ Žánova věta končí otazníkem.
 
         Volají to dvě místa a obě jsou tu schválně:
@@ -406,8 +423,15 @@ class DispecerReci:
            se na ni nedá stavět; jako druhý zdroj ale nevadí.
 
         Vrací True, když se okno opravdu otevřelo (na logování).
+
+        `ptam_se=True` = **mozek řekl, že se ptá** (značka `ZNACKA_PTAM_SE`).
+        Pak se okno otevře bez ohledu na interpunkci — kdo otázku položil,
+        ten o ní ví líp než detektor otazníku. `None` = rozhodne heuristika
+        (dosavadní chování), `False` = neotevírat.
         """
-        if not konci_otazkou(text):
+        if ptam_se is False:
+            return False
+        if not ptam_se and not konci_otazkou(text):
             return False
         self._zan_se_ptal_t = time.monotonic() if nyni is None else nyni
         return True
@@ -605,9 +629,12 @@ class DispecerReci:
         # že Žán něco ŘEKL a co to bylo. Když to byla otázka, otevírá se
         # okno, ve kterém krátká lidská věta není útržek, ale ODPOVĚĎ
         # (`prepis_ocista.ocisti(..., ceka_na_odpoved=True)`).
-        if self.zaznamenej_svou_otazku(tema.obsah, nyni=nyni):
+        z_mozku = ZNACKA_PTAM_SE in (tema.znacka or "")
+        if self.zaznamenej_svou_otazku(tema.obsah, nyni=nyni,
+                                       ptam_se=True if z_mozku else None):
             logger.info("❓ dispečer: Žán se zeptal — okno odpovědi otevřené "
-                        "(druh=%s): %.120s", tema.druh, tema.obsah)
+                        "(druh=%s zdroj=%s): %.120s", tema.druh,
+                        "mozek" if z_mozku else "otazník", tema.obsah)
         # Rozběh platí pro OBĚ cesty: i doslovná řeč chvíli hraje z reproduktoru
         # a druhá položka by ji překřičela.
         if (doslova or tema.run_llm) and self.rozbeh_s > 0:

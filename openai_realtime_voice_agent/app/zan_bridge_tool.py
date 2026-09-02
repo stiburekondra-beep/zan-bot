@@ -71,7 +71,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TYPE_C
 from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.services.openai.realtime import events as rt_events
 
-from app.dispecer_reci import DispecerReci
+from app.dispecer_reci import DispecerReci, ZNACKA_PTAM_SE
+from app.odpoved_mozku import polozky as _polozky_mozku
 from app.prepis_ocista import ocisti
 from app.zdroj_zarizeni import payload_voice, zdroj_zarizeni
 
@@ -201,18 +202,6 @@ def _post_json(url: str, token: str, payload: dict, timeout: float) -> dict:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
-
-
-def _texts_from(payload: dict) -> List[str]:
-    """Z jedné odpovědi mozku vytáhne N textů k vyslovení."""
-    for key in ("chunks", "parts"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            texts = [str(item).strip() for item in value if str(item).strip()]
-            if texts:
-                return texts
-    reply = str(payload.get("reply", "")).strip()
-    return [reply] if reply else []
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +803,7 @@ class ZanBridge:
         latency páka vůbec — HA Voice měřil >5 s → ~0,5 s.)
         """
         zarazeno = 0
-        posledni: Optional[Tuple[str, bool]] = None
+        posledni: Optional[Tuple[str, bool, bool]] = None
         async for payload in self._stream(text):
             for item in self._items(payload):
                 zarazeno += 1
@@ -828,30 +817,33 @@ class ZanBridge:
             logger.info("🏁 ask_zan #%d: mozek dořekl (%d vět)", ask_id, zarazeno)
         return zarazeno
 
-    def _items(self, payload: dict) -> List[Tuple[str, bool]]:
-        """Z jedné odpovědi mozku udělá seznam (text, ať to model vysloví?).
+    def _items(self, payload: dict) -> List[Tuple[str, bool, bool]]:
+        """Z jedné odpovědi mozku udělá seznam (text, vyslovit?, ptám se?).
 
         `local_confirmation: success` znamená, že potvrzení už zaznělo
         lokálně z knihovny frází — text se do kontextu vloží kvůli
         kontinuitě, ale model ho NESMÍ vyslovit znovu.
         """
-        speak = payload.get("local_confirmation") != "success"
-        return [(chunk, speak) for chunk in _texts_from(payload)]
+        return _polozky_mozku(payload)
 
     async def _zarad(
-        self, ask_id: int, interaction_id: str, item: Tuple[str, bool], *, final: bool
+        self, ask_id: int, interaction_id: str, item: Tuple[str, bool, bool], *,
+        final: bool
     ) -> None:
-        text, speak = item
+        text, speak, ptam_se = item
+        znacka = ZNACKA_PTAM_SE if ptam_se else ""
         if not speak:
             await self.broadcast_json(
                 {"type": "local_confirmation", "value": "success", "text": text}
             )
             self.dispecer.pridej_odpoved(
                 text, interaction_id, druh="potvrzeni", run_llm=False,
+                znacka=znacka,
             )
             return
         self.dispecer.pridej_odpoved(
             text, interaction_id, druh="odpoved" if final else "nalez",
+            znacka=znacka,
         )
 
     async def _progress(self, ask_id: int, interaction_id: str, started: float) -> None:
