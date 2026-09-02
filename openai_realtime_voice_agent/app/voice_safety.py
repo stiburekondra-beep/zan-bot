@@ -46,7 +46,7 @@ _TARGET_KEYS = ("name", "area", "entity_id", "entity", "device", "domain")
 # proslo branou bez povsimnuti -- cil byl "prazdny" a funkce vratila False.
 # Pritom prave `device_class` je v Home Assistantu jediny zpusob, jak
 # hlasem trefit vodni ventil, plyn nebo garazova vrata, aniz by v povelu
-# padlo slovo "zamek" nebo "kotel". Ondrovo zadani zni doslova: pusa nikdy
+# padlo slovo "zamek" nebo "kotel". Zadani vlastnika zni doslova: pusa nikdy
 # `water`/`gas`/`lock`/garaz.
 #
 # Shoda je PRESNA (cela hodnota klice), ne podretezcova: "door" jako
@@ -124,7 +124,7 @@ def is_sensitive_actuation(function_name: str,
 # ---------------------------------------------------------------------------
 # BRZDA 31. 8. 2026: BEZCILNY ZASAH A VLASTNI HLAS
 #
-# Zive dolozeno (log zan-realtime 17:56:02, Ondra u toho stal):
+# Zive dolozeno (log zan-realtime 17:56:02, vlastnik u toho stal):
 #
 #     Calling function [HassSetVolume] with arguments {'volume_level': 20}
 #     -> success: Zan Media Player, Zan reSpeaker Media Player,
@@ -132,7 +132,7 @@ def is_sensitive_actuation(function_name: str,
 #
 # Volani BEZ CILE zasahlo vsech pet prehravacu vcetne satelitu, kterym Zan
 # mluvi -- hlasitost spadla z 1.0 na 0.2 a Zan si tim sam stahl hlas na
-# petinu. Ondra o hlasitosti nerekl ani slovo; model si povel vyrobil
+# petinu. Vlastnik o hlasitosti nerekl ani slovo; model si povel vyrobil
 # z rozsypaneho prepisu "svetla v obyvakutechto hlavnichVypni televizi."
 #
 # Dve pravidla, obe fail-closed:
