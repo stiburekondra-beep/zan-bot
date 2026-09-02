@@ -1241,7 +1241,25 @@ class Application:
         # na celý most, stejně jako fronta a dispečer — ne per satelit.
         if self.zan_bridge is not None:
             try:
-                self._prubeh_task = await spust_prubeh_server(self.zan_bridge.prijmi_prubeh)
+                def _drzim(zarizeni=None):
+                    """Drží most tohle zařízení a zní z něj právě řeč?
+
+                    Odpověď pro `GET /drzim` — aby se ten, kdo chce na
+                    satelit poslat announce přes Home Assistant, mohl
+                    zeptat a nemluvil přes most. Jeden mluvčí na zařízení.
+                    """
+                    wh = self.websocket_handler
+                    ids = list(wh.clients.ids())
+                    faze = wh.aktualni_faze()
+                    return {
+                        "drzim": (zarizeni in ids) if zarizeni else bool(ids),
+                        "mluvim": faze == "replying",
+                        "faze": faze,
+                        "zarizeni": ids,
+                    }
+
+                self._prubeh_task = await spust_prubeh_server(
+                    self.zan_bridge.prijmi_prubeh, drzi=_drzim)
             except Exception as e:
                 logger.warning(f"⚠️ /prubeh se nepodařilo nastartovat: {e!r}")
 
