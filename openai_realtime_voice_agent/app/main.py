@@ -1120,10 +1120,15 @@ class Application:
                 # Žáni s oddělenou pamětí. Most (`ZanBridge`) je proto taky
                 # JEDEN na celý běh: drží frontu témat a dispečera řeči, jen se
                 # mu `pripoj()` přepíná session pod rukama.
-                self.zan_bridge.pripoj(service, self.websocket_handler.aktualni_faze)
+                # `client_id` sem patří od 2. 9. 2026 (karta -17): most podle
+                # něj pozná, jestli se připojil TENTÝŽ satelit znovu (frontu
+                # smí vysypat), nebo DRUHÝ satelit vedle (nesmí — rozdělaná
+                # odpověď patří tomu, kdo se ptal).
+                self.zan_bridge.pripoj(service, self.websocket_handler.aktualni_faze,
+                                       client_id=client_id)
                 # Ze které krabice se ptají — jde do payloadu `/voice` jako
                 # `zdroj_zarizeni` (mapa IP → jméno v app/zdroj_zarizeni.py).
-                self.zan_bridge.nastav_zdroj(client_id)
+                self.zan_bridge.nastav_zdroj(client_id, service)
                 service.register_function("zeptej_se_mozku", self.zan_bridge.handler)
             logger.info(
                 f"✅ Pusa '{self.pusa}' vytvořena pro {client_id}: {type(service).__name__}"

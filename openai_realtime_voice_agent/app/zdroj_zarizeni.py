@@ -89,3 +89,35 @@ def payload_voice(text: str, chat_id: Optional[int], zdroj: Optional[str]) -> Di
     if zdroj:
         payload["zdroj_zarizeni"] = zdroj
     return payload
+
+
+# ---------------------------------------------------------------------------
+# ADRESNÝ DISPEČER (2. 9. 2026, karta 2026-08-30-programator-zana-17)
+#
+# `ZanBridge` je JEDEN na celý běh (jeden mozek, jedna paměť), ale satelitů
+# může být víc. Do 2. 9. `pripoj()` přepnul frontu na naposledy připojenou
+# relaci a starou frontu vysypal — takže když se dítě zeptalo u reSpeakeru
+# a pak se v obýváku probral Voice PE, odpověď buď zazněla v druhém pokoji,
+# nebo se cestou ztratila.
+#
+# Rozhodnutí je tady jako čistá funkce schválně: `zan_bridge_tool` tahá
+# pipecat, takže by šlo otestovat jedině na krabici se dvěma satelity.
+# Karta si výslovně žádá test, "který nepotřebuje železo, aby regrese
+# nečekala na ruce".
+# ---------------------------------------------------------------------------
+
+def je_jiny_satelit(stary_klient, novy_klient) -> bool:
+    """Připojil se DRUHÝ satelit vedle toho, se kterým se právě mluví?
+
+    ``True`` = nechat běžící rozhovor být (frontu nevysypávat, cíl řeči
+    nepřepínat). ``False`` = první spojení nebo TENTÝŽ satelit znovu (wifi
+    blikla, firmware se restartoval), tam stará fronta patřila jeho
+    minulému rozhovoru a smí se vysypat.
+
+    FAIL-SAFE k dosavadnímu chování: když se o kterékoli straně neví, kdo
+    to je (``None``/prázdno), vrací ``False`` — tedy přesně to, co most
+    dělal před touhle kartou. Neznámý stav nesmí tiše zavést nové chování.
+    """
+    if not stary_klient or not novy_klient:
+        return False
+    return stary_klient != novy_klient

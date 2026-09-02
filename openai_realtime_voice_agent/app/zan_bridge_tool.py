@@ -63,6 +63,7 @@ import json
 import logging
 import os
 import time
+import weakref
 import urllib.error
 import urllib.request
 import uuid
@@ -74,7 +75,7 @@ from pipecat.services.openai.realtime import events as rt_events
 from app.dispecer_reci import DispecerReci, ZNACKA_PTAM_SE
 from app.odpoved_mozku import polozky as _polozky_mozku
 from app.prepis_ocista import ocisti
-from app.zdroj_zarizeni import payload_voice, zdroj_zarizeni
+from app.zdroj_zarizeni import je_jiny_satelit, payload_voice, zdroj_zarizeni
 
 if TYPE_CHECKING:
     from pipecat.services.llm_service import FunctionCallParams
@@ -417,6 +418,11 @@ class ZanBridge:
         # Ze které krabice se ptali (`app/zdroj_zarizeni.py`). Mění se
         # s připojeným zařízením, proto `nastav_zdroj()`.
         self._zdroj: Optional[str] = None
+        # ADRESNÝ DISPEČER (karta -17): relace → satelit a relace → jméno
+        # zdroje. Slabé klíče schválně — když satelit odpadne a jeho služba
+        # se uvolní, záznam zmizí sám a most si nedrží mrtvé relace.
+        self._sluzby: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
+        self._zdroje: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
         self.dispecer = DispecerReci(
             vyslov=self._vyslov,
             pusa_mluvi=self.pusa_mluvi,
@@ -435,38 +441,102 @@ class ZanBridge:
 
     # -- napojení na běžící session --------------------------------------
 
-    def pripoj(self, service: Any, faze_getter: Optional[Callable[[], Optional[str]]] = None) -> None:
-        """Přepne most na novou realtime session a nastartuje dispečera.
+    def pripoj(self, service: Any,
+               faze_getter: Optional[Callable[[], Optional[str]]] = None,
+               client_id: Optional[str] = None) -> None:
+        """Zaregistruje relaci satelitu a nastartuje dispečera.
 
         Volá se při každém `_create_openai_service` — služba se vytváří
-        znovu pro každé připojení zařízení. Co viselo ve frontě pro starou
-        session, se zahazuje: patřilo to k jinému rozhovoru.
+        znovu pro každé připojení zařízení.
 
-        POZOR (multiklient, 30. 8. 2026): most je JEDEN na celý běh, ale
-        satelitů může být víc a každý má vlastní relaci. `pripoj()` proto
-        přepne frontu na tu NAPOSLEDY připojenou — dispečer mluví jednou
-        pusou, ne dvěma. Dokud jsou satelity dva a mozek jeden, je to
-        záměr; kdyby měl každý satelit mluvit vlastní frontou, musel by
-        být `ZanBridge` per slot (nezavedeno — jeden mozek, jedna paměť).
+        ADRESNÝ DISPEČER (2. 9. 2026, karta -17). Most je JEDEN na celý
+        běh (jeden mozek, jedna paměť), ale satelitů může být víc a každý
+        má vlastní relaci. Do dneška `pripoj()` frontu vždycky přepnul na
+        NAPOSLEDY připojenou relaci a starou frontu vysypal — takže když
+        se dítě zeptalo u reSpeakeru a pak se v obýváku probral Voice PE,
+        odpověď buď zazněla v druhém pokoji, nebo se cestou ztratila.
+
+        Teď se rozlišuje, KDO se připojil:
+
+        * **poprvé / tentýž satelit znovu** (wifi blikla, firmware se
+          restartoval) — fronta se vysype, protože patřila jeho minulému
+          rozhovoru, a most na něj přepne. To je chování jako dosud.
+        * **druhý, jiný satelit** — fronta se NEVYSYPE a cíl řeči se
+          nepřepne. Rozdělaná odpověď doběhne tam, odkud se ptali; nový
+          satelit se stane cílem, teprve až se přes něj někdo zeptá
+          (`handler` si bere službu z volání nástroje).
+
+        Sdílené zůstává všechno podstatné — fronta témat, historie,
+        rozpočet i mozek. Rozdvojuje se jenom ret.
         """
-        if self._service is not service:
-            self.dispecer.vyprazdni("nová realtime session")
-        self._service = service
+        if client_id is not None:
+            self._sluzby[service] = client_id
+            self._zdroje[service] = zdroj_zarizeni(client_id)
+
+        stary_klient = self._sluzby.get(self._service) if self._service is not None else None
+        novy_klient = self._sluzby.get(service)
+        jiny_satelit = (
+            self._service is not None
+            and self._service is not service
+            and je_jiny_satelit(stary_klient, novy_klient)
+        )
+        if jiny_satelit:
+            logger.info(
+                "🔀 dispečer: připojil se druhý satelit (%s), ale mluvím dál "
+                "do %s — frontu nevysypávám, rozdělaná odpověď patří jemu.",
+                novy_klient, stary_klient,
+            )
+        else:
+            if self._service is not service:
+                self.dispecer.vyprazdni("nová realtime session")
+            self._service = service
+            if client_id is not None:
+                self._zdroj = self._zdroje.get(service, self._zdroj)
         if faze_getter is not None:
             self._faze_getter = faze_getter
         self.dispecer.spust()
 
-    def nastav_zdroj(self, client_id: Optional[str]) -> None:
+    def nastav_zdroj(self, client_id: Optional[str],
+                     service: Any = None) -> None:
         """Zapamatuj si, ze kterého satelitu teď hlas přichází.
 
         Volá se z `_create_openai_service` (tam je client_id ze slotu).
-        Do payloadu `/voice` pak jde `zdroj_zarizeni` — server ho zatím
-        ignoruje, takže je to čistě aditivní.
+        Do payloadu `/voice` jde `zdroj_zarizeni` — mozek podle něj pozná,
+        v které místnosti se ptali.
+
+        Se dvěma satelity musí zdroj následovat TOHO, KDO SE PTÁ, ne toho,
+        kdo se naposledy připojil — proto se ukládá i k relaci
+        (`self._zdroje`) a `handler` si ho odtud vezme podle služby, ze
+        které volání nástroje přišlo.
         """
         novy = zdroj_zarizeni(client_id)
-        if novy != self._zdroj:
-            logger.info("📍 zdroj hlasu: %s (klient %s)", novy or "neznámý", client_id)
-        self._zdroj = novy
+        if service is not None:
+            self._zdroje[service] = novy
+            self._sluzby.setdefault(service, client_id or "")
+        if service is None or service is self._service:
+            if novy != self._zdroj:
+                logger.info("📍 zdroj hlasu: %s (klient %s)", novy or "neznámý", client_id)
+            self._zdroj = novy
+
+    def _prepni_na(self, service: Any) -> None:
+        """Cílem řeči je ten, kdo se právě zeptal (volání nástroje ví, kdo).
+
+        Tohle je druhá půlka adresného dispečera: `pripoj()` už cizí relaci
+        nepřebíjí, takže jediné místo, kde se cíl legitimně mění, je
+        skutečný dotaz z konkrétního satelitu.
+        """
+        if service is None or service is self._service:
+            return
+        stary = self._sluzby.get(self._service) if self._service is not None else None
+        novy = self._sluzby.get(service)
+        self._service = service
+        zdroj = self._zdroje.get(service)
+        if zdroj is not None and zdroj != self._zdroj:
+            self._zdroj = zdroj
+        if novy is not None and novy != stary:
+            logger.info("🎯 dispečer: odpovídám do %s (ptali se odtamtud), "
+                        "ne do %s", novy, stary or "neznámý")
+        self.dispecer.spust()
 
     def _payload(self, text: str) -> Dict[str, Any]:
         """Tělo POSTu na `/voice` — obálka nad `zdroj_zarizeni.payload_voice`.
@@ -612,10 +682,10 @@ class ZanBridge:
         text = ocista.text
 
         service = getattr(params, "llm", None)
-        if service is not None and service is not self._service:
-            # Tool call zná svoji službu líp než my — držme se jí.
-            self._service = service
-            self.dispecer.spust()
+        if service is not None:
+            # Tool call zná svoji službu líp než my — a se dvěma satelity je
+            # to JEDINÝ spolehlivý údaj o tom, kdo se ptal (karta -17).
+            self._prepni_na(service)
 
         if not self.async_enabled or not session_alive(service):
             # Nouzová/stará cesta. Bez živé session není kam vstřikovat, tak
