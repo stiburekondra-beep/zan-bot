@@ -41,8 +41,9 @@ from app.config_source import OPTION_DEFAULTS as DEFAULTS  # noqa: E402
 class KonecVetySeNeuseka(unittest.TestCase):
     """`end` málo citlivý, ticho dlouhé — radši počkat než useknout."""
 
-    def test_low_ceka_1200_ms(self):
-        self.assertEqual(G.vad_plan('low')['silence_duration_ms'], 1200)
+    def test_low_ceka_2000_ms(self):
+        """Číslo od vlastníka: „děti, než se vymáčknou, tak je to horší."""
+        self.assertEqual(G.vad_plan('low')['silence_duration_ms'], 2000)
 
     def test_low_ma_malo_citlivy_konec(self):
         self.assertEqual(G.vad_plan('low')['end_sensitivity'],

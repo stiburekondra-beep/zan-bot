@@ -57,13 +57,15 @@ DROPPED_SCHEMA_KEYS = frozenset(
 #: neutíná), začátek citlivý HODNĚ (ať nic nezmešká).
 VAD_EAGERNESS_PLANS: Dict[str, Dict[str, Optional[object]]] = {
     # `low` = to, co dům jede: nejdelší ticho, tedy nejmíň useknutých vět.
-    # 1000 → 1200 ms (2. 9. 2026): vlastník hlásil „neposlouchá dlouho
-    # a utne se mi". Průvodce Live API dává 500–800 ms jako běžné pásmo;
-    # dítě i dospělý v půlce věty dělají pauzu delší, a cena omylu je tady
-    # nesymetrická — o 400 ms delší čekání nikdo nepozná, useknutou větu ano.
+    # 1000 → 2000 ms (2. 9. 2026, číslo od vlastníka): „konec až po aspoň
+    # dvou vteřinách ticha — děti, než se vymáčknou, tak je to horší."
+    # Průvodce Live API dává 500–800 ms jako běžné pásmo, tohle je vědomě
+    # nad ním: cena omylu je nesymetrická. O vteřinu delší čekání nikdo
+    # nepozná, useknutou větu uprostřed ano — a dítě, které se odmlčí,
+    # než najde slovo, není hotové.
     "low": {"end_sensitivity": "END_SENSITIVITY_LOW",
             "start_sensitivity": "START_SENSITIVITY_HIGH",
-            "silence_duration_ms": 1200},
+            "silence_duration_ms": 2000},
     "medium": {"end_sensitivity": "END_SENSITIVITY_LOW",
                "start_sensitivity": "START_SENSITIVITY_HIGH",
                "silence_duration_ms": 800},
