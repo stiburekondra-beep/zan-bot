@@ -25,6 +25,7 @@ vlastní OpenAI Realtime relace a vlastní fázový kanál. Důsledky:
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Optional, Callable, Awaitable
@@ -56,6 +57,7 @@ from app.audio_recording_service import AudioRecordingService
 from app.phase_emitter import PhaseEmitter
 from app.transcript_logger import TranscriptLogger
 from app.prepis_ocista import ocisti
+from app.kredit_hlidac import KreditHlidac
 from app import hovor_log
 
 
@@ -294,6 +296,13 @@ class ConnectionRecovery(FrameProcessor):
         # mic during an active turn or the follow-up window).
         self._last_input_audio = time.monotonic()
         self._refresh_task = None
+        # HLÍDAČ ZŮSTATKU (2. 9. 2026, karta -44 bod 3). 1. 9. v 17:14 došel
+        # u OpenAI kredit, most se 208x marně připojil a hlas hodinu mlčel —
+        # tenhle watchdog byl přesně to místo, kudy ta chyba pořád dokola
+        # tekla, a nikdo z ní nic nevyčetl. Hlídač je jen KLASIFIKÁTOR:
+        # rozliší „došly peníze" od „spadla síť" a jednou to nahlas řekne.
+        self._kredit = KreditHlidac(pusa=os.environ.get("ZAN_PUSA", "openai"))
+        self._kredit_oznameno = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -307,6 +316,11 @@ class ConnectionRecovery(FrameProcessor):
             self._last_input_audio = time.monotonic()
         if isinstance(frame, ErrorFrame) and not self._reconnecting:
             msg = str(getattr(frame, "error", "") or "")
+            # Došlý kredit u poskytovatele se tváří jako každá jiná chyba
+            # spojení — 1. 9. jich takhle proteklo 208 a nikdo z nich nic
+            # nevyčetl. Klasifikuje se KAŽDÝ ErrorFrame, ať se práh sejde
+            # i tehdy, když odmítnutí nikdy nedojde až do `_recover`.
+            await self._zkontroluj_kredit(msg)
             # Two reconnect triggers:
             #  (a) the OpenAI send-side flood ("Error sending client event: …" +
             #      a close-code marker) — OUR WS died mid-send. We require the
@@ -371,8 +385,47 @@ class ConnectionRecovery(FrameProcessor):
             )
         except Exception as e:
             logger.error(f"❌ OpenAI reconnect attempt failed: {e!r}")
+            await self._zkontroluj_kredit(e)
         finally:
             self._reconnecting = False
+
+    async def _zkontroluj_kredit(self, chyba) -> None:
+        """Odmítá poskytovatel proto, že došly peníze? Řekni to nahlas.
+
+        Fail-safe: cokoli tady selže se JEN zaloguje. Hlídač nesmí být
+        důvod, proč se most nezotaví — je to hlásič, ne brzda.
+        """
+        try:
+            nalez = self._kredit.zaznamenej(chyba)
+        except Exception as e:  # pragma: no cover - hlásič nesmí shodit most
+            logger.warning("⚠️ hlídač zůstatku sám selhal: %r", e)
+            return
+        if not nalez or self._kredit_oznameno:
+            return
+        self._kredit_oznameno = True
+        druh, zaloha, veta = nalez
+        # 1) Přednahraná fráze — jediná cesta řeči, která funguje i s mrtvou
+        #    session (PCM jde rovnou do transportu, model se neptá).
+        try:
+            play = getattr(self._service, "play_phrase", None)
+            if play is not None:
+                await play("zaloha_pusa", force=True)
+        except Exception as e:
+            logger.warning("⚠️ fráze o přepnutí nezazněla: %r", e)
+        # 2) Celá věta vlastním hlasem (mluvčí Charon/Piper). Když mluvčí
+        #    není, zůstane u fráze — nepředstírá se, že to zaznělo.
+        try:
+            rekni = getattr(self._service, "rekni_doslova", None)
+            if rekni is not None:
+                await rekni(veta)
+        except Exception as e:
+            logger.warning("⚠️ větu o došlém limitu nejde vyslovit: %r", e)
+        logger.error(
+            "💳 hlas mlčí kvůli poskytovateli (druh=%s), záloha=%s. "
+            "Ruka: doplnit kredit, nebo ZAN_PUSA=%s v /etc/zan/realtime.env "
+            "+ docker compose --profile hlas up -d zan-realtime.",
+            druh, zaloha, zaloha,
+        )
 
     async def _proactive_refresh_loop(self):
         """Refresh the OpenAI session BEFORE the 60-min cap, during real idle.

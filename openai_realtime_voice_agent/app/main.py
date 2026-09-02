@@ -24,6 +24,8 @@ from app.pusa_fallback import read_fallback
 from app.gemini_tools import DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_VOICE
 from app.mcp_service import HomeAssistantMCPService
 from app.phase_emitter import TurnLiveness
+from app.prompt_pusa import ENV_STARY_PROMPT, ohlas_ignorovany_env, prompt_pusy
+from app.voice_safety import je_nevratny_nastroj, procisti_allowlist
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.web_search_tool import get_web_search_tool_definition, create_web_search_tool_handler
 from app.zan_bridge_tool import get_ask_zan_tool_definition, ZanBridge
@@ -488,7 +490,19 @@ class Application:
         # Optional allow-list to trim the (large) ha-mcp tool set exposed to the
         # model. Comma-separated tool names; empty means expose all.
         mcp_tool_allowlist = [t.strip() for t in os.environ.get("MCP_TOOL_ALLOWLIST", "").split(",") if t.strip()]
-        
+        # PUSA NESMI SAHAT NA NEVRATNE (2. 9. 2026, karta -44 bod 1).
+        # Do dneska to drzela jen hodnota promenne — kdo do ni dopsal zamek,
+        # dostala pusa zamek. Ted se seznam prociti KODEM a co vypadne, to se
+        # ozve jako ERROR (tichy uklid = neviditelna brzda).
+        mcp_tool_allowlist, _nevratne = procisti_allowlist(mcp_tool_allowlist)
+        for _jmeno in _nevratne:
+            logger.error(
+                "🚫 MCP_TOOL_ALLOWLIST obsahuje nevratny nastroj %r (vzor %r) — "
+                "puse se NEVYSTAVI. Nevratne veci patri pres zeptej_se_mozku "
+                "na mozek, kde plati brana souhlasu.",
+                _jmeno, je_nevratny_nastroj(_jmeno),
+            )
+
         # Web search: let the assistant look things up online (weather, news,
         # facts). ON by default; existing installs keep their saved option, so an
         # Update won't silently flip it. When on, a `web_search` function tool
@@ -662,87 +676,14 @@ class Application:
         self.transcription_model = transcription_model
         self.transcription_prompt = transcription_prompt
         if zan_bridge_enabled:
-            # RYCHLÁ DRÁHA vs. DELEGACE (2026-08-22). Model má k dispozici jak
-            # nativní HA nástroje (rychlá dráha), tak ask_zan (most na mozek).
-            # Tento prefix je vynucen KÓDEM (přežije editaci volby instructions),
-            # osobnost/kontext přidává volba instructions za ním.
-            # ---------------------------------------------------------------
-            # PUSA JE TLUMOČNÍK, NE MLUVČÍ (31. 8. 2026)
-            #
-            # Ondra doslova: „ten STT podle me rozumi dobre. Bohuzel jen
-            # casto mluvi blbosti a opakuje fraze. To se mi tady s tebou
-            # v session nedeje. Takze bych nejak aby co nejvic mluvil ten
-            # Opus." Do dneška měla pusa 26 nástrojů, sama četla stav domu
-            # a pak o něm VYPRÁVĚLA vlastními slovy — a co nevěděla, to
-            # domyslela. Teď má dvě práce a ani jedna není „vymyslet obsah":
-            #
-            #   1. REFLEX — světlo/zásuvka/hudba/hlasitost hned a beze slov
-            #      (rychlá dráha to odchytí, ověří v HA a pípne),
-            #   2. `zeptej_se_mozku` — všechno ostatní doslova mozku.
-            #
-            # Obsah řeči tvoří mozek a vyslovuje ho Žánův vlastní hlas
-            # (`app/mluvci_piper.py`), ne tenhle model. Proto tu NENÍ ani
-            # slovo o tom, jak formulovat odpověď mozku — model ji nikdy
-            # nedostane k přeříkání. Míň pravidel = míň příležitostí
-            # improvizovat.
-            #
-            # Zákaz zamlouvání je psaný jako VÝČET zakázaných tvarů, ne jako
-            # obecné „nezamlouvej": research 2026-08-31 §1 (OpenAI
-            # Chat-Supervisor) — filler nesmí implikovat výsledek ani
-            # (ne)schopnost, a „nespojil jsem se s mozkem" porušuje obojí.
-            # Prefix je vynucený KÓDEM, přežije editaci volby `instructions`.
-            # ---------------------------------------------------------------
-            instructions = (
-                "JSI ŽÁN — hlas, ucho a společník. Mluvíš rád, mluvíš sám "
-                "a povídání je tvoje silná stránka. Jediné, co si nesmíš "
-                "vymýšlet, je PRAVDA O SVĚTĚ.\n"
-                "\n"
-                "Před každou odpovědí si polož JEDNU otázku: „Vím to z vlastní "
-                "hlavy?\" Podle ní jsi v jednom ze tří pásem.\n"
-                "\n"
-                "A) POVÍDÁNÍ — mluv volně, hned a sám. Vtipy, „jak se máš\", "
-                "co si o něčem myslíš, obecné znalosti (zeměpis, převody, "
-                "kolik je hodin), oslovení a rozloučení, reakce když ti někdo "
-                "skočí do řeči, doptání se, když jsi nerozuměl. Tady buď Žán: "
-                "česky, přirozeně, s humorem, krátce. Tohle mozku NEDÁVEJ — "
-                "zabil bys tím rozhovor.\n"
-                "\n"
-                "B) PRAVDA O DOMĚ, RODINĚ, KALENDÁŘI, POŠTĚ, PENĚZÍCH a o tom, co se "
-                "právě stalo nebo stane → `zeptej_se_mozku` s tím, co člověk "
-                "řekl. Sem patří i „co jsi to udělal\", „svítí něco\", „co mám "
-                "dneska\", „proč to nejede\", zámky, brány, kotel, zálivka, "
-                "televize, seznamy a cokoli nevratného. TOHLE NEVÍŠ — ani když "
-                "se ti zdá, že ano. Odpověď pak řekne Žán sám svým hlasem; ty "
-                "už k ní nic nepřidáváš. Pošta a kalendář navíc stojí za bránou "
-                "souhlasu, kterou umí obsloužit jenom mozek — sám do nich "
-                "nesaháš nikdy.\n"
-                "\n"
-                "C) RYCHLÝ POVEL — rozsvítit/zhasnout, zásuvka nebo spotřebič, "
-                "hudba, přeskočit skladbu, hlasitost. Zavolej nástroj HNED "
-                "a pak MLČ: ozve se zvuk a ten stačí.\n"
-                "\n"
-                "NEŽ ZAVOLÁŠ MOZEK smíš — a máš — říct JEDNU krátkou lidskou "
-                "větu: „mrknu se na to\", „podívám se\", „vteřinku\". Jednu, "
-                "PŘED voláním, pokaždé jinou. Pak mlč.\n"
-                "\n"
-                "CO NIKDY:\n"
-                "• Nevymýšlíš si fakta z pásma B — ani „asi\", ani „myslím, "
-                "že\". Radši se zeptej mozku.\n"
-                "• Po výsledku nástroje nic nekomentuješ: žádné „hotovo\", "
-                "„rozsvíceno\", „už to mám\", „jak jsem říkal\".\n"
-                "• Neomlouváš se, když to trvá nebo se nepovede. Zakázané jsou "
-                "zvlášť: „nespojil jsem se s mozkem\", „bohužel se mi nedaří\", "
-                "„hned to bude\", „ještě na tom dělám\", „moment, musím "
-                "přemýšlet\". Ticho je lepší než výplň.\n"
-                "• Neopakuješ tutéž větu dvakrát za sebou.\n"
-                "• Žádné entity_id, technické názvy, odrážky ani čísla "
-                "číslicemi.\n"
-                "\n"
-                "KDYŽ ČEKÁŠ NA MOZEK, mlč — ale nejsi socha: když na tebe "
-                "člověk mezitím promluví, normálně mu odpověz (pásmo A).\n"
-                "\n"
-                + instructions
-            )
+            # JEDEN PROMPT, NE DVA (2026-09-02, karta -44 bod 2).
+            # Do dneška se sem lepil ještě env INSTRUCTIONS jako druhá
+            # formulace téhož chování — dvojhlas přímo v promptu (past
+            # č. 11 z ústavy). Celý blok i to, co bylo v env, teď žije
+            # na jednom místě: app/prompt_pusa.py (čistá stdlib, takže
+            # jde testovat bez pipecatu — tests/test_prompt_pusa.py).
+            instructions = prompt_pusy()
+            ohlas_ignorovany_env(os.environ.get(ENV_STARY_PROMPT, ""))
 
         # SKUTEČNÁ JMÉNA DOMU (2026-08-31). Model si „obývák" přeložil na
         # `living_room`, HA povel odmítla a navenek to vypadalo, že Žán nechce
@@ -972,8 +913,17 @@ class Application:
                     # optional allow-list so the realtime session isn't flooded
                     # with ha-mcp's 80+ tools.
                     exposed = 0
+                    zadrzeno = []
                     for function_schema in mcp_tools_schema.standard_tools:
                         if self.mcp_tool_allowlist and function_schema.name not in self.mcp_tool_allowlist:
+                            continue
+                        # Fail-closed nezavisle na allowlistu: PRAZDNY allowlist
+                        # znamena "vystav vsechno" a to by puse dalo do ruky
+                        # i zamky a vrata z cele sady ha-mcp. Nepritomnost
+                        # konfigurace nesmi znamenat maximalni opravneni.
+                        duvod = je_nevratny_nastroj(function_schema.name)
+                        if duvod:
+                            zadrzeno.append("%s (%s)" % (function_schema.name, duvod))
                             continue
                         openai_tool = {
                             "type": "function",
@@ -988,6 +938,11 @@ class Application:
                         all_tools.append(openai_tool)
                         exposed += 1
 
+                    if zadrzeno:
+                        logger.warning(
+                            "🚫 puse se NEVYSTAVILO %d nevratnych nastroju: %s",
+                            len(zadrzeno), ", ".join(zadrzeno),
+                        )
                     if self.mcp_tool_allowlist:
                         logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools, exposing {exposed} per allow-list")
                     else:

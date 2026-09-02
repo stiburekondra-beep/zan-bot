@@ -35,10 +35,65 @@ _SENSITIVE_KEYWORDS = (
 _SENSITIVE_DOMAINS = ("lock", "alarm_control_panel", "cover")
 _TARGET_KEYS = ("name", "area", "entity_id", "entity", "device", "domain")
 
+# ---------------------------------------------------------------------------
+# NEVRATNE TRIDY ZARIZENI (2. 9. 2026, karta -44 bod 1)
+#
+# Diru nasel audit k rozhodnuti A-prim: `_TARGET_KEYS` NEOBSAHUJE
+# `device_class`, takze volani
+#
+#     HassTurnOn {'area': 'Zahrada', 'device_class': ['water']}
+#
+# proslo branou bez povsimnuti -- cil byl "prazdny" a funkce vratila False.
+# Pritom prave `device_class` je v Home Assistantu jediny zpusob, jak
+# hlasem trefit vodni ventil, plyn nebo garazova vrata, aniz by v povelu
+# padlo slovo "zamek" nebo "kotel". Ondrovo zadani zni doslova: pusa nikdy
+# `water`/`gas`/`lock`/garaz.
+#
+# Shoda je PRESNA (cela hodnota klice), ne podretezcova: "door" jako
+# podretezec by chytilo i "outdoor", a plosne odmitani venkovnich svetel
+# by brzdu za tyden nekdo vypnul.
+# ---------------------------------------------------------------------------
+_SENSITIVE_DEVICE_CLASSES = frozenset({
+    "water",    # vodni ventil / zalivka
+    "gas",      # plyn
+    "garage",   # garazova vrata
+    "gate",     # brana
+    "door",     # dverni pohon (ne "outdoor" -- shoda je presna)
+    "shutter",  # venkovni rolety (zavrena roleta = uveznene dite)
+})
+#: Klice, ve kterych se hleda nevratna trida/domena (hodnota po hodnote).
+_TRIDNI_KLICE = ("device_class", "domain")
+
 
 def _norm(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _hodnoty(args: Optional[Dict[str, Any]], klic: str):
+    """Hodnoty jednoho klice jako seznam retezcu (klic muze nest i list)."""
+    v = (args or {}).get(klic)
+    if v is None:
+        return []
+    if isinstance(v, (str, bytes)):
+        return [v.decode() if isinstance(v, bytes) else v]
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return [str(x) for x in v]
+    return [str(v)]
+
+
+def citliva_trida_nebo_domena(arguments: Optional[Dict[str, Any]]) -> str:
+    """Nese povel nevratnou `device_class`/`domain`? Vraci duvod, nebo "".
+
+    Shoda je presna na cele hodnote klice (viz komentar u
+    ``_SENSITIVE_DEVICE_CLASSES``), aby "door" nechytalo "outdoor".
+    """
+    for klic in _TRIDNI_KLICE:
+        for hodnota in _hodnoty(arguments, klic):
+            k = _norm(str(hodnota).strip())
+            if k in _SENSITIVE_DEVICE_CLASSES or k in _SENSITIVE_DOMAINS:
+                return "%s=%s" % (klic, k)
+    return ""
 
 
 def is_sensitive_actuation(function_name: str,
@@ -48,6 +103,11 @@ def is_sensitive_actuation(function_name: str,
     if function_name in SAFE_READ_TOOLS or function_name in NEVER_GATE_TOOLS:
         return False
     args = arguments or {}
+    # Nevratna trida/domena rozhoduje SAMA -- i kdyz jiny cil nikdo neuvedl.
+    # Musi to byt PRED testem na prazdny cil, jinak `device_class: water`
+    # bez oblasti propadne jako "bezcilne, tedy neskodne".
+    if citliva_trida_nebo_domena(args):
+        return True
     target = _norm(" ".join(str(args.get(k, "")) for k in _TARGET_KEYS if args.get(k)))
     if not target:
         return False
@@ -244,3 +304,83 @@ def oprav_domenu_a_tridu(arguments):
             arguments.pop("domain", None)
 
     return zmeny
+
+
+# ---------------------------------------------------------------------------
+# CO PUSA VUBEC NESMI DOSTAT DO RUKY (2. 9. 2026, karta -44 bod 1)
+#
+# Rozhodnuti `2026-09-02_hlas-cilovy-model-a-prim` ma tohle jako podminku
+# c. 1: "Pusa nesmi sahat na nevratne. `MCP_TOOL_ALLOWLIST` dnes obsahuje
+# jen vratne akce, ale tohle neni vynucene testem, jen konfiguraci."
+#
+# Dve diry, ktere se tim zaviraji:
+#
+#  1. Allowlist je JEN HODNOTA PROMENNE v /etc/zan/realtime.env. Kdo do ni
+#     dopise `HassLockUnlock`, da puse do ruky zamek -- a nic to nezastavi.
+#  2. PRAZDNY allowlist znamena "vystav vsechno". Kdyby promenna zmizela
+#     (preklep, novy stroj, recreate bez env_file), dostane pusa CELOU
+#     sadu ha-mcp nastroju vcetne zamku a vrat. Nepritomnost konfigurace
+#     se tak chova jako maximalni opravneni -- presny opak fail-closed.
+#
+# Proto se filtruje JMENO nastroje, nezavisle na allowlistu. Neni to
+# nahrada za `is_sensitive_actuation` (ta hlida ARGUMENTY jiz vystavenych
+# nastroju za behu) -- je to vrstva o patro vys: nevratny nastroj se puse
+# vubec neukaze, takze ho nemuze zavolat ani omylem, ani po vyzve.
+#
+# Vzory se hledaji jako PODRETEZEC ve jmenu (nastroje se jmenuji ruzne:
+# `HassLockUnlock`, ale taky `zahrada_voda_garaz_start`). Proto tu NENI
+# "door" ani "gas" jako samostatne slovo tam, kde by chytalo nevinna jmena
+# -- kazdy vzor nize je proverem proti 12 dnes vystavenym nastrojum
+# (test `test_zive_nastroje_projdou`).
+# ---------------------------------------------------------------------------
+_NEVRATNE_VE_JMENU = tuple(sorted(set(
+    _SENSITIVE_KEYWORDS            # kotel, zamek, lock, alarm, brana, vrata, gate
+    + _SENSITIVE_DOMAINS           # lock, alarm_control_panel, cover
+    + (
+        "garaz", "garage",         # garaz
+        "voda", "water",           # voda / zalivka
+        "plyn", "gas",             # plyn
+        "valve", "ventil",         # ventily
+        "zaliv", "studna",         # zahradni zalivka (skripty Zan-Coda)
+        "siren", "houkac",         # sirena
+        "shutter", "roleta",       # venkovni rolety
+        "setposition",             # HassSetPosition = polohovani rolet/vrat
+        "unlock",                  # pro cistotu, i kdyz "lock" ho pokryva
+    )
+)))
+
+
+def je_nevratny_nastroj(function_name: str) -> str:
+    """Patri tenhle nastroj mezi ty, ktere pusa nesmi ani videt?
+
+    Vraci vzor, ktery se trefil (duvod do logu), nebo prazdny retezec.
+    Nase vlastni mostove nastroje (`zeptej_se_mozku`, ...) jsou vyjmute --
+    prave pres ne se nevratne veci delegujou na mozek, kde plati brana
+    souhlasu.
+    """
+    if not function_name:
+        return ""
+    if function_name in NEVER_GATE_TOOLS or function_name in SAFE_READ_TOOLS:
+        return ""
+    jmeno = _norm(function_name)
+    for vzor in _NEVRATNE_VE_JMENU:
+        if vzor in jmeno:
+            return vzor
+    return ""
+
+
+def nevratne_nastroje(jmena) -> list:
+    """Ze seznamu jmen vrati ta, ktera puse nepatri (v poradi vstupu)."""
+    return [j for j in (jmena or []) if je_nevratny_nastroj(j)]
+
+
+def procisti_allowlist(allowlist) -> tuple:
+    """Fail-closed uklid `MCP_TOOL_ALLOWLIST`.
+
+    Vraci ``(povolene, zahozene)``. Zahozene se maji zalogovat jako CHYBA
+    -- tichy uklid by z bezpecnostni brzdy udelal neviditelnou vlastnost.
+    """
+    povolene, zahozene = [], []
+    for jmeno in (allowlist or []):
+        (zahozene if je_nevratny_nastroj(jmeno) else povolene).append(jmeno)
+    return povolene, zahozene
