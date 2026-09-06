@@ -46,7 +46,7 @@ _TARGET_KEYS = ("name", "area", "entity_id", "entity", "device", "domain")
 # proslo branou bez povsimnuti -- cil byl "prazdny" a funkce vratila False.
 # Pritom prave `device_class` je v Home Assistantu jediny zpusob, jak
 # hlasem trefit vodni ventil, plyn nebo garazova vrata, aniz by v povelu
-# padlo slovo "zamek" nebo "kotel". Ondrovo zadani zni doslova: pusa nikdy
+# padlo slovo "zamek" nebo "kotel". Zadani vlastnika zni doslova: pusa nikdy
 # `water`/`gas`/`lock`/garaz.
 #
 # Shoda je PRESNA (cela hodnota klice), ne podretezcova: "door" jako
@@ -124,7 +124,7 @@ def is_sensitive_actuation(function_name: str,
 # ---------------------------------------------------------------------------
 # BRZDA 31. 8. 2026: BEZCILNY ZASAH A VLASTNI HLAS
 #
-# Zive dolozeno (log zan-realtime 17:56:02, Ondra u toho stal):
+# Zive dolozeno (log zan-realtime 17:56:02, vlastnik u toho stal):
 #
 #     Calling function [HassSetVolume] with arguments {'volume_level': 20}
 #     -> success: Zan Media Player, Zan reSpeaker Media Player,
@@ -132,7 +132,7 @@ def is_sensitive_actuation(function_name: str,
 #
 # Volani BEZ CILE zasahlo vsech pet prehravacu vcetne satelitu, kterym Zan
 # mluvi -- hlasitost spadla z 1.0 na 0.2 a Zan si tim sam stahl hlas na
-# petinu. Ondra o hlasitosti nerekl ani slovo; model si povel vyrobil
+# petinu. Vlastnik o hlasitosti nerekl ani slovo; model si povel vyrobil
 # z rozsypaneho prepisu "svetla v obyvakutechto hlavnichVypni televizi."
 #
 # Dve pravidla, obe fail-closed:
@@ -248,6 +248,40 @@ _DEVICE_CLASSES = frozenset({
     "switch", "tv", "speaker", "receiver", "projector", "water", "gas",
 })
 
+#: Slova, kterymi model pojmenuje domenu, jenze HA je NEZNA -- ani jako
+#: domenu, ani jako device_class. Prohazovaci logika nize je proto nechytne
+#: (neni v zadne z obou mnozin) a povel se zuzi na prazdnou mnozinu.
+#:
+#: ZIVA ZAMINKA 2. 9. 2026 17:48:40. Clovek: "Zapni zasuvku v loznici."
+#: Model poslal HassTurnOn {area: "Loznice", domain: ["plug"]} a vysledek byl
+#: `unconfirmed`. V registru pritom zasuvka byla uplne v poradku -- jmeno
+#: "Zasuvka televize v loznici", spravna oblast, vystavena Assistovi. Chybelo
+#: jedine tohle: domena zasuvky je v HA "switch", device_class "outlet",
+#: "plug" neni ani jedno. Vlastnik z toho mel "nechce zapnout zasuvku" a hledal
+#: chybu v registru, kde zadna nebyla.
+#:
+#: Preklada se JEN na domenu, device_class se nedoplnuje -- pridat "outlet" by
+#: hledani zuzilo na entity, ktere tu tridu opravdu hlasi, a to u ZHA spolehnout
+#: nejde. "switch" v dane oblasti je presne tak siroke, jak clovek mysli.
+_DOMENA_SYNONYMA = {
+    "plug": "switch",
+    "plugs": "switch",
+    "smart_plug": "switch",
+    "power_plug": "switch",
+    "socket": "switch",
+    "outlet_plug": "switch",
+    "wall_plug": "switch",
+    "zasuvka": "switch",
+    "zásuvka": "switch",
+    "zasuvky": "switch",
+    "television": "media_player",
+    "televize": "media_player",
+    "speakers": "media_player",
+    "svetlo": "light",
+    "světlo": "light",
+    "lights": "light",
+}
+
 
 def oprav_domenu_a_tridu(arguments):
     """Prehodi hodnoty mezi `domain` a `device_class`, kdyz jsou naopak.
@@ -267,6 +301,25 @@ def oprav_domenu_a_tridu(arguments):
 
     tridy = _seznam("device_class")
     domeny = _seznam("domain")
+
+    # 0) SYNONYMA nejdriv. Slovo, ktere HA nezna ani jako domenu, ani jako
+    #    device_class, propadne obema vetvemi nize beze zmeny a povel pak
+    #    nenajde nic (viz komentar u `_DOMENA_SYNONYMA`). Prekladame drive,
+    #    aby prelozena hodnota jeste prosla prohazovanim.
+    if domeny:
+        prelozene, popisy = [], []
+        for v in domeny:
+            k = str(v).strip().lower()
+            nova = _DOMENA_SYNONYMA.get(k)
+            if nova and nova != k:
+                prelozene.append(nova)
+                popisy.append("%s -> %s" % (v, nova))
+            else:
+                prelozene.append(v)
+        if popisy:
+            domeny = prelozene
+            arguments["domain"] = list(domeny)
+            zmeny.append("domain synonymum: %s" % ", ".join(popisy))
 
     # device_class -> domain (napr. "light")
     if tridy:
@@ -302,6 +355,20 @@ def oprav_domenu_a_tridu(arguments):
             arguments["domain"] = domeny
         else:
             arguments.pop("domain", None)
+
+    # DIAGNOSTIKA NAKONEC. Kdyz v `domain` zbyde hodnota, kterou HA nezna,
+    # je uz ted jiste, ze intent nenajde NIC -- a v hovoru z toho bude holy
+    # `unconfirmed` bez duvodu. Presne tak 2. 9. 2026 zmizela pricina z dohledu
+    # a hledala se v registru. Radeji hlasita stopa v logu nez tiche selhani.
+    zbyle = arguments.get("domain")
+    if zbyle:
+        if isinstance(zbyle, str):
+            zbyle = [zbyle]
+        nezname = [v for v in zbyle if str(v).strip().lower() not in _DOMENY]
+        if nezname:
+            zmeny.append(
+                "VAROVANI: domain %s Home Assistant nezna -- povel nenajde nic"
+                % nezname)
 
     return zmeny
 
