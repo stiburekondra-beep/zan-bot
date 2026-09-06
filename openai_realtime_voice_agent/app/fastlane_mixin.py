@@ -41,6 +41,7 @@ from app.phase_emitter import TURN_LIVENESS
 from app import hovor_log
 from app import utrzek_argumenty
 from app import predani_mozku
+from app.nemluva_hlidka import NemluvaHlidka, ZNACKA as ZNACKA_NEMOTA
 from app.voice_safety import (
     is_sensitive_actuation,
     saha_na_vlastni_hlas,
@@ -1061,6 +1062,12 @@ class FastLaneMixin:
             "🗣️ VYSLOVENO DOSLOVA (%d B, %.2f s od přijetí): %s",
             len(pcm), time.monotonic() - zacatek, text,
         )
+        # HLÍDKA NĚMOTY: mozek promluvil (a `rekni_doslova` obchází model,
+        # takže `_zan_dorekl` o té větě neví) → výplň už není potřeba.
+        try:
+            self.nemluva_hlidka.promluveno("mozek")
+        except Exception as e:  # noqa: BLE001 - hlídka nesmí shodit hlas
+            logger.debug("hlídku němoty se nepodařilo zrušit: %r", e)
         return True
 
     async def _verify_after_action(self, pre, plan) -> str:
@@ -1162,6 +1169,77 @@ class FastLaneMixin:
             self.zrcadlo_vymen.pusa_odpovedela(text)
         except Exception as e:  # noqa: BLE001 - paměť nesmí shodit hlas
             logger.debug("výměnu se nepodařilo spárovat: %r", e)
+        # HLÍDKA NĚMOTY: model promluvil sám → výplň není potřeba.
+        try:
+            self.nemluva_hlidka.promluveno("model")
+        except Exception as e:  # noqa: BLE001 - hlídka nesmí shodit hlas
+            logger.debug("hlídku němoty se nepodařilo zrušit: %r", e)
+
+    # -----------------------------------------------------------------------
+    # PO NEÚSPĚCHU MUSÍ NĚCO ZAZNÍT (karta -zana-13, nález revize 30. 8.)
+    #
+    # `_verdict_text` výš modelu ŘÍKÁ, ať poctivou větu vysloví, a
+    # `_predej_mozku` posílá dotaz mozku. Obojí je prosba — 30. 8. skončilo
+    # pět akcí za sebou `unconfirmed` a nezaznělo NIC. Tohle je mechanismus:
+    # když do `nemluva_hlidka.TTL_S` nikdo nepromluví, výplň se zařadí
+    # do FRONTY MLUVENÍ. Nikdy se nemluví odsud napřímo — jinak by vedle
+    # modelu, mozku a dispečera vznikl další nezávislý mluvčí a padlo by
+    # pravidlo „mluví právě jeden" (karta -zana-04).
+    # -----------------------------------------------------------------------
+
+    @property
+    def nemluva_hlidka(self) -> NemluvaHlidka:
+        """Líné založení — mixin nemá vlastní `__init__` (dědí ho po službě)."""
+        h = getattr(self, "_nemluva_hlidka", None)
+        if h is None:
+            h = NemluvaHlidka()
+            self._nemluva_hlidka = h
+        return h
+
+    def _vypln_do_fronty(self, vypln) -> bool:
+        """Zařadí splatnou výplň do fronty témat. Vrací, jestli se to povedlo."""
+        dispecer = getattr(self, "zan_dispecer", None)
+        if dispecer is None:
+            # Poctivě: bez mostu nemá výplň kudy ven. Radši hlasitý log než
+            # tichý předpoklad, že to někdo řekne — to je přesně ten bug.
+            logger.warning(
+                "⚠️ %s: fronta mluvení není zapojená (zan_dispecer chybí) — "
+                "větu %r nemám kudy říct",
+                ZNACKA_NEMOTA, vypln.text,
+            )
+            return False
+        # `druh='chyba'` je doslovný druh (`dispecer_reci.DOSLOVNE_DRUHY`),
+        # takže větu vysloví mluvčí přesně tak, jak je — model ji nepřebásní.
+        return bool(dispecer.pridej_odpoved(
+            vypln.text, vypln.interaction_id,
+            druh="chyba", znacka=ZNACKA_NEMOTA,
+        ))
+
+    async def _hlidej_nemotu(self, verdict: str) -> None:
+        """Natáhne hlídku a po TTL zkontroluje, jestli někdo promluvil."""
+        hlidka = self.nemluva_hlidka
+        vypln = hlidka.po_akci(
+            verdict, tah=float(getattr(self, "posledni_prepis_t", 0.0) or 0.0))
+        if vypln is None:
+            return
+        await asyncio.sleep(hlidka.ttl_s)
+        splatna = hlidka.splatna()
+        if splatna is None:
+            return
+        self._vypln_do_fronty(splatna)
+        self._rozbor(
+            "fastlane-nemota",
+            volani=splatna.verdikt,
+            vysledek="vyplneno",
+            poznamka="po neúspěchu nikdo nepromluvil, výplň do fronty",
+        )
+
+    def _spust_hlidku_nemoty(self, verdict: str) -> None:
+        """Fire-and-forget: hlas na hlídku nikdy nečeká."""
+        try:
+            asyncio.create_task(self._hlidej_nemotu(verdict))
+        except Exception as e:  # pragma: no cover - bez smyčky se nic nestane
+            logger.debug("hlídku němoty se nepodařilo naplánovat: %r", e)
 
     async def _run_fast_lane(self, plan, function_name, handler, params):
         """Průběh HNED + akce souběžně → ověření → tón / retry / poctivé selhání."""
@@ -1309,6 +1387,13 @@ class FastLaneMixin:
 
         await real_cb(self._verdict_text(verdict, plan, captured,
                                          predano=predano))
+
+        # A TEĎ HLÍDKA (karta -zana-13). Řádek výš je POKYN modelu, ne
+        # promluva; 30. 8. ho pětkrát za sebou nikdo nesplnil a v pokoji bylo
+        # ticho. Hlídka počká `TTL_S` a když se do té doby nic neozve (ani
+        # model přes `vymena_pusa_odpovedela`, ani mozek přes
+        # `rekni_doslova`), zařadí poctivou větu do fronty mluvení.
+        self._spust_hlidku_nemoty(verdict)
 
     async def _predej_mozku(self, verdict: str, function_name: str,
                             arguments) -> bool:

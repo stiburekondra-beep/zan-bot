@@ -1145,6 +1145,12 @@ class Application:
                 # `zdroj_zarizeni` (mapa IP → jméno v app/zdroj_zarizeni.py).
                 self.zan_bridge.nastav_zdroj(client_id, service)
                 service.register_function("zeptej_se_mozku", self.zan_bridge.handler)
+                # FRONTA MLUVENÍ pro hlídku němoty (karta -zana-13). Když po
+                # neúspěšné akci nikdo do pár vteřin nepromluví, musí mít
+                # rychlá dráha kam poctivou větu zařadit — a smí to být
+                # JEDINĚ tahle fronta, ne vlastní cesta do pipeline
+                # („mluví právě jeden", karta -zana-04).
+                service.zan_dispecer = self.zan_bridge.dispecer
             logger.info(
                 f"✅ Pusa '{self.pusa}' vytvořena pro {client_id}: {type(service).__name__}"
             )
