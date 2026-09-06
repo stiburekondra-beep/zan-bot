@@ -2,6 +2,30 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.9.1
+
+**Recording a voice sample — and the silent recordings that never were**
+
+- **Debug recording wrote 613 files of 44 bytes: a WAV header and no audio.**
+  The bridge built its `WebSocketHandler` *before* creating
+  `AudioRecordingService`, so the handler was handed `None` and never put the
+  recorder into the pipeline — while the per-session file was still opened and
+  closed on every connection. The log said it out loud for weeks: `Pipeline
+  created` with no `Audio recording enabled` next to it. The service is now
+  created first, and it no longer opens a file at start-up that nothing can
+  ever fill (that was two more empty headers per restart).
+- **New: `POST /nahravani/start` / `/nahravani/stop`** — one clip per spoken
+  sentence, on demand, for recording voice profiles and wake-word samples from
+  the satellite's own microphone. Loopback only, token required (fail-closed:
+  no token, no endpoint), refused while a conversation is running.
+- **The clip is the device's original 16 kHz mono**, tapped before the 24 kHz
+  resampler; written atomically, and reported back to the caller when it lands.
+  **A failed clip is reported too** — silence would leave the guide waiting.
+- **The model is not called during recording.** The recorded frames never enter
+  the pipeline, so the assistant doesn't answer the sentence being recorded and
+  nothing is billed for it.
+- See **DOCS.md § 6b** for the request format and the environment variables.
+
 ## 0.9.0
 
 **Two voice satellites at once**

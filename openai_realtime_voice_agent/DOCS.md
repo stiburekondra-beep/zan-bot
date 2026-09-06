@@ -128,6 +128,55 @@ Every option has a description on the **Configuration** tab. The ones worth know
   `zan_denni_strop_tvrdy: true` a *new* satellite is refused once the daily cap
   is spent — a satellite that is already connected is never cut off mid-sentence.
 
+## 6b. Recording one voice sample from the satellite
+
+Voice profiles and wake-word samples are recorded **from the microphone people
+actually speak into**, not from a phone. The brain asks the bridge for one clip
+and gets a callback when it is on disk.
+
+Two loopback-only HTTP endpoints, off unless a token is set:
+
+```
+POST /nahravani/start        Authorization: Bearer $ZAN_MOST_TOKEN
+{"klip_id":"<8-64 chars>", "typ":"veta|wake", "delka_s":6, "hz":16000,
+ "kam":"nazev.wav", "zpetne_volani":"http://127.0.0.1:8098/nataceni/klip"}
+  -> 200 {"ok":true}     taken, you'll hear back
+  -> 409                 a conversation is running, or a clip is already being taken
+  -> 400                 bad payload / `kam` outside the folder / callback off-loopback
+
+POST /nahravani/stop         cut the clip short
+GET  /nahravani/stav         is it recording right now? (for curl)
+```
+
+When the clip is done (silence for 1.5 s, or `delka_s`, whichever comes first)
+the bridge writes `<ZAN_NATACENI_TMP>/<kam>` **atomically** and calls
+`zpetne_volani` with `{"klip_id","soubor"}` — or `{"klip_id","chyba"}` if it
+failed. **A failure is always reported**: silence is a worse answer than an
+error, because the guide would otherwise wait five minutes for a clip that
+never comes.
+
+Three things worth knowing:
+
+- **The audio is the device's original 16 kHz mono**, tapped in the serializer
+  *before* the 24 kHz resampler — a wake-word trainer needs the real thing, not
+  an upsampled copy.
+- **The model is not called while recording.** The clip is not a question; the
+  frames never reach the pipeline, so nothing is billed and the assistant
+  doesn't answer the sentence being recorded.
+- **An empty or silent stream is an error, never an empty file.** Nothing is
+  written unless there is audio in it.
+
+Environment variables (set them next to the other bridge secrets, not in git):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ZAN_MOST_HTTP_PORT` | `8091` | control port; `0` turns recording off |
+| `ZAN_MOST_HTTP_HOST` | `127.0.0.1` | bind address — keep it on loopback |
+| `ZAN_MOST_TOKEN` | `ZAN_VOICE_TOKEN` | **without either, the endpoint does not start** |
+| `ZAN_NATACENI_TMP` | `/homeassistant/zan_data/nataceni/tmp` | where clips land |
+| `ZAN_AKCE_TOKEN` | `ZAN_VOICE_TOKEN` | token used for the callback to the brain |
+| `ZAN_NATACENI_HOSTY` | — | extra hosts allowed as callback targets |
+
 ## 7. Reading the logs
 
 The add-on log shows each turn: `🗣️ user:` (when transcription language is set),
