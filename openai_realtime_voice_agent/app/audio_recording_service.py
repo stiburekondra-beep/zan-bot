@@ -83,12 +83,18 @@ class AudioRecordingService:
             self._initialize_recording()
     
     def _initialize_recording(self):
-        """Initialize audio recording components."""
+        """Initialize audio recording components.
+
+        SOUBOR SE TU JEŠTĚ NEOTVÍRÁ. Do 6. 9. 2026 se rovnou volalo
+        `start_recording("session_<čas>")` — jenže v tu chvíli žádná
+        pipeline neexistuje, takže do toho souboru nikdy nic nepřiteklo
+        a každý restart mostu nechal na disku dvě prázdné hlavičky.
+        (Na krabici jich bylo 613.) Zapisovač se otevře až v
+        `start_new_session()`, tedy když je čím ho naplnit.
+        """
         # Create audio recorder
         self.audio_recorder = AudioRecorder(output_dir=self.output_dir)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.audio_recorder.start_recording(client_id=f"session_{timestamp}")
-        
+
         # Create audio frame recorders for input and output
         self.input_recorder = AudioFrameRecorder(
             InputAudioRawFrame,

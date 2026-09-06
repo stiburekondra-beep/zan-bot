@@ -39,7 +39,8 @@ from app.voice_fastlane import (
 )
 from app.audio_recording_service import AudioRecordingService
 from app.session_manager import SessionManager
-from app.websocket_handler import WebSocketHandler
+from app.websocket_handler import WebSocketHandler, PIPELINE_SAMPLE_RATE
+from app.nahravani_server import spust_nahravani_server
 
 # Configure logging
 logging.basicConfig(
@@ -349,6 +350,9 @@ class Application:
         # cleanup() na ně sahá i po havárii při startu.
         self.zan_bridge = None
         self._prubeh_task = None
+        # Nahrávací režim (`/nahravani/start`) — task serveru a stavový automat.
+        self._nahravani_task = None
+        self._nahravani_rezim = None
         # Drát na plátnový session režim; vzniká v initialize(), ale
         # cleanup() na něj sahá i po havárii při startu.
         self.session_klient = None
@@ -515,9 +519,9 @@ class Application:
             "WEB_SEARCH_MODEL", "WEB_SEARCH_MODEL_CUSTOM", "gpt-5.5"
         )
 
-        # Get recording setting (optional, defaults to false)
-        enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
-        
+        # (ENABLE_RECORDING se čte až u `AudioRecordingService` níž — dřív
+        # se četlo tady, 130 řádků nad místem, kde se používá.)
+
         # Post-reply follow-up window: how many seconds the device keeps the mic
         # open after the assistant finishes so the user can answer back without
         # re-saying the wake word. Sent to the device in the `hello` handshake as
@@ -636,6 +640,23 @@ class Application:
             tpm_limit=tpm_limit, daily_limit=denni_strop, hard_stop=denni_tvrdy
         )
         logger.info("💰 rozpočet mostu (sdílený všemi satelity): %s", self.budget.describe())
+
+        # NAHRÁVÁNÍ RELACE MUSÍ VZNIKNOUT PŘED HANDLEREM. Do 6. 9. 2026 se
+        # `AudioRecordingService` tvořil AŽ ZA konstrukcí `WebSocketHandler`,
+        # takže mu do konstruktoru šlo `audio_recording_service=None`.
+        # Handler si tu None uložil a `build_pipeline` proto nikdy nezapojil
+        # `AudioFrameRecorder` — zatímco `_build_client_session` (ta čte
+        # `self.audio_recording_service`, už nastavené) poctivě otevírala
+        # nový soubor na každou relaci. Odtud těch 613 WAVů po 44 bajtech na
+        # krabici: hlavička ano, zvuk nikdy. Doloženo logem, kde je
+        # „Pipeline created" BEZ „Audio recording enabled".
+        enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
+        self.audio_recording_service = AudioRecordingService(
+            enable_recording=enable_recording,
+            sample_rate=PIPELINE_SAMPLE_RATE,
+            chunk_duration_seconds=30,
+            output_dir=os.environ.get("ZAN_NAHRAVKY_DIR", "").strip() or "recordings",
+        )
 
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
@@ -783,14 +804,9 @@ class Application:
         self.session_klient = SessionKlient()
         self.websocket_handler.session_klient = self.session_klient
 
-        # Initialize audio recording service (optional)
-        self.audio_recording_service = AudioRecordingService(
-            enable_recording=enable_recording,
-            sample_rate=24000,
-            chunk_duration_seconds=30,
-            output_dir="recordings"
-        )
-        
+        # (`AudioRecordingService` vzniká VÝŠ, před `WebSocketHandler` —
+        # jinak by mu do konstruktoru šla None a nahrávalo by se ticho.)
+
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
     
     async def _build_client_session(self, slot: ClientSlot) -> None:
@@ -1269,6 +1285,28 @@ class Application:
             except Exception as e:
                 logger.warning(f"⚠️ /prubeh se nepodařilo nastartovat: {e!r}")
 
+        # NAHRÁVACÍ REŽIM (`POST /nahravani/start`) — natáčení hlasových
+        # profilů a vzorků budicího slova ze SKUTEČNÉHO mikrofonu satelitu.
+        # Vlastní port (`ZAN_MOST_HTTP_PORT`), ne `/prubeh`: `/prubeh` je
+        # zápis do úst, tohle je zapnutí mikrofonu — jiná pravomoc, jiný
+        # token, a jádro si smí jedno nastavit bez druhého.
+        # Běží NEZÁVISLE na Žán-bridge: natáčet se dá i bez mozku za `ask_zan`.
+        try:
+            def _probiha_rozhovor() -> bool:
+                """Mluví se právě teď? Do rozjetého hovoru se nenatáčí.
+
+                `aktualni_faze()` čte přes VŠECHNY satelity: `None` = nikdo
+                nehlásí fázi (klid), `idle` = doposlouchal. Cokoli jiného
+                (listening / thinking / replying) je běžící otočka.
+                """
+                faze = self.websocket_handler.aktualni_faze()
+                return faze is not None and faze != "idle"
+
+            self._nahravani_task, self._nahravani_rezim = await spust_nahravani_server(
+                probiha_rozhovor=_probiha_rozhovor)
+        except Exception as e:
+            logger.warning(f"⚠️ /nahravani se nepodařilo nastartovat: {e!r}")
+
         # Periodické čtení session režimu z plátna (30 s). Fail-safe uvnitř:
         # když plátno neběží, klient drží `listening=True` a nic se nemění.
         if self.session_klient is not None:
@@ -1309,6 +1347,18 @@ class Application:
         prubeh_task = getattr(self, "_prubeh_task", None)
         if prubeh_task is not None and not prubeh_task.done():
             prubeh_task.cancel()
+
+        # Rozdělaný klip se při vypínání OHLÁSÍ jako neúspěch, ne zamlčí —
+        # jádro by jinak čekalo pět minut do vypršení.
+        rezim = getattr(self, "_nahravani_rezim", None)
+        if rezim is not None and rezim.aktivni():
+            try:
+                await rezim.stop("most se vypíná")
+            except Exception as e:
+                logger.warning(f"⚠️ Error stopping nahrávací režim: {e}")
+        nahravani_task = getattr(self, "_nahravani_task", None)
+        if nahravani_task is not None and not nahravani_task.done():
+            nahravani_task.cancel()
 
         # Pipeline už nepatří aplikaci, ale jednotlivým satelitům — zruší je
         # úklid mostu (`WebSocketHandler.cleanup` → `_teardown` každého slotu);

@@ -19,6 +19,10 @@ for _jmeno in ("StartInterruptionFrame", "BotStoppedSpeakingFrame",
 _PRERUSENI_TYPY = tuple(_PRERUSENI_TYPY)
 from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
 
+# Nahravaci rezim (`/nahravani/start`). Modul je schvalne bez pipecatu,
+# takze import nic netahne a da se testovat samostatne.
+from app import nahravani
+
 logger = logging.getLogger(__name__)
 
 # POLOVICNI DUPLEX (2. 9. 2026). Satelit slysi sam sebe a Gemini si vlastni
@@ -313,6 +317,22 @@ class RawAudioSerializer(FrameSerializer):
         if not isinstance(message, bytes):
             # Skip anything that isn't bytes or a known text control frame.
             return None
+
+        # NATACENI VZORKU (`/nahravani/start`). Odbocka sedi TADY schvalne:
+        # je to posledni misto, kde je zvuk PRESNE takovy, jak ho poslal
+        # mikrofon satelitu -- nativnich 16 kHz mono int16, pred
+        # `InputResampler` (24 kHz) i pred poloduplexni brzdou. Trener
+        # budiciho slova chce originál, ne dopoctenou rychlost.
+        #
+        # `prijmi()` vraci True = "tenhle zvuk je muj". Do pipeline uz
+        # nejde, takze se behem natáčení NEVOLA MODEL: klip neni dotaz.
+        rezim = nahravani.aktivni_rezim()
+        if rezim is not None:
+            try:
+                if await rezim.prijmi(message, self._input_sample_rate):
+                    return None
+            except Exception:  # noqa: BLE001 - natáčení nesmi umlcet Zana
+                logger.warning("natáčení klipu selhalo", exc_info=True)
 
         # POLOVICNI DUPLEX. Dokud z repraku zni Zanuv hlas, mikrofon do
         # Gemini nejde -- jinak si model prepise vlastni slova jako `user`
