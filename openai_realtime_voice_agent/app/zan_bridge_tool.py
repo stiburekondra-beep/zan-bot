@@ -614,6 +614,17 @@ class ZanBridge:
         """
         killed = self.cancel_all(reason)
         self.dispecer.vyprazdni(reason)
+        # HLÍDKA NĚMOTY (karta -zana-13) čeká MIMO frontu — vysypaná fronta
+        # ji nezruší a za pár vteřin by po „zmlkni" promluvila. Brzda musí
+        # zavírat celou cestu, ne jen její konec.
+        for sluzba in {self._service, *self._sluzby.keys()}:
+            hlidka = getattr(sluzba, "_nemluva_hlidka", None)
+            if hlidka is None:
+                continue
+            try:
+                hlidka.zrus(reason)
+            except Exception as e:  # noqa: BLE001 - stopka nesmí spadnout
+                logger.debug("hlídku němoty se nepodařilo zrušit: %r", e)
         return killed
 
     def prijmi_prubeh(self, interaction_id: str, text: str, druh: str = "prubeh") -> bool:
