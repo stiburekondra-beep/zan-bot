@@ -165,6 +165,8 @@ const DATA_DIR = (() => {
   try { fs.mkdirSync('/config/zan_data', { recursive: true }); return '/config/zan_data'; }
   catch { return __dirname; } // fallback pro vývoj mimo add-on
 })();
+// Noční ticho 22–7 na Ondrův telefon (Ondra 6. 10. 2026) — fronta v DATA_DIR, souhrn po 7:00.
+const nocniTicho = require('./nocni-ticho').vytvor(DATA_DIR);
 // Jednorázová migrace dat z /app (verze <= 5.4.16 ukládaly vedle bot.js)
 if (DATA_DIR !== __dirname) {
   for (const f of ['home_memory.json', 'zan_actions.log', 'zan_conversation.log',
@@ -491,6 +493,8 @@ function persistConversations() {
 async function sendSafe(chatId, text, extra = {}) {
   if (text === undefined || text === null || text === '') text = '…';
   text = String(text);
+  // Noční ticho 22–7: Ondrovi v noci nic (jen odpověď do 10 min po jeho zprávě), zbytek čeká na ranní souhrn.
+  if (chatId === CHAT_ONDRA && nocniTicho.brana(text) === 'fronta') return;
   const chunks = [];
   for (let i = 0; i < text.length; i += 3900) chunks.push(text.slice(i, i + 3900));
   for (const chunk of chunks) {
@@ -4313,6 +4317,7 @@ bot.on('callback_query', async (q) => {
 
 async function handleMessage(msg, send = sendSafe, sendChatAction = (chatId, action) => bot.sendChatAction(chatId, action)) {
   const chatId = msg.chat.id;
+  if (chatId === CHAT_ONDRA) nocniTicho.ondraNapsal();
 
   // Security — neznámý chat
   if (!ALLOWED_CHATS.includes(chatId)) {
@@ -5896,6 +5901,9 @@ if (!HARNESS_ONLY) {
 
   // Osobní připomínky — čistě Telegram, bez zásahu do HA nebo domu.
   setInterval(deliverDueReminders, 30 * 1000);
+
+  // Ranní souhrn zpráv z nočního ticha (po 7:00, jednou).
+  setInterval(() => { nocniTicho.vyprazdni((t) => bot.sendMessage(CHAT_ONDRA, t)).catch((e) => console.warn('ticho:', e.message)); }, 60 * 1000);
 
   // Jednorázové odložené akce („za 10 minut rozsviť") — tick po 15 s,
   // ať „za minutu" nemá půlminutový skluz.
